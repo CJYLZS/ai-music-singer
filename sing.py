@@ -149,6 +149,7 @@ class Cfg:
     vocal_gain: float = 1.0
     acc_gain: float = 0.8
     mix: bool = False
+    no_sep_cache: bool = False
 
     @property
     def out_dir(self) -> str:
@@ -261,10 +262,13 @@ def preflight(cfg: Cfg) -> None:
 
 def stage_sep(cfg: Cfg) -> None:
     banner("Stage: 人声分离 (BS-RoFormer + karaoke)")
+    extra = ["--no-cache"] if cfg.no_sep_cache else []
     run([VENVS["gsv"], os.path.join(WORKERS, "w_sep.py"), "--in", cfg.song,
-         "--out-dir", cfg.p("sep1"), "--model", "bs", "--device", cfg.device], stage="sep")
+         "--out-dir", cfg.p("sep1"), "--model", "bs", "--device", cfg.device,
+         *extra], stage="sep")
     run([VENVS["gsv"], os.path.join(WORKERS, "w_sep.py"), "--in", cfg.p("sep1", "vocal.wav"),
-         "--out-dir", cfg.p("sep2"), "--model", "karaoke", "--device", cfg.device], stage="sep")
+         "--out-dir", cfg.p("sep2"), "--model", "karaoke", "--device", cfg.device,
+         *extra], stage="sep")
     for p in (cfg.p("sep1", "vocal.wav"), cfg.p("sep1", "acc.wav"),
               cfg.p("sep2", "lead.wav"), cfg.p("sep2", "backing.wav")):
         if not os.path.exists(p):
@@ -273,10 +277,13 @@ def stage_sep(cfg: Cfg) -> None:
 
 def stage_ref_sep(cfg: Cfg) -> None:
     banner("Stage: 参考分离 (BS-RoFormer + karaoke, 去 BGM)")
+    extra = ["--no-cache"] if cfg.no_sep_cache else []
     run([VENVS["gsv"], os.path.join(WORKERS, "w_sep.py"), "--in", cfg.ref,
-         "--out-dir", cfg.p("refsep1"), "--model", "bs", "--device", cfg.device], stage="ref-sep")
+         "--out-dir", cfg.p("refsep1"), "--model", "bs", "--device", cfg.device,
+         *extra], stage="ref-sep")
     run([VENVS["gsv"], os.path.join(WORKERS, "w_sep.py"), "--in", cfg.p("refsep1", "vocal.wav"),
-         "--out-dir", cfg.p("refsep2"), "--model", "karaoke", "--device", cfg.device], stage="ref-sep")
+         "--out-dir", cfg.p("refsep2"), "--model", "karaoke", "--device", cfg.device,
+         *extra], stage="ref-sep")
     for p in (cfg.p("refsep1", "vocal.wav"), cfg.p("refsep2", "lead.wav")):
         if not os.path.exists(p):
             raise Fail(f"参考分离产物缺失: {p}")
@@ -409,6 +416,8 @@ def main() -> None:
     ap.add_argument("--mix", action="store_true", help="跑混音阶段（验收纯人声后）")
     ap.add_argument("--vocal-gain", type=float, default=1.0)
     ap.add_argument("--acc-gain", type=float, default=0.8)
+    ap.add_argument("--no-sep-cache", action="store_true",
+                    help="禁用分离缓存（sep/ref-sep 强制重新分离）")
     ap.add_argument("-v", "--verbose", action="store_true", help="打印子进程完整输出")
     args = ap.parse_args()
 
@@ -427,7 +436,8 @@ def main() -> None:
               anchor_min_ratio=args.anchor_min_ratio,
               max_seg_sec=args.max_seg_sec,
               n_steps=args.n_steps, cfg=args.cfg,
-              vocal_gain=args.vocal_gain, acc_gain=args.acc_gain, mix=args.mix)
+              vocal_gain=args.vocal_gain, acc_gain=args.acc_gain, mix=args.mix,
+              no_sep_cache=args.no_sep_cache)
 
     setup_logging(cfg.log_file, args.verbose)
     log.info(f"实验    : {cfg.name}")

@@ -166,6 +166,14 @@ lead，产出 `data/songs/<name>/refsep2/lead.wav`；select/eval 自动优先用
 
 ### Gotchas (all hit in practice)
 
+- **sep/ref-sep 有输入内容级缓存**：`w_sep.py` 按「输入文件 md5 + 模型 ckpt md5」两级建目录
+  （`data/.sep_cache/<model>-<ckpt8>/<inmd5>/`），全命中时连 torch 都不导入，直接拷产物，
+  140s 分离 → 4s。换 `--name` 重跑同一首歌 / 同一参考会全命中。坑：
+  - 缓存目录在 `data/.sep_cache`（在 /data/ 下，不进 git）；`sing.py --no-sep-cache` 强制重跑。
+  - 模型权重升级会自动失效（路径带 ckpt md5 前 8 位），但 BS-RoFormer 权重若不变、分离逻辑
+    改了则需手动 `rm -rf data/.sep_cache`。
+  - karaoke 阶段的输入是 `sep1/vocal.wav`：只有它字节稳定（同机同权重确定性分离 OK）缓存才
+    能命中；中途杀进程不会污染缓存（先写 `.tmp` 再原子改名）。
 - **seed-vc 的缓存路径是相对的** (`inference.py:5` `HF_HUB_CACHE='./checkpoints/hf_cache'`，
   `hf_utils.py` `cache_dir="./checkpoints"`)。必须以 `seed-vc/` 为 CWD 启动，否则会在调用处新建
   空 `checkpoints/` 并**重新下载 2.4G 模型**。`sing.py` 已处理（`cwd=SEEDVC_DIR`，仅
