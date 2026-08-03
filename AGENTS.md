@@ -186,8 +186,16 @@ lead，产出 `data/songs/<name>/refsep2/lead.wav`；select/eval 自动优先用
 - **`python cli/inference_svc.py` 找不到 `soulxsinger` 包** — 直接跑 cli 脚本时 sys.path 只有 `cli/`。
   需要 `PYTHONPATH=SoulX-Singer`（`sing.py` 已处理）。
 - **`SoulX-Singer/` 里有本地补丁，升级上游会覆盖掉**：`soulxsinger/models/soulxsinger_svc.py`
-  的 `infer(max_seg_sec=...)` 参数 + `cli/inference_svc.py` 的 `--max_seg_sec`（显存分段），
-  以及 `tools/uvr5/uvr5_weights/*.yaml` 的 `batch_size: 1`。拉新版后要重打。
+  的 `infer(max_seg_sec=...)` 参数（显存分段）+ `build_vocal_segments` 活性优先合并（跳过
+  尾奏/间奏无人声）+ `cli/inference_svc.py` 的 `--max_seg_sec`，以及
+  `tools/uvr5/uvr5_weights/*.yaml` 的 `batch_size: 1`。拉新版后要重打。
+- **本地补丁都在自己的 fork 里，可 diff 可回溯**（2026-08）：
+  - `SoulX-Singer` → `CJYLZS/SoulX-Singer` 分支 `voice-patches`（基于上游 `81aeb3a`）
+  - `tools/pcnsf` → `CJYLZS/pitch-transposition-using-DiffSinger` 分支 `voice-patches`
+    （基于上游 `0e40e97`，rmvpe 裸 state_dict 补丁）
+  - 本地 remote 名为 `fork`。升级上游后重打：`git fetch fork && git rebase origin/<branch> voice-patches`
+    （或 `git cherry-pick`），冲突按 AGENTS.md 的语义修。
+  - GPT-SoVITS 的 uvr5 yaml 改动在 `.gitignore` 里 fork 也带不走，仍靠本文件记录。
 - **参考素材决定上限**：`select` 只在现有素材里选段。素材太短（如 7s 可用）时 prompt 短、
   SIM 偏低，自动建议的变调数也偏高；要多补高音区，录更长的素材而不是靠变调。
 - `--max-prompt` 默认 25s，扩展后 ≤29s（whisper 30s 硬顶）。pt_f0 参与 SVC 的 f0 conditioning，
