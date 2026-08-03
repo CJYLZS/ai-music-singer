@@ -1,0 +1,34 @@
+# ---- 上游项目（各自是独立 git 仓库，不纳入本仓库）----
+# 依赖冲突所以各带 .venv，总计 ~30GB；按 AGENTS.md 的说明单独 clone + 装环境
+/GPT-SoVITS/
+/SoulX-Singer/
+/seed-vc/
+/tools/pcnsf/
+/tools/yingmusic/
+
+# ---- 模型权重 ----
+/tools/pcnsf_hifigan/
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.safetensors
+
+# ---- 数据与产物 ----
+# data/voices = 语音素材, data/songs = 歌曲+分离stem+SVC输出, logs = 训练特征
+/data/
+/logs/
+/girlish_v2Pro.zip
+*.zip
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# ---- 编辑器/系统 ----
+.DS_Store
+.idea/
+.vscode/
