@@ -1,5 +1,14 @@
 # AGENTS.md — voice workspace
 
+## Hardware baseline (2026-08: 3060-Laptop 6GB → RTX 4070 Ti SUPER 16GB)
+
+Many notes below were written against the old 6GB card and keep their historical detail;
+**the current GPU is a 16GB 4070 Ti SUPER**. Numbers observed on it: seed-vc training
+0.25s/step (was 36s/step on 6GB), karaoke separation 27s/track, SoulX SVC segments are
+only VRAM-bound above ~30s. Whenever a note says "6GB card" or "raise on a 24GB card",
+read the current limit as ~16GB: `sing.py --max-seg-sec` default is now **28** and
+separation yaml `batch_size` can be raised toward 4.
+
 ## Workspace layout
 
 The main projects sit side by side at the workspace root. **Their dependencies genuinely conflict** (torch 2.13+cu130 vs 2.6+cu124, `gradio<5` vs 6.x, `transformers<=4.50` vs 4.46), so each carries its own `.venv`. Never install across them. `tools/` holds self-contained helper toolkits with their own venvs too.
@@ -17,6 +26,8 @@ voice/
 ├── tools/pcnsf_hifigan/  PC-NSF-HiFiGAN 44.1k weights (config.json + model.ckpt), 2025.02 release
 ├── tools/yingmusic/  YingMusic-SVC (zero-shot SVC, seed-vc fork + F0-aware timbre adaptor).
 │                     .venv = torch 2.6+cu124. Experimental; see "SVC engine A/B" below.
+├── tools/stems4.py   4-stem separation (drums/bass/other/vocals) via BS-RoFormer 4stems_ft.
+│                     Uses GPT-SoVITS venv + uvr5 weights; see "Separation notes".
 ├── data/             Shared audio. voices/ = speaker source material; songs/ = songs, stems, SVC output
 ├── logs/             GPT-SoVITS training features + checkpoints
 ├── AGENTS.md         this file
@@ -82,11 +93,50 @@ Measured on a 257s Chinese song with a 163s female speech reference (median F0 2
 
   Three fixes mattered, in order of impact: (1) keeping clean audio in the prompt at all; (2) allocating the extension budget by **time-weighted band gap** (`song % − anchor %` per 2-semitone grid) instead of the old "one equal-probability target per segment", which silently assumed every segment contributes equal duration; (3) picking, for each gap band, the candidates needing the **smallest** shift — the old code sorted segments by median ascending and paired them with targets ascending, so low-pitched segments always drew low targets and their transposition headroom went unused. Also: skip the vocoder entirely for the `+0` group, and allow one source segment to produce several differently-shifted copies (material reuse beats forcing +7st).
 - **A strict "must land inside this band" filter starves the top bands.** First cut of the new selector rejected any candidate whose clamped shift fell outside the target band; with material topping out at med 339Hz, +5st reaches only 452Hz, so the 437-491Hz band got 0.30s of the 2.13s it needed — *worse* than the old algorithm there. Allowing a best-effort fallback (rank in-band candidates first, then nearest-to-center) brought it to 2.38s and cut L1 from 0.463 to 0.377.
-- **`--auto_shift` transposes the whole song to fit the speaker.** With a 368Hz song and 247Hz speech it computes −7 semitones, which changes the key. Use `--pitch_shift 0` to preserve the melody.
-- **`build_vocal_segments`' 30s ceiling is a 6GB VRAM trap that looks like slowness.** `soulxsinger_svc.py:257` hard-coded `max_duration_sec=30.0`; with `num_overlaps=1` the longest chunk reaches ~33s. On a 6GB card that chunk overflows into host-memory paging: song_2 sat at 8/10 segments for 12+ minutes with VRAM pegged at 5845/6144 MiB while the first five pipeline stages had taken only 4.6 min total. Patched to accept `max_seg_sec` (threaded through `cli/inference_svc.py --max_seg_sec`, `sing.py --max-seg-sec`, default **20.0**); the short-circuit at `soulxsinger_svc.py:234` follows the same value. song_2 then went 10 chunks (max 31.3s) → 14 chunks (max 22.8s) and **finished in 305.8s**. Raise it on a 24GB card. Symptom to recognize: `Inferring segments` stops advancing with no error, and killing `sing.py` leaves the child `inference_svc.py` alive holding all the VRAM — check `ps aux | grep inference_svc` and kill it before re-running.
+- **`--auto_shift` transposes the whole song to fit the speaker.** With a 368Hz song and 247Hz speech it computes −7 semitones, which changes the key. Use `--pitch_shift 0` to preserve the melody — *but* see the octave-alignment note below: `0` is right for arbitrary shifts, not for octaves.
+- **Octave shifts are the exception to "always `--pitch_shift 0`", and they are the biggest lever found so far for low-register songs.** `pitch_shift` moves only the *F0 condition* fed to the model (`f0_to_coarse(gt_f0, f0_shift=pitch_shift*5)`, `soulxsinger_svc.py:360`; 1 semitone = 5 bins of 20 cents), so the model is asked to sing the same content at a different pitch — `target_f0.npy` itself is untouched, which means `select`/`ext` keep planning against the original register and do not fight the shift. Arbitrary shifts change the key and clash with the untouched accompaniment (upstream's webui compensates by shifting the acc too, `webui_svc.py:236`; `sing.py`'s mix stage cannot), but **±12 is musically free** — same pitch class, one octave up, which is exactly how a female singer covers a male song. A/B'd 2026-08 on song_3 (240.9s, 61 windows, female speech ref, prompt median 267.5Hz), scored per-window against the real voice:
+
+  | | mean SIM | median SIM |
+  |---|---|---|
+  | `--pitch-shift 0` | 0.5018 | 0.5278 |
+  | `--pitch-shift 12` (whole song) | 0.5009 | 0.5148 |
+  | **`--pitch-shift auto`** (per segment) | **0.5485** | **0.5513** |
+
+  The whole-song numbers look like a tie and are not: song_3 turned out to be a **duet**, low 135-175Hz for 16-71s and 235-337Hz afterwards. Split by source register, `+12` wins the low part by **+0.1834** (0.3926 → 0.5761, 14/14 windows improved, the largest single gain measured in this workspace — prompt tuning moves ±0.01) and loses the already-aligned high part by −0.0647, and the two cancel. **Never judge a pitch-shift A/B by the whole-song mean; bucket by source register.**
+- **Per-segment octave alignment (`--pitch-shift auto`) is the general fix, and it nearly saturates.** Implemented as a local patch: `_nearest_octave_shift(seg_median, prompt_median)` rounds `12·log2(ref/seg)` to the nearest multiple of 12 (clamped ±36) and is applied per segment inside the existing loop (`soulxsinger_svc.py`, threaded through `cli/inference_svc.py --pitch_shift auto` and `sing.py --pitch-shift auto`). Two details matter: the decision must read the F0 of the **non-overlapping** part (`segments[idx]`, the audio that actually lands in the output) — using the overlap context lets a low lead-in bias a whole segment; and because SVC already splits at silence, the octave changes land in silence and are seamless. On song_3 it chose `+12` for 16.4-71.5s and `+0` for everything after, reaching 0.5485 against a per-window oracle ceiling of **0.5496**. Rule of thumb: a genuinely low male song (whole song ~150Hz) only needs `--pitch-shift 12`; duets and wide-register songs need `auto`.
+- **`eval_sim --f0` must be the F0 of the audio being scored, not the source's.** `sing.py`'s eval stage passes `cfg.target_f0` (the *source* lead's F0), which is correct only when `pitch_shift=0`. On a shifted run the bucket labels are stale — the shift12 run reported the identical window counts (34/7/6/4/8/2) as the baseline, which is the tell. Re-extract the F0 from `vocal.wav` before bucketing a shifted run; the overall mean/median stay valid either way. (Verified the shift really applied by measuring output F0: 261.0Hz → 522.4Hz, exactly 2×.)
+- **Non-octave global shifts are not a reliable lever, even when the whole-song pitch coverage looks good on paper.** A/B'd 2026-08 on song (song.flac, 257s, 70 windows): median 369Hz vs prompt 274Hz = +5.2st offset. Frame-level analysis showed −6st maximises ≤2st coverage from 17.5% → 49.0%. Running it: SIM dropped from 0.5313 → 0.5199 (−0.011). Cause: the song's melodic range spans p10-p90 = 254-465Hz, so the low end (254-331Hz) was already inside the prompt's register and had the highest SIM (0.5637 at 0-2st). The −6st shift pushed those already-aligned windows out by −0.064, while windows pulled in from the high register only gained +0.008 per window — pitch distance is no longer the bottleneck for those windows; content-feature leakage (whisper speaker residual) is. The asymmetry: moving an already-aligned window out costs more than moving a misaligned window in gains. Two corollaries: (1) never apply a non-octave global shift without checking what fraction of your best windows are already in range; (2) the `--pitch-shift auto` per-segment octave approach avoids this trap because it only shifts segments that are genuinely far out. Per-segment arbitrary (non-octave) shift is musically invalid — it changes the key mid-phrase, breaking tonality. The only musically safe non-zero shift is ±12/±24 (octave multiples, same pitch class).
+- **`--cfg` is the largest single-parameter win found so far, and upstream's default is ~6× too high.** `cfg` is the classifier-free guidance scale in the CFM sampler (`flow_matching.py:293-304`): each Euler step also runs the estimator with the condition zeroed and extrapolates `flow_pred + cfg·(flow_pred − uncond_flow_pred)`, then rescales to the conditional prediction's std (`rescale_cfg=0.75` blends the rescaled and raw versions). The condition here is `content_feat + f0_feat` — **whisper content features plus F0, not a speaker embedding** (`soulxsinger_svc.py:391-394`). That is the whole story: amplifying the condition amplifies whatever speaker residual whisper left in the content features, i.e. CFG pushes the output *toward the original singer*, not toward the prompt. The prompt timbre enters as in-context mel (`pt_mel`), which CFG does not touch. Swept 2026-08 on song (257s, 70 windows), everything else fixed, `sing.py --stages svc,eval --cfg <x>`:
+
+  | cfg | 0 | 0.5 | 1 | 1.5 | 2 | **3 (upstream)** | 5 | 7 |
+  |---|---|---|---|---|---|---|---|---|
+  | mean SIM | 0.5373 | **0.5554** | 0.5541 | 0.5425 | 0.5357 | 0.5313 | 0.5158 | 0.5093 |
+  | median SIM | 0.5478 | 0.5576 | **0.5673** | 0.5575 | 0.5485 | 0.5433 | 0.5257 | 0.5234 |
+
+  Monotone decreasing above ~1, peak at **0.5-1**, and `cfg=0` (CFG fully off) still beats the default. Replicated on two more songs, and it **stacks with `--pitch-shift auto`**:
+
+  | song | cfg=3 (baseline) | cfg=1 | **cfg=0.5** | gain |
+  |---|---|---|---|---|
+  | song (257s) | 0.5313 | 0.5541 | **0.5554** | +0.024 |
+  | song_4 (`--pitch-shift 0`) | 0.5641 | 0.6099 | **0.6207** | +0.057 |
+  | song_3 (`--pitch-shift auto`) | 0.5485 | 0.5755 | **0.5873** | +0.039 |
+
+  For scale: every prompt-engineering change in this file moved ±0.01. **Default in `sing.py` changed to 0.5.**
+- **Low `cfg` trades local stability for similarity — check `eval_stab` before accepting it.** Same runs, 1.5s windows vs the real voice:
+
+  | | song mean/drift/dropouts/worst | song_4 | song_3 |
+  |---|---|---|---|
+  | cfg=3 | 0.4914 / **0.0894** / **12** / 0.2437 | 0.5312 / **0.0655** / **0** / **0.3709** | 0.5117 / **0.0793** / **4** / 0.2526 |
+  | cfg=1 | 0.5080 / 0.1136 / 15 / 0.2401 | 0.5609 / 0.1002 / 2 / 0.2957 | 0.5375 / 0.0928 / 7 / 0.2343 |
+  | cfg=0.5 | **0.5090** / 0.1154 / 15 / 0.2389 | **0.5738** / 0.1049 / 2 / 0.3196 | **0.5450** / 0.0933 / 4 / **0.2851** |
+
+  Drift rises ~0.03-0.04 and dropouts go up on all three. Interpretation: CFG acts as a regularizer that keeps adjacent windows consistent (by leaning on the strongly-conditioned content signal), so removing it lets the output track the prompt more freely and jitter more. The mean gain (+0.024 to +0.057) is 2-6× larger than any prompt change, so it is worth the trade — but on a song where consistency matters more than peak similarity, `cfg=1` is the middle ground (better worst-case than 0.5 on song_4 and song_3's dropouts). Same shape of trade-off as YingMusic vs SoulX.
+- **`build_vocal_segments`' 30s ceiling was a 6GB VRAM trap that looked like slowness.** `soulxsinger_svc.py:257` hard-coded `max_duration_sec=30.0`; with `num_overlaps=1` the longest chunk reaches ~33s. On the old 6GB card that chunk overflowed into host-memory paging: song_2 sat at 8/10 segments for 12+ minutes with VRAM pegged at 5845/6144 MiB. Patched to accept `max_seg_sec` (threaded through `cli/inference_svc.py --max_seg_sec`, `sing.py --max-seg-sec`); the short-circuit at `soulxsinger_svc.py:234` follows the same value. On 6GB we used **20.0**; **on the current 16GB card the default is 28.0** (the whisper encoder hard-caps at 30s — that is the real ceiling, not VRAM anymore). Symptom to recognize if it ever paged again: `Inferring segments` stops advancing with no error, and killing `sing.py` leaves the child `inference_svc.py` alive holding all the VRAM — check `ps aux | grep inference_svc` and kill it before re-running.
 - **`build_vocal_segments` wasted inference on outro/interlude silence — three separate bugs.** (1) The split point for a silence run was placed at its *midpoint* (`(run_start+run_end)//2`), so the outro got glued to the previous vocal segment; (2) the min-duration merge absorbed a short vocal tail *forward* into the following long silence (`163.8-167.7s` vocal + 28s outro → one 24s segment at 11% voiced); (3) `ignore_silent_segments` scored **overlap** segments (which prepend the previous vocal grid) instead of the non-overlapping ones, masking pure-silence segments. Result: song_2 (outro 27.9s + 10s interlude) inferred 187.0s of its 195.7s. Patched (local, gets overwritten on upgrade): silence runs now split at *both* start and end; merging is activity-first — silence grids never enter segments (short active segments infer standalone instead of being padded with trailing silence), overlaps never cross a silence grid and stay ≤ `max_frames` (which also caps VRAM peak); the 5%-voiced filter now scores non-overlapping segments. song_2: 14 segments / 305.8s → **9 segments / 212.9s (−30%)**, tail 167.8s→end is exact zeros (mix fills the accompaniment), SIM mean 0.5794→0.5771 / median 0.5717→0.5757 (no regression). If the song has a long outro, always run `f0-target` first — segmenting keys off `target_f0.npy`.
 - **SoulX SVC handles silence correctly *only after the build_vocal_segments patch*.** Output is inited as `zeros_like(gt_wav)` (`soulxsinger_svc.py:263`) and unvoiced regions simply stay zero. Do not add a silence gate — regions that look like leakage are usually breath/consonants that RMVPE found no F0 for, and gating them removes real audio.
-- **Speech-only references are a known-hard case** ("cross-domain SVC"). In SVCC2023 Task 2 (speech-only target), *no* submitted system reached target-speaker similarity; the winner still sat ~0.4 MOS below. A SIM around 0.6 here is not a failure. The winning system's ablation showed adaptation/fine-tuning beat zero-shot by 0.41 similarity — so **fine-tuning is the next real lever**, not more prompt tweaking.
+- **Speech-only references are a known-hard case** ("cross-domain SVC"). In SVCC2023 Task 2 (speech-only target), *no* submitted system reached target-speaker similarity; the winner still sat ~0.4 MOS below. A SIM around 0.6 here is not a failure. The winning system's ablation showed adaptation/fine-tuning beat zero-shot by 0.41 similarity — so **fine-tuning is the next real lever**, not more prompt tweaking. **But 30s-scale fine-tuning is NOT that lever** (A/B'd 2026-08, see below) — QQ Music's "30s 微调" works because it's a purpose-built singing model + 30 epochs + matched-content nursery-rhyme recordings, not because 30s of data is enough in general.
+- **seed-vc 30s fine-tuning: process works, result is negative.** A/B'd 2026-08 (ref.wav 15-45s cut into 3×10s clips → `train.py` on `config_dit_mel_seed_uvit_whisper_base_f0_44k.yml`, 100/500 steps, then `inference.py --checkpoint ft_model.pth` on a 30s song section, scored by `eval_stab.py` vs the real voice): zero-shot mean 0.5466/median 0.5991 → ft100 0.5413/0.5628 → ft500 0.5300/0.5506. **More steps = worse similarity**; loss plateaus at ~0.52. The model memorizes the 3 clips and loses the pretrained speaker-manifold prior that zero-shot relies on; and the ft objective is mel reconstruction, not speaker-similarity. Conclusion: for seed-vc, the right use is zero-shot + good prompt; real fine-tuning needs RVC-scale data (≥5-10 min). Flow is still useful as a reference: `train.py --config ... --dataset-dir <1-30s clips> --run-name x --batch-size 1 --max-steps 500`, output `runs/<name>/ft_model.pth`; resume auto-loads the latest `DiT_epoch_*_step_*.pth` (weights only, iters restart at 0).
+- **seed-vc fine-tuning on a 6GB card was a VRAM-paging trap (fixed by hardware).** Full pipeline (DiT 17×768 + whisper-small fp32 + RMVPE + OpenVoiceV2 converter + campplus + BigVGAN, all fp32) peaks ~7.4GB VRAM. On the old 3060-Laptop 6GB it paged: **36s/step** (50 steps took 30+ min), no error, GPU util low. Same run on the 4070 Ti SUPER 16GB: **~0.25s/step**, 500 steps in ~2 min — this is now a non-issue, but if seed-vc training ever crawls again, check `nvidia-smi` for memory.used near the cap before touching any code. Note `checkpoints/hf_cache` (vocoder/whisper) vs `checkpoints/models--*` (DiT/rmvpe/campplus) are separate cache roots; OpenVoiceV2 converter downloads on first `train.py` run.
 - **The source material bounds everything.** This reference had 0.4s above 370Hz while the song spent 44.3% of its voiced frames there. Reference *selection* only reshuffles what exists; recording 30-60s of higher-register material is worth more than any parameter.
 
 ### SVC engine A/B (2026-08): SoulX-Singer vs YingMusic-SVC
@@ -102,7 +152,7 @@ Same inputs (257s lead vocal, same ref), same eval protocol (eval_sim vs real sp
 - **YingMusic is ~+0.04 mean SIM but less stable**: adjacent-window drift ~0.03-0.04 higher, more dropouts, worse worst-case window. Diffusion (flow-matching, 100 steps) trades local jitter for better average similarity — don't judge by mean SIM alone (see `singing/eval_stab.py`).
 - **The F0-aware timbre adaptor makes the pitch-extension stage unnecessary on this model**: raw 7s prompt ≈ 24.7s extended prompt (0.5531 vs 0.5496). On YingMusic, skip `ext` entirely.
 - **YingMusic auto-transposes the song into the ref's register by default** (`mm4.py` `preprocess_voice_conversion`: base shift + adaptive factor + 3.5st, clamp ±8). Must pass `--semi-tone-shift 0` to keep the melody (flag added to `my_inference.py` — upstream argparse doesn't expose it).
-- Setup: own `.venv` (torch 2.6+cu124), `checkpoints/` = seed-vc's HF caches copied in (whisper-small, bigvgan_v2_44khz_128band_512x, funasr/campplus, lj1995/VoiceConversionWebUI) + `YingMusic-SVC-full.pt` (731MB). **CWD must be `tools/yingmusic/`** (relative cache paths, same gotcha as seed-vc). RTF ≈ 5.9 at 100 steps fp16 on 6GB.
+- Setup: own `.venv` (torch 2.6+cu124), `checkpoints/` = seed-vc's HF caches copied in (whisper-small, bigvgan_v2_44khz_128band_512x, funasr/campplus, lj1995/VoiceConversionWebUI) + `YingMusic-SVC-full.pt` (731MB). **CWD must be `tools/yingmusic/`** (relative cache paths, same gotcha as seed-vc). RTF ≈ 5.9 at 100 steps fp16 on 6GB (16GB card is not memory-bound; the bottleneck is the 100 diffusion steps themselves).
   ```bash
   cd tools/yingmusic && .venv/bin/python my_inference.py \
       --source ../data/songs/<name>/sep2/lead.wav --target ../data/songs/<name>/prompt.wav \
@@ -111,10 +161,24 @@ Same inputs (257s lead vocal, same ref), same eval protocol (eval_sim vs real sp
       --semi-tone-shift 0
   ```
 
+### SVC engine A/B #2 (2026-08): HQ-SVC (AAAI'26 low-resource zero-shot)
+
+HQ-SVC = 解耦 codec + EVA 模块 + DDSP/diffusion 渐进生成，主打低资源零样本。Same 257s song, same ref; here we compared on the full song with the real `prompt_ext` as target (SoulX via `sing.py` full pipeline, HQ-SVC via `tools/HQ-SVC/cli_infer.py --shift 0`):
+
+| engine | eval_sim vs prompt_ext | eval_stab vs real voice (1.5s win) |
+|---|---|---|
+| | mean / median | mean / median / drift / dropouts / worst |
+| SoulX-Singer-SVC (baseline) | **0.5850 / 0.5945** | **0.4886 / 0.5154** / 0.0957 / 16 / 0.2346 |
+| HQ-SVC | 0.5060 / 0.5084 | 0.4086 / 0.4125 / **0.0748** / 24 / **0.1869** |
+
+- **HQ-SVC loses ~0.08 mean SIM to SoulX in both protocols** — worse timbre similarity — but its windows are *more internally consistent* (drift 0.0748 vs 0.0957, best worst-case). It sounds "stable but off-timbre"; SoulX sounds closer to the ref with more local jumps. For speech→singing cross-domain this confirms zero-shot SVC quality is still dominated by pretraining scale (SoulX: 42k hours; HQ-SVC: <80h). **Eliminated by ear (2026-08): the timbre gap is clearly audible on the full song; do not wire HQ-SVC into `sing.py`.** Keep the A/B files only as reference data.
+- Its selling point is **low-resource training** (single consumer GPU, <80h data), not zero-shot inference quality — training code was still not released as of 2026-08, so it's inference-only for now.
+- Setup gotchas (repo dir + weights removed 2026-08 to free 15G; re-download if ever needed): ships a ready-made conda env `environment.tar.gz` (4.7GB → unpack to `venv/`, torch 2.0.1+cu118, python3.9); weights on HF `shawnpi/HQ-SVC` (`utils/pretrain/*`: 250000_step_val_loss_0.50.pth 241M + ns3_facodec_* 450M + rmvpe 368M + nsf_hifigan 57M). `utils/pretrain/nsf_hifigan/` needs `config.json` copied from `configs/hifigan_config.json` (not shipped in place). `LD_LIBRARY_PATH` must be unset before running (`unset LD_LIBRARY_PATH`). Local CLI wrapper: `tools/HQ-SVC/cli_infer.py` (source + 1..N targets, `--shift 0` to keep melody; sys.path must use `append`, not `insert`, or `utils` shadows itself). RTF ≈ 0.05 on 16GB (10 diffusion steps).
+
 ### Separation notes
 
 - `tools/uvr5/uvr5_weights/` ships `.ckpt` files but **BS-RoFormer's `.yaml` config was missing**; fetched from `ZFTurbo/Music-Source-Separation-Training`. The karaoke model + config came from `Soul-AILab/SoulX-Singer-Preprocess`.
-- **`batch_size` in those yaml files is a real performance trap.** The karaoke model ships `batch_size: 8` with `chunk_size: 485100` (11s/chunk) = 88s of audio resident. On 6GB that overflows into host-memory swapping: VRAM pegged, GPU utilization low, 15+ min per track. Setting `batch_size: 1` gave 2.2GB VRAM, 92-100% utilization, **27 seconds** — ~33× faster. Read from config at `bsroformer.py:117`. Raise it again on a 24GB card.
+- **`batch_size` in those yaml files is a real performance trap.** The karaoke model ships `batch_size: 8` with `chunk_size: 485100` (11s/chunk) = 88s of audio resident. On 6GB that overflows into host-memory swapping: VRAM pegged, GPU utilization low, 15+ min per track. Setting `batch_size: 1` gave 2.2GB VRAM, 92-100% utilization, **27 seconds** — ~33× faster. Read from config at `bsroformer.py:117`. **On the current 16GB card `batch_size: 4` is safe** (≈8.8GB with the karaoke chunk size); the yamls in the repo still carry `batch_size: 1` from the 6GB era — bump them if a track feels slow.
 - `tools/uvr5_cli.py` only writes the vocal stem, but the underlying `_path_audio_(input, others_root, vocal_root, ...)` writes both. Call it directly to keep the instrumental.
 - Karaoke separation measurably isolates backing vocals (37/128 windows contaminated, up to backing/lead 0.66) but **only marginally improved output stability** — residual bleed remains. For harmony-heavy songs, YingMusic-SVC is the model actually trained for this (its benchmark is graded by contamination level).
 
@@ -162,8 +226,10 @@ lead，产出 `data/songs/<name>/refsep2/lead.wav`；select/eval 自动优先用
 (参考切片打分贪心选段 → `prompt.wav`+`prompt_f0.npy`+`prompt_stats.json`) → `ext` (原始 prompt 作
 音色锚点 + 按频段缺口追加移调段，PC-NSF-HiFiGAN 默认 `--ext-method nsf`，seed-vc 可选；
 `--anchor-min-ratio 0.55` 控制干净音频最低占比，拼出 ≤29s 的 `prompt_ext`) → `svc`
-(SoulX, `--pitch_shift 0` 保留旋律，`--max-seg-sec 20` 防 6GB 爆显存) → `eval` (eval_sim.py 对照
-真实语音) → `mix` (opt-in, `--mix`)。Worker 脚本在 `singing/w_*.py`，每个阶段用对应项目的 venv 跑。
+(SoulX, `--pitch-shift 0` 默认保留旋律；`12` 全曲高八度适配男→女；`auto` 按段自动对齐（男女对唱/跨音区）；
+`--max-seg-sec 28` 适配 16GB；`--cfg 0.5` 默认，上游 3.0 会放大原唱音色残留) →
+`eval` (eval_sim.py 对照真实语音) → `mix` (opt-in, `--mix`)。
+Worker 脚本在 `singing/w_*.py`，每个阶段用对应项目的 venv 跑。
 
 ### Gotchas (all hit in practice)
 
@@ -187,8 +253,10 @@ lead，产出 `data/songs/<name>/refsep2/lead.wav`；select/eval 自动优先用
   需要 `PYTHONPATH=SoulX-Singer`（`sing.py` 已处理）。
 - **`SoulX-Singer/` 里有本地补丁，升级上游会覆盖掉**：`soulxsinger/models/soulxsinger_svc.py`
   的 `infer(max_seg_sec=...)` 参数（显存分段）+ `build_vocal_segments` 活性优先合并（跳过
-  尾奏/间奏无人声）+ `cli/inference_svc.py` 的 `--max_seg_sec`，以及
-  `tools/uvr5/uvr5_weights/*.yaml` 的 `batch_size: 1`。拉新版后要重打。
+  尾奏/间奏无人声）+ `_nearest_octave_shift` / `pitch_shift="auto"` 按段八度对齐，
+  以及 `cli/inference_svc.py` 的 `--max_seg_sec` 和 `--pitch_shift` 的 `_pitch_shift_arg`
+  （改成接受整数或 `"auto"`，上游是 `type=int`），还有
+   `tools/uvr5/uvr5_weights/*.yaml` 的 `batch_size: 1`（6GB 时代调的；16GB 卡可提到 4，见 Separation notes）。拉新版后要重打。
 - **本地补丁都在自己的 fork 里，可 diff 可回溯**（2026-08）：
   - `SoulX-Singer` → `CJYLZS/SoulX-Singer` 分支 `voice-patches`（基于上游 `81aeb3a`）
   - `tools/pcnsf` → `CJYLZS/pitch-transposition-using-DiffSinger` 分支 `voice-patches`
@@ -277,7 +345,8 @@ uv run python train.py --ref data/voices/ref.wav --name myvoice \
     --threshold -30 --min-length 4000 --min-interval 600 --max-sil-kept 800
 
 # Tune training. Defaults: s1 batch 6 / 2 epochs / save every 1,
-# s2 batch 4 / 10 epochs / save every 5. On 6GB VRAM keep both batches <= 4.
+# s2 batch 4 / 10 epochs / save every 5. On the old 6GB card keep both batches <= 4;
+# 16GB fits s1 batch 12 / s2 batch 8 comfortably.
 uv run python train.py --ref data/voices/ref.wav --name myvoice \
     --s1-batch 4 --s1-epochs 30 --s1-save-every 5 \
     --s2-batch 4 --s2-epochs 20 --s2-save-every 5

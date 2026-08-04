@@ -6,6 +6,7 @@
     song.flac
       ├─ BS-RoFormer          -> 人声(含和声) + 伴奏      (GPT-SoVITS venv)
       │    └─ karaoke 模型    -> 主唱 + 和声
+      ├─ 伴奏 -> 4-stem 分离   -> 鼓点+bass 骨架 (sep4/, GPT-SoVITS venv)
       ├─ 主唱 -> RMVPE F0     (SoulX venv)
       ├─ 参考音频(通常带BGM/BGM含人声) 同样两步分离 -> 纯人声 lead
       ├─ 纯人声切片 -> F0 分析 -> 贪心选段 -> prompt.wav (SoulX venv)
@@ -44,7 +45,7 @@ from dataclasses import dataclass
 ROOT = os.path.dirname(os.path.abspath(__file__))
 log = logging.getLogger("sing")
 
-ALL_STAGES = ["sep", "ref-sep", "f0-target", "select", "ext", "svc", "eval", "mix"]
+ALL_STAGES = ["sep", "stems4", "ref-sep", "f0-target", "select", "ext", "svc", "eval", "mix"]
 OPT_IN_STAGES = {"mix"}  # 先验收纯人声，再 --mix
 
 VENVS = {
@@ -61,6 +62,8 @@ BS_CKPT = os.path.join(UVR5_WEIGHTS, "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
 BS_YAML = os.path.join(UVR5_WEIGHTS, "model_bs_roformer_ep_317_sdr_12.9755.yaml")
 KARAOKE_CKPT = os.path.join(UVR5_WEIGHTS, "mel_band_roformer_karaoke_becruily.ckpt")
 KARAOKE_YAML = os.path.join(UVR5_WEIGHTS, "mel_band_roformer_karaoke_becruily.yaml")
+STEMS4_CKPT = os.path.join(UVR5_WEIGHTS, "bs_roformer_4stems_ft.pth")
+STEMS4_YAML = os.path.join(UVR5_WEIGHTS, "bs_roformer_4stems_ft.yaml")
 RMVPE = os.path.join(ROOT, "SoulX-Singer", "pretrained_models",
                      "SoulX-Singer-Preprocess", "rmvpe", "rmvpe.pt")
 SVC_MODEL = os.path.join(ROOT, "SoulX-Singer", "pretrained_models", "SoulX-Singer", "model-svc.pt")
@@ -143,9 +146,10 @@ class Cfg:
     semitone_shift: int | None = None
     ext_method: str = "nsf"
     anchor_min_ratio: float = 0.55
-    max_seg_sec: float = 20.0
+    max_seg_sec: float = 28.0
     n_steps: int = 32
-    cfg: float = 3.0
+    cfg: float = 0.5   # 上游默认 3.0，实测偏高（见 AGENTS.md「cfg 扫点」）
+    pitch_shift: int | str = 0
     vocal_gain: float = 1.0
     acc_gain: float = 0.8
     mix: bool = False
@@ -178,6 +182,11 @@ class Cfg:
     @property
     def acc_wav(self) -> str:
         return self.p("sep1", "acc.wav")
+
+    @property
+    def drum_bass_wav(self) -> str:
+        """伴奏中的 鼓点+bass 骨架（stems4 阶段产物，供 --mix 使用）。"""
+        return self.p("sep4", "drum_bass.wav")
 
     @property
     def target_f0(self) -> str:
@@ -228,6 +237,8 @@ def preflight(cfg: Cfg) -> None:
         ("BS-RoFormer 配置", BS_YAML),
         ("karaoke 权重", KARAOKE_CKPT),
         ("karaoke 配置", KARAOKE_YAML),
+        ("4-stem 权重", STEMS4_CKPT),
+        ("4-stem 配置", STEMS4_YAML),
         ("RMVPE", RMVPE),
         ("SVC 模型", SVC_MODEL),
         ("SVC 配置", SVC_CONFIG),
@@ -273,6 +284,22 @@ def stage_sep(cfg: Cfg) -> None:
               cfg.p("sep2", "lead.wav"), cfg.p("sep2", "backing.wav")):
         if not os.path.exists(p):
             raise Fail(f"分离产物缺失: {p}")
+
+
+def stage_stems4(cfg: Cfg) -> None:
+    banner("Stage: 伴奏乐器分离 (4-stem -> 鼓点+bass)")
+    for p in (cfg.acc_wav,):
+        if not os.path.exists(p):
+            raise Fail(f"缺少伴奏: {p}（先跑 sep 阶段）")
+    run([VENVS["gsv"], os.path.join(ROOT, "tools", "stems4.py"),
+         cfg.acc_wav, cfg.p("sep4"), "--mix",
+         "--drum-bass-out", cfg.drum_bass_wav,
+         "--device", cfg.device], stage="stems4")
+    for p in (cfg.drum_bass_wav, cfg.p("sep4", "acc_drums.wav"),
+              cfg.p("sep4", "acc_bass.wav")):
+        if not os.path.exists(p):
+            raise Fail(f"4-stem 分离产物缺失: {p}")
+    log.info(f"  -> {cfg.drum_bass_wav}（鼓点+bass 骨架，可用作 --mix 的伴奏）")
 
 
 def stage_ref_sep(cfg: Cfg) -> None:
@@ -333,6 +360,16 @@ def stage_svc(cfg: Cfg) -> None:
             raise Fail(f"缺少前置产物: {p}")
     svc_dir = cfg.p("svc")
     os.makedirs(svc_dir, exist_ok=True)
+    # pitch_shift 只移调「送进模型的 F0 条件」(soulxsinger_svc.py:360 f0_to_coarse
+    # 的 f0_shift=pitch_shift*5，1 半音=5 个 20-cent bin)，target_f0.npy 本身不变，
+    # 所以 select/ext 仍按原始音域规划。输出音频会跟着高/低相应的半音数。
+    if cfg.pitch_shift == "auto":
+        log.info("  F0 条件移调: auto（按段对齐到最近八度，男女对唱/跨音区歌曲用）")
+    elif cfg.pitch_shift:
+        log.info(f"  F0 条件移调: {cfg.pitch_shift:+d} 半音（输出音高同步改变）")
+        if cfg.pitch_shift % 12 != 0:
+            log.warning(f"  注意: {cfg.pitch_shift:+d} 不是八度整数倍，人声会与原伴奏跑调；"
+                        f"±12/±24 才是和声上安全的")
     run([VENVS["soulx"], os.path.join(SOULX_DIR, "cli", "inference_svc.py"),
          "--device", cfg.device,
          "--model_path", SVC_MODEL, "--config", SVC_CONFIG,
@@ -341,7 +378,7 @@ def stage_svc(cfg: Cfg) -> None:
          "--prompt_f0_path", cfg.prompt_ext_f0,
          "--target_f0_path", cfg.target_f0,
          "--save_dir", svc_dir,
-         "--pitch_shift", "0",           # 保留原旋律，不自动移调
+         "--pitch_shift", str(cfg.pitch_shift),
          "--n_steps", str(cfg.n_steps), "--cfg", str(cfg.cfg),
          "--max_seg_sec", str(cfg.max_seg_sec),
          "--fp16"], stage="svc", cwd=SOULX_DIR,
@@ -377,6 +414,7 @@ def stage_mix(cfg: Cfg) -> None:
 
 STAGE_FN = {
     "sep": stage_sep,
+    "stems4": stage_stems4,
     "ref-sep": stage_ref_sep,
     "f0-target": stage_f0_target,
     "select": stage_select,
@@ -385,6 +423,16 @@ STAGE_FN = {
     "eval": stage_eval,
     "mix": stage_mix,
 }
+
+
+def _pitch_shift_arg(v: str):
+    """--pitch-shift 接受整数半音数或字面量 "auto"（按段对齐到最近八度）。"""
+    if isinstance(v, str) and v.lower() == "auto":
+        return "auto"
+    try:
+        return int(v)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'--pitch-shift 需要整数或 "auto"，收到 {v!r}')
 
 
 def main() -> None:
@@ -409,10 +457,16 @@ def main() -> None:
                     help="音域扩展引擎: nsf（默认，PC-NSF-HiFiGAN）| seedvc")
     ap.add_argument("--anchor-min-ratio", type=float, default=0.55,
                     help="prompt_ext 中原始干净音频的最低占比（音色锚点，默认 0.55）")
-    ap.add_argument("--max-seg-sec", type=float, default=20.0,
-                    help="SVC 单段最长秒数（默认 20，适配 6GB；上游默认 30 会爆显存）")
+    ap.add_argument("--max-seg-sec", type=float, default=28.0,
+                    help="SVC 单段最长秒数（默认 28，16GB 卡无压力；上游默认 30，6GB 卡需降到 20）")
     ap.add_argument("--n-steps", type=int, default=32, help="SVC 采样步数（默认 32）")
-    ap.add_argument("--cfg", type=float, default=3.0, help="SVC cfg 系数（默认 3.0）")
+    ap.add_argument("--cfg", type=float, default=0.5,
+                    help="SVC classifier-free guidance 强度（默认 0.5；上游默认 3.0 实测过强，"
+                         "会放大内容特征里的原唱音色残留。0 = 完全关闭 CFG）")
+    ap.add_argument("--pitch-shift", type=_pitch_shift_arg, default=0,
+                    help='SVC F0 条件移调（半音）。男声歌用 +12（高八度）可对齐女声 prompt；'
+                         '"auto" 按段对齐到最近八度（男女对唱/跨音区）；'
+                         '非八度整数倍会与原伴奏跑调')
     ap.add_argument("--mix", action="store_true", help="跑混音阶段（验收纯人声后）")
     ap.add_argument("--vocal-gain", type=float, default=1.0)
     ap.add_argument("--acc-gain", type=float, default=0.8)
@@ -435,7 +489,7 @@ def main() -> None:
               semitone_shift=args.semitone_shift, ext_method=args.ext_method,
               anchor_min_ratio=args.anchor_min_ratio,
               max_seg_sec=args.max_seg_sec,
-              n_steps=args.n_steps, cfg=args.cfg,
+              n_steps=args.n_steps, cfg=args.cfg, pitch_shift=args.pitch_shift,
               vocal_gain=args.vocal_gain, acc_gain=args.acc_gain, mix=args.mix,
               no_sep_cache=args.no_sep_cache)
 
