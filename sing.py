@@ -154,7 +154,7 @@ class Cfg:
     pitch_shift: int | str = 0
     seed: int | None = None   # CFM 初始噪声 seed；None = 上游行为（每次随机、不可复现）
     n_seeds: int = 1   # >1 时跑 N 个 seed 再用 DP 段级选择（见 AGENTS.md「DP 段级选择」）
-    dp_lam: float = 1.0   # DP 边界一致性惩罚权重（0=朴素 argmax；段数多的歌用 0 更合算）
+    dp_lam: float = 0.0   # DP 边界一致性惩罚权重（0=朴素 argmax；听到明显跳变时才往上调）
     vocal_gain: float = 1.0
     acc_gain: float = 0.8
     mix: bool = False
@@ -531,8 +531,9 @@ def main() -> None:
     ap.add_argument("--n-seeds", type=int, default=1,
                     help="多采样：跑 N 个 seed 再用 DP 段级选择拼出最优人声（1=单次推理）。"
                          "代价 N× 时间，收益 +0.015~+0.04；详见 AGENTS.md「DP 段级选择」")
-    ap.add_argument("--dp-lam", type=float, default=1.0,
-                    help="DP 边界一致性惩罚权重（0=朴素 argmax；段数多的歌用 0 更合算）")
+    ap.add_argument("--dp-lam", type=float, default=0.0,
+                    help="DP 边界一致性惩罚权重（默认 0 = 朴素 argmax，均值最高）。"
+                         "调高只换来更稳的边界、更低的均值（拿 SIM 换 drift，同 --cfg 的形状）")
     ap.add_argument("--mix", action="store_true", help="跑混音阶段（验收纯人声后）")
     ap.add_argument("--vocal-gain", type=float, default=1.0)
     ap.add_argument("--acc-gain", type=float, default=0.8)
