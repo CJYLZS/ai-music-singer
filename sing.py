@@ -153,6 +153,8 @@ class Cfg:
     rescale_cfg: float = 0.75   # CFG 外推的 std 归一化混合比（上游默认，0=关闭归一化）
     pitch_shift: int | str = 0
     seed: int | None = None   # CFM 初始噪声 seed；None = 上游行为（每次随机、不可复现）
+    n_seeds: int = 1   # >1 时跑 N 个 seed 再用 DP 段级选择（见 AGENTS.md「DP 段级选择」）
+    dp_lam: float = 1.0   # DP 边界一致性惩罚权重（0=朴素 argmax；段数多的歌用 0 更合算）
     vocal_gain: float = 1.0
     acc_gain: float = 0.8
     mix: bool = False
@@ -356,23 +358,8 @@ def stage_ext(cfg: Cfg) -> None:
          "--max-sec", "29", "--device", cfg.device], stage="ext")
 
 
-def stage_svc(cfg: Cfg) -> None:
-    banner("Stage: 歌声转换 (SoulX-Singer SVC)")
-    for p in (cfg.prompt_ext_wav, cfg.prompt_ext_f0, cfg.lead_wav, cfg.target_f0):
-        if not os.path.exists(p):
-            raise Fail(f"缺少前置产物: {p}")
-    svc_dir = cfg.p("svc")
-    os.makedirs(svc_dir, exist_ok=True)
-    # pitch_shift 只移调「送进模型的 F0 条件」(soulxsinger_svc.py:360 f0_to_coarse
-    # 的 f0_shift=pitch_shift*5，1 半音=5 个 20-cent bin)，target_f0.npy 本身不变，
-    # 所以 select/ext 仍按原始音域规划。输出音频会跟着高/低相应的半音数。
-    if cfg.pitch_shift == "auto":
-        log.info("  F0 条件移调: auto（按段对齐到最近八度，男女对唱/跨音区歌曲用）")
-    elif cfg.pitch_shift:
-        log.info(f"  F0 条件移调: {cfg.pitch_shift:+d} 半音（输出音高同步改变）")
-        if cfg.pitch_shift % 12 != 0:
-            log.warning(f"  注意: {cfg.pitch_shift:+d} 不是八度整数倍，人声会与原伴奏跑调；"
-                        f"±12/±24 才是和声上安全的")
+def _svc_cmd(cfg: Cfg, svc_dir: str, seed: int | None) -> list[str]:
+    """构建单次 SVC 推理命令。"""
     cmd = [VENVS["soulx"], os.path.join(SOULX_DIR, "cli", "inference_svc.py"),
            "--device", cfg.device,
            "--model_path", SVC_MODEL, "--config", SVC_CONFIG,
@@ -386,11 +373,68 @@ def stage_svc(cfg: Cfg) -> None:
            "--rescale_cfg", str(cfg.rescale_cfg),
            "--max_seg_sec", str(cfg.max_seg_sec),
            "--num_overlaps", str(cfg.num_overlaps)]
+    if seed is not None:
+        cmd += ["--seed", str(seed)]
+    return cmd + ["--fp16"]
+
+
+def _svc_multi_seed(cfg: Cfg) -> None:
+    """--n-seeds N: 跑 N 个 seed 后用 DP 段级选择拼出最优人声。"""
+    log.info(f"  多采样模式: {cfg.n_seeds} 个 seed → DP 段级选择（λ={cfg.dp_lam:g}）")
+    base_seed = cfg.seed if cfg.seed is not None else 1
+    cands: list[str] = []
+    for i in range(cfg.n_seeds):
+        s = base_seed + i * 1000   # 每个 seed 之间间隔大，避免各段 seed+idx 出现交叉
+        svc_dir = cfg.p(f"svc_s{s}")
+        os.makedirs(svc_dir, exist_ok=True)
+        log.info(f"  SVC run {i+1}/{cfg.n_seeds}  seed={s}")
+        run(_svc_cmd(cfg, svc_dir, s), stage="svc", cwd=SOULX_DIR,
+            env={"PYTHONPATH": SOULX_DIR})
+        gen = os.path.join(svc_dir, "generated.wav")
+        if not os.path.exists(gen):
+            raise Fail(f"SVC 未产生输出（seed={s}）: {gen}")
+        cands.append(gen)
+    # DP 选择
+    log.info(f"  DP 段级选择  λ={cfg.dp_lam:g}  {cfg.n_seeds} 候选")
+    os.makedirs(cfg.p("svc"), exist_ok=True)
+    report = cfg.p("svc", "dp_select.json")
+    run([VENVS["gsv"], os.path.join(WORKERS, "w_dpselect.py"),
+         "--prompt", cfg.prompt_ext_wav,
+         "--target-f0", cfg.target_f0,
+         "--cands", *cands,
+         "--out", cfg.vocal_wav,
+         "--lam", str(cfg.dp_lam),
+         "--max-seg-sec", str(cfg.max_seg_sec),
+         "--num-overlaps", str(cfg.num_overlaps),
+         "--device", cfg.device,
+         "--report", report], stage="svc")
+    log.info(f"  -> {cfg.vocal_wav}")
+
+
+def stage_svc(cfg: Cfg) -> None:
+    banner("Stage: 歌声转换 (SoulX-Singer SVC)")
+    for p in (cfg.prompt_ext_wav, cfg.prompt_ext_f0, cfg.lead_wav, cfg.target_f0):
+        if not os.path.exists(p):
+            raise Fail(f"缺少前置产物: {p}")
+    if cfg.n_seeds > 1:
+        _svc_multi_seed(cfg)
+        return
+    svc_dir = cfg.p("svc")
+    os.makedirs(svc_dir, exist_ok=True)
+    # pitch_shift 只移调「送进模型的 F0 条件」(soulxsinger_svc.py:360 f0_to_coarse
+    # 的 f0_shift=pitch_shift*5，1 半音=5 个 20-cent bin)，target_f0.npy 本身不变，
+    # 所以 select/ext 仍按原始音域规划。输出音频会跟着高/低相应的半音数。
+    if cfg.pitch_shift == "auto":
+        log.info("  F0 条件移调: auto（按段对齐到最近八度，男女对唱/跨音区歌曲用）")
+    elif cfg.pitch_shift:
+        log.info(f"  F0 条件移调: {cfg.pitch_shift:+d} 半音（输出音高同步改变）")
+        if cfg.pitch_shift % 12 != 0:
+            log.warning(f"  注意: {cfg.pitch_shift:+d} 不是八度整数倍，人声会与原伴奏跑调；"
+                        f"±12/±24 才是和声上安全的")
     if cfg.seed is not None:
         log.info(f"  CFM 噪声 seed: {cfg.seed}（可复现；第 i 段用 seed+i）")
-        cmd += ["--seed", str(cfg.seed)]
-    run(cmd + ["--fp16"], stage="svc", cwd=SOULX_DIR,
-        env={"PYTHONPATH": SOULX_DIR})  # 直接跑 cli/*.py 时 soulxsinger 包不在 sys.path
+    run(_svc_cmd(cfg, svc_dir, cfg.seed), stage="svc", cwd=SOULX_DIR,
+        env={"PYTHONPATH": SOULX_DIR})
     gen = os.path.join(svc_dir, "generated.wav")
     if not os.path.exists(gen):
         raise Fail(f"SVC 未产生输出: {gen}")
@@ -484,6 +528,11 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=None,
                     help="CFM 初始噪声 seed（默认不设 = 每次随机、不可复现）。"
                          "设定后同参数可复现，第 i 段用 seed+i")
+    ap.add_argument("--n-seeds", type=int, default=1,
+                    help="多采样：跑 N 个 seed 再用 DP 段级选择拼出最优人声（1=单次推理）。"
+                         "代价 N× 时间，收益 +0.015~+0.04；详见 AGENTS.md「DP 段级选择」")
+    ap.add_argument("--dp-lam", type=float, default=1.0,
+                    help="DP 边界一致性惩罚权重（0=朴素 argmax；段数多的歌用 0 更合算）")
     ap.add_argument("--mix", action="store_true", help="跑混音阶段（验收纯人声后）")
     ap.add_argument("--vocal-gain", type=float, default=1.0)
     ap.add_argument("--acc-gain", type=float, default=0.8)
@@ -508,7 +557,7 @@ def main() -> None:
               max_seg_sec=args.max_seg_sec, num_overlaps=args.num_overlaps,
               n_steps=args.n_steps, cfg=args.cfg, rescale_cfg=args.rescale_cfg,
               pitch_shift=args.pitch_shift,
-              seed=args.seed,
+              seed=args.seed, n_seeds=args.n_seeds, dp_lam=args.dp_lam,
               vocal_gain=args.vocal_gain, acc_gain=args.acc_gain, mix=args.mix,
               no_sep_cache=args.no_sep_cache)
 
