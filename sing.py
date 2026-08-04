@@ -147,9 +147,12 @@ class Cfg:
     ext_method: str = "nsf"
     anchor_min_ratio: float = 0.55
     max_seg_sec: float = 28.0
+    num_overlaps: int = 1   # 每段往前取几个活性格作上下文（见 AGENTS.md「num_overlaps」）
     n_steps: int = 32
     cfg: float = 0.5   # 上游默认 3.0，实测偏高（见 AGENTS.md「cfg 扫点」）
+    rescale_cfg: float = 0.75   # CFG 外推的 std 归一化混合比（上游默认，0=关闭归一化）
     pitch_shift: int | str = 0
+    seed: int | None = None   # CFM 初始噪声 seed；None = 上游行为（每次随机、不可复现）
     vocal_gain: float = 1.0
     acc_gain: float = 0.8
     mix: bool = False
@@ -370,18 +373,23 @@ def stage_svc(cfg: Cfg) -> None:
         if cfg.pitch_shift % 12 != 0:
             log.warning(f"  注意: {cfg.pitch_shift:+d} 不是八度整数倍，人声会与原伴奏跑调；"
                         f"±12/±24 才是和声上安全的")
-    run([VENVS["soulx"], os.path.join(SOULX_DIR, "cli", "inference_svc.py"),
-         "--device", cfg.device,
-         "--model_path", SVC_MODEL, "--config", SVC_CONFIG,
-         "--prompt_wav_path", cfg.prompt_ext_wav,
-         "--target_wav_path", cfg.lead_wav,
-         "--prompt_f0_path", cfg.prompt_ext_f0,
-         "--target_f0_path", cfg.target_f0,
-         "--save_dir", svc_dir,
-         "--pitch_shift", str(cfg.pitch_shift),
-         "--n_steps", str(cfg.n_steps), "--cfg", str(cfg.cfg),
-         "--max_seg_sec", str(cfg.max_seg_sec),
-         "--fp16"], stage="svc", cwd=SOULX_DIR,
+    cmd = [VENVS["soulx"], os.path.join(SOULX_DIR, "cli", "inference_svc.py"),
+           "--device", cfg.device,
+           "--model_path", SVC_MODEL, "--config", SVC_CONFIG,
+           "--prompt_wav_path", cfg.prompt_ext_wav,
+           "--target_wav_path", cfg.lead_wav,
+           "--prompt_f0_path", cfg.prompt_ext_f0,
+           "--target_f0_path", cfg.target_f0,
+           "--save_dir", svc_dir,
+           "--pitch_shift", str(cfg.pitch_shift),
+           "--n_steps", str(cfg.n_steps), "--cfg", str(cfg.cfg),
+           "--rescale_cfg", str(cfg.rescale_cfg),
+           "--max_seg_sec", str(cfg.max_seg_sec),
+           "--num_overlaps", str(cfg.num_overlaps)]
+    if cfg.seed is not None:
+        log.info(f"  CFM 噪声 seed: {cfg.seed}（可复现；第 i 段用 seed+i）")
+        cmd += ["--seed", str(cfg.seed)]
+    run(cmd + ["--fp16"], stage="svc", cwd=SOULX_DIR,
         env={"PYTHONPATH": SOULX_DIR})  # 直接跑 cli/*.py 时 soulxsinger 包不在 sys.path
     gen = os.path.join(svc_dir, "generated.wav")
     if not os.path.exists(gen):
@@ -459,14 +467,23 @@ def main() -> None:
                     help="prompt_ext 中原始干净音频的最低占比（音色锚点，默认 0.55）")
     ap.add_argument("--max-seg-sec", type=float, default=28.0,
                     help="SVC 单段最长秒数（默认 28，16GB 卡无压力；上游默认 30，6GB 卡需降到 20）")
+    ap.add_argument("--num-overlaps", type=int, default=1,
+                    help="SVC 每段往前取几个活性格作前置上下文（默认 1）。"
+                         "总窗仍受 --max-seg-sec 限制，段本来就接近上限时提高它无效")
     ap.add_argument("--n-steps", type=int, default=32, help="SVC 采样步数（默认 32）")
     ap.add_argument("--cfg", type=float, default=0.5,
                     help="SVC classifier-free guidance 强度（默认 0.5；上游默认 3.0 实测过强，"
                          "会放大内容特征里的原唱音色残留。0 = 完全关闭 CFG）")
+    ap.add_argument("--rescale-cfg", type=float, default=0.75,
+                    help="CFG 外推结果的 std 归一化混合比（1=全归一化，0=用原始外推；上游 0.75）。"
+                         "cfg=0 时这一路完全不走")
     ap.add_argument("--pitch-shift", type=_pitch_shift_arg, default=0,
                     help='SVC F0 条件移调（半音）。男声歌用 +12（高八度）可对齐女声 prompt；'
                          '"auto" 按段对齐到最近八度（男女对唱/跨音区）；'
                          '非八度整数倍会与原伴奏跑调')
+    ap.add_argument("--seed", type=int, default=None,
+                    help="CFM 初始噪声 seed（默认不设 = 每次随机、不可复现）。"
+                         "设定后同参数可复现，第 i 段用 seed+i")
     ap.add_argument("--mix", action="store_true", help="跑混音阶段（验收纯人声后）")
     ap.add_argument("--vocal-gain", type=float, default=1.0)
     ap.add_argument("--acc-gain", type=float, default=0.8)
@@ -488,8 +505,10 @@ def main() -> None:
               stages=stages, max_prompt=args.max_prompt,
               semitone_shift=args.semitone_shift, ext_method=args.ext_method,
               anchor_min_ratio=args.anchor_min_ratio,
-              max_seg_sec=args.max_seg_sec,
-              n_steps=args.n_steps, cfg=args.cfg, pitch_shift=args.pitch_shift,
+              max_seg_sec=args.max_seg_sec, num_overlaps=args.num_overlaps,
+              n_steps=args.n_steps, cfg=args.cfg, rescale_cfg=args.rescale_cfg,
+              pitch_shift=args.pitch_shift,
+              seed=args.seed,
               vocal_gain=args.vocal_gain, acc_gain=args.acc_gain, mix=args.mix,
               no_sep_cache=args.no_sep_cache)
 

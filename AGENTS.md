@@ -131,8 +131,37 @@ Measured on a 257s Chinese song with a 163s female speech reference (median F0 2
   | cfg=0.5 | **0.5090** / 0.1154 / 15 / 0.2389 | **0.5738** / 0.1049 / 2 / 0.3196 | **0.5450** / 0.0933 / 4 / **0.2851** |
 
   Drift rises ~0.03-0.04 and dropouts go up on all three. Interpretation: CFG acts as a regularizer that keeps adjacent windows consistent (by leaning on the strongly-conditioned content signal), so removing it lets the output track the prompt more freely and jitter more. The mean gain (+0.024 to +0.057) is 2-6× larger than any prompt change, so it is worth the trade — but on a song where consistency matters more than peak similarity, `cfg=1` is the middle ground (better worst-case than 0.5 on song_4 and song_3's dropouts). Same shape of trade-off as YingMusic vs SoulX.
+- **`rescale_cfg` is a real but sub-noise effect — swept and rejected as a default change.** It is the second CFG knob (`flow_matching.py:262`, upstream hard-codes 0.75 and exposes it nowhere): after the extrapolation `flow_pred_cfg = flow_pred + cfg·(flow_pred − uncond)`, the result is rescaled to the conditional prediction's std and the two are blended, `rescale_cfg·rescaled + (1−rescale_cfg)·raw`. So 1.0 = fully std-normalised (most conservative), 0.0 = raw extrapolation. Now plumbed through the same four layers as `seed` (`sing.py --rescale-cfg` → `inference_svc.py --rescale_cfg` → `infer` → `infer_segment` → `CFMDecoder`). Swept on song_2 at `cfg=0.5`, **seed fixed at 1** so the arms are paired:
+
+  | rescale_cfg | 0.0 | 0.5 | 0.75 (upstream) | 1.0 |
+  |---|---|---|---|---|
+  | mean SIM | **0.5924** | 0.5900 | 0.5873 | 0.5850 |
+  | median SIM | **0.5964** | 0.5922 | 0.5917 | 0.5885 |
+  | drift | 0.1053 | 0.1046 | **0.1027** | 0.1019 |
+
+  Monotone: less normalisation → higher SIM, slightly higher drift. Direction replicated on 3 seeds (0.0 beat 0.75 in 3/3: +0.0051 / +0.0043 / +0.0033), **but the mean gain is +0.0042 — exactly the seed-noise floor**, an order of magnitude below `--cfg` (+0.024…+0.057). Left at the upstream 0.75. Worth knowing for two reasons: it is the same mechanism as `cfg` (both control how hard the content condition is amplified, and both trade SIM against drift in the same direction), and if `--cfg` is ever raised for a stability-sensitive song, `rescale_cfg=1.0` is the matching "even more conservative" setting. Also note `cfg=0` skips the whole `if cfg > 0` block, so `rescale_cfg` is dead there.
+- **Per-segment seed resampling has measurable headroom but trades drift.** Measured 2026-08 by running song_2 (6 segments, 52 windows) and song_9 (12 segments, 96 windows) with 5 different seeds, then computing three scenarios: (1) single-seed baseline (best of 5: mean 0.5496 / 0.4684); (2) segment-level oracle — for each segment, pick the seed whose windows in that segment score highest against the prompt; (3) per-window oracle (unreachable upper bound). Results:
+
+  | song | 5-seed mean | best single seed | seg oracle | win oracle | seg captures |
+  |---|---|---|---|---|---|
+  | song_2 | 0.5962 | 0.6003 | 0.6127 **(+0.0124)** | 0.6360 | 42% |
+  | song_9 | 0.4633 | 0.4684 | 0.5026 **(+0.0342)** | 0.5166 | 74% |
+
+  All five columns are the same protocol (`eval_sim`, 3s windows, vs `refsep2/lead.wav`) — do not mix in
+  `eval_stab`'s 1.5s numbers when comparing, they run ~0.05 lower and the gain looks 5× bigger than it is.
+
+  The low-scoring song gains more. But segment switching introduces cross-segment timbre drift: mixing the oracle-selected segments from 5 seeds raised song_2's mean SIM from 0.5496 → 0.5604 (+0.011), but `eval_stab` drift rose from 0.1034 (most stable single seed) → 0.1199, and worst-case window dropped to 0.3073 (vs 0.2565 baseline). Trade-off is similar to the cfg case: +SIM for +drift. Segment boundaries are silent (切在静音处), but the ear still detects timbre shifts across phrase boundaries. Conclusion: *if* implementing multi-seed selection, monitor drift; the naive "每段选最优 seed" plan needs either (a) acceptance of the drift cost, or (b) a consistency penalty in the selection objective.
 - **`build_vocal_segments`' 30s ceiling was a 6GB VRAM trap that looked like slowness.** `soulxsinger_svc.py:257` hard-coded `max_duration_sec=30.0`; with `num_overlaps=1` the longest chunk reaches ~33s. On the old 6GB card that chunk overflowed into host-memory paging: song_2 sat at 8/10 segments for 12+ minutes with VRAM pegged at 5845/6144 MiB. Patched to accept `max_seg_sec` (threaded through `cli/inference_svc.py --max_seg_sec`, `sing.py --max-seg-sec`); the short-circuit at `soulxsinger_svc.py:234` follows the same value. On 6GB we used **20.0**; **on the current 16GB card the default is 28.0** (the whisper encoder hard-caps at 30s — that is the real ceiling, not VRAM anymore). Symptom to recognize if it ever paged again: `Inferring segments` stops advancing with no error, and killing `sing.py` leaves the child `inference_svc.py` alive holding all the VRAM — check `ps aux | grep inference_svc` and kill it before re-running.
 - **`build_vocal_segments` wasted inference on outro/interlude silence — three separate bugs.** (1) The split point for a silence run was placed at its *midpoint* (`(run_start+run_end)//2`), so the outro got glued to the previous vocal segment; (2) the min-duration merge absorbed a short vocal tail *forward* into the following long silence (`163.8-167.7s` vocal + 28s outro → one 24s segment at 11% voiced); (3) `ignore_silent_segments` scored **overlap** segments (which prepend the previous vocal grid) instead of the non-overlapping ones, masking pure-silence segments. Result: song_2 (outro 27.9s + 10s interlude) inferred 187.0s of its 195.7s. Patched (local, gets overwritten on upgrade): silence runs now split at *both* start and end; merging is activity-first — silence grids never enter segments (short active segments infer standalone instead of being padded with trailing silence), overlaps never cross a silence grid and stay ≤ `max_frames` (which also caps VRAM peak); the 5%-voiced filter now scores non-overlapping segments. song_2: 14 segments / 305.8s → **9 segments / 212.9s (−30%)**, tail 167.8s→end is exact zeros (mix fills the accompaniment), SIM mean 0.5794→0.5771 / median 0.5717→0.5757 (no regression). If the song has a long outro, always run `f0-target` first — segmenting keys off `target_f0.npy`.
+- **The silence-aware patch silently killed `num_overlaps` — every segment was inferred with zero preceding context.** `append_segment`'s backtrack loop was `while k >= 0 and cnt < num_overlaps and active(k)`, written when silence was merged into neighbouring grids. After the outro/interlude patch split each silence run into its own grid, `start_idx - 1` is *always* a silence grid, so `active(k)` fails on the first iteration and the loop exits immediately. Measured before the fix: song_2 **0/6** segments and song_9 **0/12** had any context (0.00s), at every `num_overlaps` and every `max_seg_sec` — the parameter was dead. Fixed by letting the backtrack step over *short* silence grids (`< min_frames`, same test the forward merge uses) and treating only long silence (interlude/outro) as a hard boundary. song_2 now gets 5.60s of context across 3/6 segments, song_9 10.16s across 2/12; the rest are first-segments or sit right after an interlude, where there is genuinely nothing to prepend. A/B on song_2 with `--seed 1` fixed:
+
+  | | mean SIM | drift | p90drift | worst |
+  |---|---|---|---|---|
+  | before fix (ctx 0.00s) | 0.5405 | 0.1083 | 0.2373 | 0.2630 |
+  | **after fix, `num_overlaps=1` (ctx 5.60s)** | 0.5377 | **0.1027** | **0.2240** | 0.2693 |
+  | `num_overlaps=2` (ctx 8.80s) | 0.5379 | 0.1047 | 0.2246 | 0.2693 |
+
+  The fix is a real local-stability gain (drift −0.006, p90drift −0.013) and mean SIM is unchanged (all three within 0.002 = noise). **Raising `num_overlaps` past 1 does nothing** — the first prepended active grid is what matters, a second one costs inference time and nudges drift back up. Exposed as `sing.py --num-overlaps` / `inference_svc.py --num_overlaps` for future experiments but **leave it at 1**. Also note the context budget competes with `max_seg_sec` for the whisper 30s ceiling: at `max_seg_sec=28` a 27.7s segment has almost no room left, which is the second reason a bigger `num_overlaps` cannot help.
 - **SoulX SVC handles silence correctly *only after the build_vocal_segments patch*.** Output is inited as `zeros_like(gt_wav)` (`soulxsinger_svc.py:263`) and unvoiced regions simply stay zero. Do not add a silence gate — regions that look like leakage are usually breath/consonants that RMVPE found no F0 for, and gating them removes real audio.
 - **Speech-only references are a known-hard case** ("cross-domain SVC"). In SVCC2023 Task 2 (speech-only target), *no* submitted system reached target-speaker similarity; the winner still sat ~0.4 MOS below. A SIM around 0.6 here is not a failure. The winning system's ablation showed adaptation/fine-tuning beat zero-shot by 0.41 similarity — so **fine-tuning is the next real lever**, not more prompt tweaking. **But 30s-scale fine-tuning is NOT that lever** (A/B'd 2026-08, see below) — QQ Music's "30s 微调" works because it's a purpose-built singing model + 30 epochs + matched-content nursery-rhyme recordings, not because 30s of data is enough in general.
 - **seed-vc 30s fine-tuning: process works, result is negative.** A/B'd 2026-08 (ref.wav 15-45s cut into 3×10s clips → `train.py` on `config_dit_mel_seed_uvit_whisper_base_f0_44k.yml`, 100/500 steps, then `inference.py --checkpoint ft_model.pth` on a 30s song section, scored by `eval_stab.py` vs the real voice): zero-shot mean 0.5466/median 0.5991 → ft100 0.5413/0.5628 → ft500 0.5300/0.5506. **More steps = worse similarity**; loss plateaus at ~0.52. The model memorizes the 3 clips and loses the pretrained speaker-manifold prior that zero-shot relies on; and the ft objective is mel reconstruction, not speaker-similarity. Conclusion: for seed-vc, the right use is zero-shot + good prompt; real fine-tuning needs RVC-scale data (≥5-10 min). Flow is still useful as a reference: `train.py --config ... --dataset-dir <1-30s clips> --run-name x --batch-size 1 --max-steps 500`, output `runs/<name>/ft_model.pth`; resume auto-loads the latest `DiT_epoch_*_step_*.pth` (weights only, iters restart at 0).
@@ -190,6 +219,35 @@ Do not judge by ear alone. `eval_sim.py` scores speaker similarity with the ERes
 **Always score against the real, unmodified speech** as ground truth. Scoring a pitch-shifted variant against
 its own shifted prompt hides the very degradation you are trying to measure — that mistake made a real
 regression look like a tie.
+
+**Every SIM number carries ±0.004 of seed noise, so any A/B under ~0.01 is unmeasured.** SVC inference was
+non-deterministic until 2026-08: the CFM initial noise `z = torch.randn(...)` (`flow_matching.py:275`) used
+the *global* RNG with no `manual_seed` anywhere in the repo (the one `manual_seed(0)` in
+`whisper_encoder.py:70` sits in a `__main__` self-test that never runs). Every historical result was a single
+random draw. Measured on two songs, 5 seeds each, everything else fixed:
+
+| | song_2 (52 win) | song_9 (96 win) |
+|---|---|---|
+| whole-song mean, 5 seeds | 0.5890 – 0.6003 | 0.4573 – 0.4684 |
+| seed std | **0.0043** | **0.0036** |
+| mean per-window std | 0.0273 | 0.0396 |
+| windows with max−min > 0.10 | 13 / 52 | 51 / 96 |
+
+Consequences, in order of how much they should change behaviour:
+
+1. **Fix `--seed` for every A/B from now on** (`sing.py --seed N`, threaded to `inference_svc.py --seed`,
+   `infer(seed=)`, segment *i* uses `seed + i`). Same seed + same inputs is now bit-exact — verified by
+   identical md5 on two runs. Leaving it unset keeps upstream's random behaviour.
+2. **Re-read the history with a 0.01 noise floor.** `--cfg` (+0.024…+0.057) and `--pitch-shift auto` on
+   song_3's low register (+0.1834) are far above it and stand. The non-octave shift result (−0.011) is ~2.5σ:
+   direction probably right, magnitude not trustworthy. Everything described in this file as "prompt tuning
+   moves ±0.01" — including the ext rewrite's +0.010 — is **at or below the noise floor and was never
+   actually resolved**. Do not build on those numbers.
+3. **To resolve a small effect, average over seeds.** 3 seeds cut the noise to ~0.0023, 5 to ~0.0018. One run
+   per arm cannot see anything smaller than about 0.01.
+4. Whole-song means are *far* more stable than individual windows (std 0.004 vs 0.027-0.040). "Run the song N
+   times and keep the best" is therefore near-worthless; per-segment selection is where the headroom is (see
+   the per-segment resampling entry above).
 
 Mean SIM is also the wrong metric for "the timbre jumps around": use adjacent-window drift and worst-case
 SIM to catch local instability. `singing/eval_stab.py` does this for arbitrary files (1.5s windows →
@@ -251,12 +309,21 @@ Worker 脚本在 `singing/w_*.py`，每个阶段用对应项目的 venv 跑。
   googleads 装不上）。缺任何一环 ext 阶段直接失败。
 - **`python cli/inference_svc.py` 找不到 `soulxsinger` 包** — 直接跑 cli 脚本时 sys.path 只有 `cli/`。
   需要 `PYTHONPATH=SoulX-Singer`（`sing.py` 已处理）。
-- **`SoulX-Singer/` 里有本地补丁，升级上游会覆盖掉**：`soulxsinger/models/soulxsinger_svc.py`
-  的 `infer(max_seg_sec=...)` 参数（显存分段）+ `build_vocal_segments` 活性优先合并（跳过
-  尾奏/间奏无人声）+ `_nearest_octave_shift` / `pitch_shift="auto"` 按段八度对齐，
-  以及 `cli/inference_svc.py` 的 `--max_seg_sec` 和 `--pitch_shift` 的 `_pitch_shift_arg`
-  （改成接受整数或 `"auto"`，上游是 `type=int`），还有
-   `tools/uvr5/uvr5_weights/*.yaml` 的 `batch_size: 1`（6GB 时代调的；16GB 卡可提到 4，见 Separation notes）。拉新版后要重打。
+- **`SoulX-Singer/` 里有本地补丁，升级上游会覆盖掉**：
+  - `soulxsinger/models/soulxsinger_svc.py`：`infer(max_seg_sec=...)`（显存分段）+
+    `build_vocal_segments` 活性优先合并（跳过尾奏/间奏无人声）+ `append_segment` 回溯跨短静音格
+    （修 `num_overlaps` 失效）+ `num_overlaps` 透传 + `_nearest_octave_shift` /
+    `pitch_shift="auto"` 按段八度对齐 + `infer/infer_segment` 的 `seed=`
+  - `soulxsinger/models/modules/flow_matching.py`：`reverse_diffusion(seed=)` —— 用
+    `torch.Generator` 取初始噪声，上游走全局 RNG 不可复现
+  - `soulxsinger/models/modules/decoder.py`：`CFMDecoder.reverse_diffusion(seed=)` 透传
+    （这层最容易漏，漏了会 `TypeError: unexpected keyword argument 'seed'`）
+  - `cli/inference_svc.py`：`--max_seg_sec` / `--num_overlaps` / `--seed`，以及
+    `--pitch_shift` 的 `_pitch_shift_arg`（接受整数或 `"auto"`，上游是 `type=int`）
+  - `tools/uvr5/uvr5_weights/*.yaml`（在 GPT-SoVITS 里）的 `batch_size: 1`（6GB 时代调的；
+    16GB 卡可提到 4，见 Separation notes）
+
+  拉新版后要重打。
 - **本地补丁都在自己的 fork 里，可 diff 可回溯**（2026-08）：
   - `SoulX-Singer` → `CJYLZS/SoulX-Singer` 分支 `voice-patches`（基于上游 `81aeb3a`）
   - `tools/pcnsf` → `CJYLZS/pitch-transposition-using-DiffSinger` 分支 `voice-patches`
