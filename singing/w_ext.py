@@ -46,7 +46,10 @@ NSF_CONFIG = ROOT / "tools" / "pcnsf_hifigan" / "pc_nsf_hifigan_44.1k_hop512_128
 NSF_CKPT = ROOT / "tools" / "pcnsf_hifigan" / "pc_nsf_hifigan_44.1k_hop512_128bin_2025.02" / "model.ckpt"
 
 RMVPE = SOULX / "pretrained_models" / "SoulX-Singer-Preprocess" / "rmvpe" / "rmvpe.pt"
-MAX_SHIFT = 5          # +10 半音退化到 DSP 水平（AGENTS.md 实测）
+MAX_SHIFT_DEFAULT = 5  # +10 半音退化到 DSP 水平（AGENTS.md 实测）
+DIV_WEIGHT_DEFAULT = 0.0  # 源段复用惩罚（等价半音数）；0 = 旧行为。
+# 注意：这里保持 0.0 只为「不带 --div-weight 直接跑本脚本时复现旧行为」；
+# 实际默认由 sing.py 的 Cfg.ext_div_weight = 3.0 下发（A/B 3 首全正，见 AGENTS.md）。
 FADE_SEC = 0.01
 F0_RATE = 50.0
 GRID_SEMI = 2.0        # 频段格宽（半音），与 w_select 一致
@@ -70,6 +73,32 @@ def nsf_shift(wav: str, out_dir: Path, shift: int, device: str) -> str:
     if not out:
         sys.exit(f"pc-nsf-hifigan 未产生输出于 {out_dir}")
     return str(out[-1])
+
+
+def nsf_shift_many(jobs: list[dict], work_dir: Path) -> list[dict]:
+    """一次进程跑完所有 (wav, shift) 移调任务；返回原 jobs（含 out 路径）。
+
+    替代逐组 fork nsf_shift()：模型加载开销 2.77s 只付一次而不是 N 次。
+    输出与逐组路径 bit-identical（multi_transpose.py 逐行照抄 pitch_transpose.py
+    的 nsfhifigan 分支），已用 md5 验证。
+    """
+    if not PCNSF_VENV.exists():
+        sys.exit(f"缺少 PC-NSF-HiFiGAN venv: {PCNSF_VENV}（在 tools/pcnsf/ 建 .venv）")
+    jobs_json = work_dir / "nsf_jobs.json"
+    jobs_json.write_text(json.dumps(jobs, ensure_ascii=False), encoding="utf-8")
+    cmd = [str(PCNSF_VENV), str(PCNSF / "scripts" / "multi_transpose.py"),
+           "--jobs", str(jobs_json), "--config", str(NSF_CONFIG),
+           "--ckpt", str(NSF_CKPT), "--rmvpe", str(RMVPE)]
+    print(f"  pc-nsf-hifigan 批量 {len(jobs)} 组: "
+          + ", ".join(f"{j['shift']:+d}st" for j in jobs))
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        sys.exit(f"pc-nsf-hifigan 失败 (exit {proc.returncode}):\n"
+                 f"{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}")
+    for j in jobs:
+        if not Path(j["out"]).exists():
+            sys.exit(f"pc-nsf-hifigan 未产生输出: {j['out']}")
+    return jobs
 
 
 def seedvc_shift(wav: str, out_dir: Path, shift: int, device: str) -> str:
@@ -129,9 +158,19 @@ def main() -> None:
     ap.add_argument("--max-sec", type=float, default=29.0,
                     help="prompt_ext 总长上限（whisper 30s 硬顶）")
     ap.add_argument("--anchor-min-ratio", type=float, default=0.55,
-                    help="原始干净音频至少占 prompt_ext 的比例（音色锚点）")
+                    help="原始干净音频占 prompt_ext 的份额上限（cap，不是下限）: "
+                         "锚点超过 max_sec×ratio 即裁剪，余量全给移调段")
+    ap.add_argument("--max-shift", type=int, default=MAX_SHIFT_DEFAULT,
+                    help=f"单段最大移调半音数（默认 {MAX_SHIFT_DEFAULT}）。AGENTS.md 的逐段扫点显示"
+                         "-4..+6 在均值上都过 0.85，但 worst>=0.85 只到 +4；ext 是池化平均使用，"
+                         "可放到 6")
+    ap.add_argument("--div-weight", type=float, default=DIV_WEIGHT_DEFAULT,
+                    help=f"源段复用惩罚，折算为等价半音数（默认 {DIV_WEIGHT_DEFAULT}）。"
+                         "0=旧行为（纯按移调量最小选，会把素材锁在 med 最高的少数段上）；"
+                         "越大越倾向用更大移调换更多不同源段（音素多样性）")
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
+    max_shift = args.max_shift
 
     import librosa
     import soundfile as sf
@@ -197,6 +236,7 @@ def main() -> None:
     pool = list(cands.values())
     plan: list[tuple[dict, int, int]] = []   # (cand, shift, grid_idx)
     used_copies: dict[tuple[int, int], bool] = {}
+    used_src: dict[int, int] = {}      # 源段 idx -> 已用次数（多样性惩罚用）
     used_sec = 0.0
     order = np.argsort(-need_sec)             # 缺口大的格先填
 
@@ -207,35 +247,45 @@ def main() -> None:
         g_hi = g_lo * 2 ** (GRID_SEMI / 12)
         g_center = float(np.sqrt(g_lo * g_hi))
         filled = 0.0
-        # 该格的候选按 |移调量| 升序：移调越小音色损失越小。
-        # 落不进本格的段允许"尽力靠近"（钳到 MAX_SHIFT 后取最接近），否则素材
+        # 该格的候选按「移调量 + 复用惩罚」升序。
+        # 移调越小音色损失越小（AGENTS.md 逐段扫点: 0.014-0.020 SIM/半音，且每个
+        # 输出音高桶内 corr(|shift|,SIM) 都在 -0.76..-0.99）——但只按 |shift| 排会把
+        # 素材池锁死在 med 最高的极少数段上: 实测绿色池有 143 段/95.6s，med>=290Hz
+        # 的只有 15 段/7.7s，要填 13s 预算必然复用 2.2x，28 个移调段只来自 13 个源段。
+        # div_weight 把「复用一次同源段」折算成等价半音数，让算法可以用更大的移调换
+        # 更多不同的源段（音素多样性）。0 = 旧行为。
+        # 落不进本格的段允许"尽力靠近"（钳到 max_shift 后取最接近），否则素材
         # med 上限不足时高音格会完全空掉——实测 440-494Hz 格因此只补到 0.3s/2.1s。
-        ranked = []
+        avail = []
         for c in pool:
             raw = 12 * np.log2(g_center / c["med"])
-            sh = max(-MAX_SHIFT, min(MAX_SHIFT, int(round(raw))))
+            sh = max(-max_shift, min(max_shift, int(round(raw))))
             if sh == 0:
                 continue                      # 本格已由锚点覆盖，无需重合成
             reached = c["med"] * 2 ** (sh / 12)
             inside = g_lo <= reached < g_hi
-            # 排序键: 先要"落进本格"的，再按移调量小、离格中心近
-            ranked.append((0 if inside else 1, abs(sh),
-                           abs(12 * np.log2(reached / g_center)), c, sh))
-        ranked.sort(key=lambda t: (t[0], t[1], t[2]))
-        ranked = [(a, b, c, sh) for _, a, b, c, sh in ranked]
-        for _, _, c, sh in ranked:
-            if filled >= need_sec[gi] or used_sec >= budget:
+            avail.append((0 if inside else 1, abs(sh),
+                          abs(12 * np.log2(reached / g_center)), c, sh))
+        # 贪心逐个取：复用惩罚随 used_src 变化，故每次重算 cost 而非一次性排序
+        while filled < need_sec[gi] and used_sec < budget and avail:
+            best_i, best_key = None, None
+            for i, (ins, ash, dist, c, sh) in enumerate(avail):
+                if (c["idx"], sh) in used_copies:
+                    continue
+                if used_sec + c["dur"] > budget:
+                    continue
+                # 排序键: 先要"落进本格"的，再按 移调量+复用惩罚、离格中心近
+                key = (ins, ash + args.div_weight * used_src.get(c["idx"], 0), dist)
+                if best_key is None or key < best_key:
+                    best_key, best_i = key, i
+            if best_i is None:
                 break
-            key = (c["idx"], sh)
-            if key in used_copies:
-                continue           # 同段同移调不重复用
-            dur = c["dur"]
-            if used_sec + dur > budget:
-                continue
-            used_copies[key] = True
+            _, _, _, c, sh = avail.pop(best_i)
+            used_copies[(c["idx"], sh)] = True
+            used_src[c["idx"]] = used_src.get(c["idx"], 0) + 1
             plan.append((c, sh, int(gi)))
-            filled += dur
-            used_sec += dur
+            filled += c["dur"]
+            used_sec += c["dur"]
         if filled > 0:
             print(f"  格 {g_lo:.0f}-{g_hi:.0f}Hz: 需 {need_sec[gi]:.2f}s 实补 {filled:.2f}s")
 
@@ -263,25 +313,53 @@ def main() -> None:
     for c, sh, _ in plan:
         by_shift.setdefault(sh, []).append(c)
 
+    # 每个 shift 组的输入音频先全部落盘，再**一次**调 vocoder 跑完所有组。
+    # 动机（本机实测）：pitch_transpose.py 单次进程固定开销 2.77s（import torch 1.02
+    # + import 项目模块 0.99 + load RMVPE 0.53 + load NSF 0.11），而净计算只有 0.87s
+    # （5.94s 音频）。0.30s 的组和 5.94s 的组 wall 都是 ~3.6-4.7s，即耗时几乎与音频
+    # 长度无关、全是开销。5 组 fork 5 次 = ~14s 纯浪费。multi_transpose.py 把模型
+    # 加载摊到一次：5 组 18.4s -> 7.6s，输出逐组 md5 bit-identical。
+    # 注意 seedvc 引擎没有对应的多 job 入口，仍走逐组 subprocess。
+    group_in: dict[int, np.ndarray] = {}      # shift -> 拼接后的输入音频
+    group_parts: dict[int, list[np.ndarray]] = {}   # shift -> 各段原始音频（用于切回）
+    for sh in sorted(by_shift):
+        parts = [librosa.load(c["wav"], sr=sr_out, mono=True)[0] for c in by_shift[sh]]
+        group_parts[sh] = parts
+        group_in[sh] = np.concatenate(parts)
+
+    shifted_by: dict[int, np.ndarray] = {}
+    if 0 in group_in:
+        # 0 半音无需重合成，直接用原始音频（省一次 vocoder 损失）
+        shifted_by[0] = group_in[0]
+        print("  +0st: 直接使用原始音频（跳过 vocoder）")
+
+    nonzero = [sh for sh in sorted(group_in) if sh != 0]
+    if nonzero and args.shifter == "nsf":
+        jobs = []
+        for sh in nonzero:
+            tmp_wav = shift_dir / f"group_{sh:+03d}.wav"
+            sf.write(str(tmp_wav), group_in[sh], sr_out)
+            jobs.append({"wav": str(tmp_wav), "shift": sh,
+                         "out": str(shift_dir / f"out_{sh:+03d}.wav")})
+        for job in nsf_shift_many(jobs, shift_dir):
+            y, sr_s = librosa.load(job["out"], sr=None, mono=True)
+            if sr_s != sr_out:
+                y = librosa.resample(y, orig_sr=sr_s, target_sr=sr_out)
+            shifted_by[int(job["shift"])] = y
+    else:
+        for sh in nonzero:
+            tmp_wav = shift_dir / f"group_{sh:+03d}.wav"
+            sf.write(str(tmp_wav), group_in[sh], sr_out)
+            out_wav = seedvc_shift(str(tmp_wav), shift_dir / f"out_{sh:+03d}", sh, args.device)
+            y, sr_s = librosa.load(out_wav, sr=None, mono=True)
+            if sr_s != sr_out:
+                y = librosa.resample(y, orig_sr=sr_s, target_sr=sr_out)
+            shifted_by[sh] = y
+
     for sh in sorted(by_shift):
         segs = by_shift[sh]
-        parts = []
-        for c in segs:
-            y, sr = librosa.load(c["wav"], sr=sr_out, mono=True)
-            parts.append(y)
-        combined = np.concatenate(parts)
-        if sh == 0:
-            # 0 半音无需重合成，直接用原始音频（省一次 vocoder 损失）
-            shifted = combined
-            print(f"  {sh:+d}st: 直接使用原始音频（跳过 vocoder）")
-        else:
-            tmp_wav = shift_dir / f"group_{sh:+03d}.wav"
-            sf.write(str(tmp_wav), combined, sr_out)
-            shifter = nsf_shift if args.shifter == "nsf" else seedvc_shift
-            out_wav = shifter(str(tmp_wav), shift_dir / f"out_{sh:+03d}", sh, args.device)
-            shifted, sr_s = librosa.load(out_wav, sr=None, mono=True)
-            if sr_s != sr_out:
-                shifted = librosa.resample(shifted, orig_sr=sr_s, target_sr=sr_out)
+        parts = group_parts[sh]
+        shifted = shifted_by[sh]
         # 按输入比例切回各段
         off = 0
         for y, c in zip(parts, segs):

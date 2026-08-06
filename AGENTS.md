@@ -9,6 +9,41 @@ only VRAM-bound above ~30s. Whenever a note says "6GB card" or "raise on a 24GB 
 read the current limit as ~16GB: `sing.py --max-seg-sec` default is now **28** and
 separation yaml `batch_size` can be raised toward 4.
 
+**System RAM is the second, easily-forgotten ceiling: this is WSL2 on a 32GB host.**
+Without a `memory=` line in `/mnt/c/Users/rookie/.wslconfig`, WSL takes the default 50%
+of host RAM = **15.9GB**, which is *less than the GPU-adjacent workloads need for weight
+loading*. Video-diffusion checkpoints are the trigger: `echomimic3`'s T5 encoder is a
+single 11.36GB `.pth`, and `torch.load(..., map_location="cpu")` without `mmap=True`
+peaks at roughly **2× file size (~23GB)** because the file buffer and the materialised
+tensors are both resident. Symptom is not a Python traceback but `Killed` / **exit code
+137** (the kernel OOM killer), with the log stopping mid-way through model loading — easy
+to misread as a hang or a CUDA problem. Check `grep MemTotal /proc/meminfo` and the
+`.wslconfig` before debugging anything else. Raising WSL to `memory=24GB` + `swap=8GB`
+(edit `.wslconfig`, then `wsl --shutdown` from PowerShell) is the quick fix; the real fix
+is `mmap=True`, measured on this host to drop the same T5 load from ~23GB to **0.38GB
+peak RSS** (60×). `nvidia-smi` looks completely healthy during these kills — VRAM is not
+the constraint.
+
+### Downloading large weights: verify resume, do not assume it
+
+`huggingface_hub`'s `snapshot_download`/`hf_hub_download` write to
+`<sha256>.<etag-suffix>.incomplete`, and **the suffix is renegotiated on every process
+start**, so interrupting and re-running creates a *new* temp file and restarts from byte
+0 while the old partial sits on disk unused. This silently re-downloaded ~10GB of an
+11.36GB file here. Tell-tale sign: several `.incomplete` files under
+`<model>/.cache/huggingface/download/` sharing one sha256 but differing in the final
+suffix.
+
+The HF CDN *does* honour byte ranges (verified: `HTTP 206`, and the returned bytes are
+identical to the local partial's tail), so resume works — just not through hf_hub across
+restarts. `echomimic3/download_models.py` is the pattern to copy: download to a fixed
+`<target>.part` name, resume with `curl -fL -C -`, then verify against the repo's LFS
+sha256 (`HfApi().model_info(repo, files_metadata=True)`) before renaming into place. It
+is idempotent, so re-running after any interruption transfers only what is missing.
+Before trusting a partial file, confirm it is a real prefix:
+`curl -sL -H "Range: bytes=<size-32>-<size-1>" <url> | xxd` versus
+`tail -c 32 <partial> | xxd`.
+
 ## Workspace layout
 
 The main projects sit side by side at the workspace root. **Their dependencies genuinely conflict** (torch 2.13+cu130 vs 2.6+cu124, `gradio<5` vs 6.x, `transformers<=4.50` vs 4.46), so each carries its own `.venv`. Never install across them. `tools/` holds self-contained helper toolkits with their own venvs too.
@@ -21,13 +56,23 @@ voice/
 │                     .venv = torch 2.6+cu124. Converts a song's vocal to a target timbre.
 ├── seed-vc/          Zero-shot VC; range extender fallback (--ext-method seedvc), see tools/pcnsf.
 │                     .venv = torch 2.6+cu124. GPL-3.0 (viral — do not redistribute linked).
-├── tools/pcnsf/      PC-NSF-HiFiGAN pitch-transposition toolkit (scripts/pitch_transpose.py).
+├── tools/pcnsf/      PC-NSF-HiFiGAN pitch-transposition toolkit (scripts/pitch_transpose.py
+│                     单 job；scripts/multi_transpose.py 多 job，ext 阶段用，省 2.2× 进程开销).
 │                     .venv = torch 2.13 CPU-only (~500MB, 无需 CUDA). DEFAULT range extender.
 ├── tools/pcnsf_hifigan/  PC-NSF-HiFiGAN 44.1k weights (config.json + model.ckpt), 2025.02 release
 ├── tools/yingmusic/  YingMusic-SVC (zero-shot SVC, seed-vc fork + F0-aware timbre adaptor).
 │                     .venv = torch 2.6+cu124. Experimental; see "SVC engine A/B" below.
+├── tools/voxcpm2/    VoxCPM2 TTS (voice design + style-controlled cloning) 与本轮移调实验脚本.
+│                     .venv = torch 2.6+cu124. 结论是否定的，见「参考素材音域扩展」一节
+├── tools/vevo2/      Vevo2 (Amphion) 零样本 SVC，speech+singing 联合 tokenizer.
+│                     .venv = torch 2.6+cu124. 结论是否定的（whisper 30s 硬顶），见 SVC engine A/B #2
+├── tools/hifiglot/   HiFi-Glot 显式共振峰合成（F1-F4 可控）.
+│                     .venv = torch 2.6+cu124. 结论是否定的，见「共振峰」一节
 ├── tools/stems4.py   4-stem separation (drums/bass/other/vocals) via BS-RoFormer 4stems_ft.
 │                     Uses GPT-SoVITS venv + uvr5 weights; see "Separation notes".
+├── echomimic3/       EchoMimicV3 (AAAI'26, Apache-2.0): 单图 + 音频 → 说话/唱歌视频.
+│                     .venv = torch 2.6+cu124. 1.3B params, flash-pro 8-step, ≤768×768.
+│                     可吃 GPT-SoVITS 的 TTS 输出或 sing.py 的 SVC 干声。见「EchoMimicV3」一节
 ├── data/             Shared audio. voices/ = speaker source material; songs/ = songs, stems, SVC output
 ├── logs/             GPT-SoVITS training features + checkpoints
 ├── AGENTS.md         this file
@@ -196,10 +241,261 @@ Measured on a 257s Chinese song with a 163s female speech reference (median F0 2
 - **seed-vc 30s fine-tuning: process works, result is negative.** A/B'd 2026-08 (ref.wav 15-45s cut into 3×10s clips → `train.py` on `config_dit_mel_seed_uvit_whisper_base_f0_44k.yml`, 100/500 steps, then `inference.py --checkpoint ft_model.pth` on a 30s song section, scored by `eval_stab.py` vs the real voice): zero-shot mean 0.5466/median 0.5991 → ft100 0.5413/0.5628 → ft500 0.5300/0.5506. **More steps = worse similarity**; loss plateaus at ~0.52. The model memorizes the 3 clips and loses the pretrained speaker-manifold prior that zero-shot relies on; and the ft objective is mel reconstruction, not speaker-similarity. Conclusion: for seed-vc, the right use is zero-shot + good prompt; real fine-tuning needs RVC-scale data (≥5-10 min). Flow is still useful as a reference: `train.py --config ... --dataset-dir <1-30s clips> --run-name x --batch-size 1 --max-steps 500`, output `runs/<name>/ft_model.pth`; resume auto-loads the latest `DiT_epoch_*_step_*.pth` (weights only, iters restart at 0).
 - **seed-vc fine-tuning on a 6GB card was a VRAM-paging trap (fixed by hardware).** Full pipeline (DiT 17×768 + whisper-small fp32 + RMVPE + OpenVoiceV2 converter + campplus + BigVGAN, all fp32) peaks ~7.4GB VRAM. On the old 3060-Laptop 6GB it paged: **36s/step** (50 steps took 30+ min), no error, GPU util low. Same run on the 4070 Ti SUPER 16GB: **~0.25s/step**, 500 steps in ~2 min — this is now a non-issue, but if seed-vc training ever crawls again, check `nvidia-smi` for memory.used near the cap before touching any code. Note `checkpoints/hf_cache` (vocoder/whisper) vs `checkpoints/models--*` (DiT/rmvpe/campplus) are separate cache roots; OpenVoiceV2 converter downloads on first `train.py` run.
 - **`n_steps` is saturated at the upstream 32 — do not spend time here.** Swept on song_2 at `--seed 1234`, everything else fixed: 32 → 0.5950 / 0.5735, 64 → 0.5959 / 0.5786, 100 → 0.5959 / 0.5827 (mean / median). The +0.0009 mean gain from 32→64 is a quarter of the seed-noise floor, 64→100 is exactly zero on the mean, and each doubling costs a proportional amount of inference time (the Euler loop is the whole cost). Median creeps up ~0.009 across the range, which is the only hint of a real effect and still sub-noise. Note the CFM sampler is a plain fixed-step Euler integrator (`flow_matching.py:292-315`), so more steps only reduce discretisation error — it cannot add speaker information that the condition does not carry. Confirms the older "≥16 converged" note with numbers.
-- **Debiasing the whisper content features toward the prompt makes it worse — the speaker residual is load-bearing.** The tempting inference from the `--cfg` result is that the whisper speaker residual in `content_feat` is pure contamination, so subtracting it should help directly. Implemented and tested: take the time-mean of the source's content features over non-padded frames, take the prompt's, and shift the source's features by `α·(pt_mean − gt_mean)` before `content_feat + f0_feat` — stripping the static speaker component while leaving all temporal (phonetic) structure intact. Swept on song_2 at `--seed 1234`: α=0 → **0.5950**, α=0.5 → 0.5931, α=1.0 → 0.5932. Monotonically *worse*, and both arms land ~0.002 below baseline. Reason: the CFM decoder was trained on features with that residual present, so the learned feature→mel mapping already accounts for it; removing it at inference time is an out-of-distribution shift, and the decoder has no way to know the missing bias was speaker rather than content. This is why `--cfg` works and this does not — CFG changes *how hard the condition is amplified* (staying on-manifold), while mean-shifting moves the condition off the manifold entirely. Reverted; not exposed as a flag. General lesson: interventions that edit the conditioning signal in-place lose to interventions that reweight it.
+- **Debiasing the whisper content features toward the prompt makes it worse — the speaker residual is load-bearing.** The tempting inference from the `--cfg` result is that the whisper speaker residual in `content_feat` is pure contamination, so subtracting it should help directly. Implemented and tested: take the time-mean of the source's content features over non-padded frames, take the prompt's, and shift the source's features by `α·(pt_mean − gt_mean)` before `content_feat + f0_feat` — stripping the static speaker component while leaving all temporal (phonetic) structure intact. Swept on song_2 at `--seed 1234`: α=0 → **0.5950**, α=0.5 → 0.5931, α=1.0 → 0.5932. Monotonically *worse*, and both arms land ~0.002 below baseline. Reason: the CFM decoder was trained on features with that residual present, so the learned feature→mel mapping already accounts for it; removing it at inference time is an out-of-distribution shift, and the decoder has no way to know the missing bias was speaker rather than content. This is why `--cfg` works and this does not — CFG changes *how hard the condition is amplified* (staying on-manifold), while mean-shifting moves the condition off the manifold entirely. Reverted; not exposed as a flag. General lesson: interventions that edit the conditioning signal in-place lose to interventions that reweight it — **or that substitute it with in-distribution vectors, see the kNN entry below**.
+- **kNN retrieval on the content features is the second-largest lever found, and it stacks with `--cfg`.** Same target as the failed mean-shift — the source-singer residual in `content_feat` — but instead of *deleting* the residual it *replaces* it with the target speaker's: each source whisper frame is blended with the mean of its `k` nearest neighbours among the **prompt's own** whisper frames (`_knn_replace_content`, `soulxsinger_svc.py`, exposed as `sing.py --knn-alpha/--knn-k` → `inference_svc.py --knn_alpha/--knn_k`). Every substituted vector is therefore a convex combination of genuine whisper-base final-layer outputs, which is exactly what mean-shift was not. Costs nothing: `pt_content_feat` is already computed one line above (`:414`), the pool is ~1250-1450 frames, brute-force cosine needs no faiss. Same idea as kNN-VC / RVC's `index_rate`.
+
+  Swept on song_2, `--seed 1234`, cfg=0.5 (52 windows, `eval_sim` vs the real voice):
+
+  | α | 0.0 | 0.2 | 0.3 | **0.4** | 0.6 | 1.0 |
+  |---|---|---|---|---|---|---|
+  | mean SIM | 0.5950 | 0.5985 | 0.6016 | **0.6042** | 0.5918 | 0.5395 |
+
+  Inverted U with a peak at **0.3-0.4**; full replacement (α=1.0) costs −0.056 and flattens
+  `corr(pitch distance, SIM)` from −0.42 to −0.086, i.e. it destroys content. Confirmed over 3 seeds
+  (1234/2234/3234, paired) so it clears the ±0.004 noise floor, and the gain is **larger at cfg=1.0**
+  than at the current default cfg=0.5:
+
+  | | α=0.0 | α=0.4 | gain | wins |
+  |---|---|---|---|---|
+  | cfg=0.5 | 0.5991 | 0.6066 | +0.0075 | 3/3 |
+  | cfg=1.0 | 0.6002 | **0.6134** | **+0.0132** | 3/3 |
+
+  **The triad is what makes this trustworthy: A rises while C *falls*.** Every other SIM gain in this
+  file could in principle have been bought with original-singer leakage (`corr(A, excess) = +0.396`);
+  this one demonstrably is not (seed 1234, B = 0.4295, 4 impostors):
+
+  | arm | A | C | excess | progress | A−C margin | win% |
+  |---|---|---|---|---|---|---|
+  | cfg=0.5, α=0.0 | 0.5888 | 0.6492 | 0.1354 | 0.279 | −0.0605 | 28% |
+  | cfg=0.5, α=0.4 | 0.5979 | 0.6195 | 0.1291 | 0.295 | −0.0216 | 42% |
+  | **cfg=1.0, α=0.4** | **0.6086** | **0.6090** | **0.1188** | **0.314** | **−0.0003** | **55%** |
+
+  `win%` (fraction of windows closer to the reference than to the original singer) crossing 50% is a
+  first for this workspace. Note `eval_triad` reports 53 windows where `eval_sim` reports 52, so its A
+  runs ~0.006 below the `eval_sim` mean — do not mix the two tools' absolute numbers in one table.
+  Stability cost is the familiar shape and mild: at cfg=1.0, `eval_stab` mean 0.5444 → 0.5548,
+  drift 0.0933 → **0.1050**, p90drift 0.2144 → 0.2526, dropouts 2 → 2, worst 0.2982 → 0.3074.
+- **The kNN gain replicates on every song tested — 11/11 arms positive, and it is *largest where the
+  baseline is worst*.** Cross-song check at cfg=1.0, α=0.4 vs α=0.0, all seeds paired:
+
+  | song | n seeds | α=0.0 | α=0.4 | gain | wins | baseline rank |
+  |---|---|---|---|---|---|---|
+  | song_9 | 1 | 0.4831 | **0.5149** | **+0.0318** | 1/1 | worst song in the set |
+  | song_6 | 3 | 0.5264 | 0.5473 | **+0.0209** | 3/3 | worst *progress* (0.220) |
+  | song_2 | 3 | 0.6002 | 0.6134 | +0.0132 | 3/3 | mid |
+  | song_4 | 3 | 0.6124 | 0.6198 | +0.0074 | 3/3 | best song in the set |
+  | song_0 | 1 | 0.5587 | 0.5634 | +0.0047 | 1/1 | mid |
+  | **all** | **11** | | | **+0.0146** | **11/11** | |
+
+  Not one negative arm; the smallest gain (+0.0047) still sits at the noise floor and the largest
+  (+0.0318) is 8× it. **`corr(baseline SIM, gain)` is strongly negative** — song_9 and song_6, the two
+  songs this file previously singled out as hardest, gain 3-4× what the best song gains. That is the
+  opposite of the usual pattern where a lever only helps where things already work, and it means kNN
+  partially closes the cross-song spread rather than widening it.
+
+  Leakage holds up on the other songs too, so song_2 was not a fluke (`--impostor` × 4, cfg=1.0):
+
+  | song | A α=0→0.4 | C α=0→0.4 | excess α=0→0.4 | win% α=0→0.4 |
+  |---|---|---|---|---|
+  | song_6 | 0.5271 → 0.5458 | 0.6435 → **0.6175** | 0.1275 → **0.1169** | 10% → 25% |
+  | song_9 | 0.4810 → 0.5125 | 0.4771 → **0.4338** | −0.0551 → **−0.0695** | 58% → **80%** |
+
+  Same signature as song_2: A up, C *down*, excess down. song_6 is the one song where `excess` exceeded
+  the normalised gain (flagged by `eval_triad` as 泄漏超过获得) and kNN narrows that gap from both
+  sides. song_9's win% reaching 80% is the highest recorded here.
+
+  Stability cost is consistently mild and, on song_9, actually *negative* (i.e. it improves):
+
+  | song | mean | drift | p90drift | dropouts | worst |
+  |---|---|---|---|---|---|
+  | song_4 | 0.5638 → 0.5674 | 0.0999 → 0.1174 | 0.1902 → 0.2107 | 2 → 2 | 0.2842 → 0.3164 |
+  | song_6 | 0.4988 → 0.5122 | 0.0841 → 0.0936 | 0.1845 → 0.1933 | 10 → 10 | 0.2077 → 0.2175 |
+  | song_9 | 0.4527 → 0.4845 | 0.0759 → 0.0822 | 0.1769 → 0.1818 | **23 → 13** | 0.2102 → 0.2067 |
+  | song_0 | 0.5132 → 0.5167 | 0.1120 → 0.1196 | 0.2330 → 0.2504 | 13 → 13 | 0.2398 → 0.2322 |
+
+  drift rises 0.006-0.018 everywhere (the familiar SIM-for-drift trade), but dropouts never worsen and
+  song_9 loses **10 of its 23** dropouts. So on the songs that need help most, kNN improves the mean,
+  the leakage, *and* the tail simultaneously — there is no trade to weigh there.
+
+  **All of the above was measured on speaker similarity alone, and α=0.4 turned out to be unusable
+  once intelligibility was measured.** See the next entry — the α table there supersedes the "α=0.4
+  is the peak" conclusion, and the working default is now **0.2**, not 0.4 and not 0.
+- **kNN's real cost is articulation, and none of the three existing metrics could see it.**
+  `eval_sim` / `eval_stab` / `eval_triad` all score speaker similarity; kNN edits the *content*
+  features by construction, so validating it with timbre metrics only was a hole in the measurement
+  setup, not a subtle oversight. Found by ear first — specific characters ("退") stopped being
+  pronounceable — then reproduced objectively. `singing/eval_cer.py` now measures it: ASR the output,
+  ASR the original lead as the reference text, report CER. Two things make the number trustworthy:
+  - **The reference text is the original lead's own ASR transcript**, not a hand annotation, so CER
+    measures "how many characters were lost *by the conversion*" rather than absolute recognisability.
+    Both arms inherit the same ~61-character tail that the ASR drops on long audio, so the absolute
+    CER is inflated and only the *relative* comparison is meaningful.
+  - **FunASR's VAD is non-deterministic and this silently corrupted the first measurement.** The same
+    file scored CER 0.3059 and 0.1912 on two runs; re-ASR'ing one file three times gave 345/281/345
+    characters. `eval_cer.py` pins `torch`/`numpy`/`random` seeds and `cudnn.deterministic`, after
+    which four consecutive runs are byte-identical. **Any CER number produced without that seeding is
+    noise** — this is the same class of trap as the unseeded CFM noise documented above.
+
+  Swept on 陪你看星星 (195.6s), cfg=1.0, k=4, full pool, seed 1234 fixed, `eval_sim` 52 windows:
+
+  | α | 0 (off) | **0.1** | **0.2** | 0.3 | 0.4 |
+  |---|---|---|---|---|---|
+  | CER | 0.1324 | **0.1206** | **0.1206** | 0.1412 | 0.1912 |
+  | ΔCER vs off | — | **−0.0118** | **−0.0118** | +0.0088 | **+0.0588** |
+  | SIM | 0.5950 | 0.6042 | 0.6095 | 0.6148 | 0.6195 |
+  | ΔSIM vs off | — | +0.0092 | **+0.0145** | +0.0198 | +0.0245 |
+
+  **α=0.1-0.2 improves both metrics at once** — CER *drops* 1.2 points while SIM rises past the
+  ±0.004 noise floor. SIM keeps climbing monotonically to α=0.4, so a similarity-only sweep
+  (which is what the previous entry did) inevitably picks 0.4 and lands on a 44%-worse CER. The
+  substitution-error count is where it shows: S goes 31 → 31 → 37 → **52** across α=0.1…0.4.
+  **Default is now `--knn-alpha 0.2`**; 0.3 is the crossover, 0.4 is out.
+
+  For scale, compare the exchange rate against the published one. kNN-SVC (ICASSP'25, by a kNN-VC
+  author) pays **+0.62 WER for +2.82 EER** and calls that "largely imperceptible". α=0.4 here pays
+  **+5.9 CER points for +0.025 SIM** — roughly an order of magnitude worse trade. α=0.2 is not a
+  trade at all, which is the only reason it is defensible as a default.
+- **The kNN pool must be the whole reference, not `prompt_ext.wav` — the whisper 30s cap does not
+  apply to it.** The first implementation matched against `pt_content_feat`, i.e. the 28.9s
+  `prompt_ext.wav`, because that is what `infer_segment` already had in hand. But the 30s ceiling
+  exists so `pt_mel` stays aligned with `pt_content_feat` for the *in-context prompt*; a **retrieval
+  pool never enters the model**, so it is not constrained at all. Propagating that limit to the pool
+  was the actual bug behind the articulation damage.
+
+  `encode_long()` (`soulxsinger_svc.py`) chunk-encodes at 28s and concatenates, keeping only each
+  chunk's real frames. On this reference that is **8158 frames (163.2s) instead of 1500 (30.0s)**,
+  and it is what makes α=0.2 viable:
+
+  | pool | mean nn1 | p10 nn1 | frames with nn1<0.5 | top-10 pool frames cover |
+  |---|---|---|---|---|
+  | `prompt_ext.wav`, 28.9s | 0.6534 | 0.5057 | 137/1400 (9.8%) | 10.9% of source |
+  | **`refsep2/lead.wav`, 163.1s** | **0.7232** | **0.5694** | **26/1400 (1.9%)** | **8.1%** |
+
+  Unmatchable frames drop **5×**. At α=0.4 the full pool alone cut CER 0.3441 → 0.3059 and *raised*
+  SIM +0.020 → +0.025, i.e. it improves both sides of the trade — but 0.3059 was still unusable,
+  which is what forced the α sweep. Exposed as `sing.py --knn-full-pool` (**on by default**) →
+  `inference_svc.py --knn_pool_wav` → `infer(knn_pool_wav=)`; the pool is encoded **once** in `infer`,
+  outside the segment loop, since it is identical for every segment. `--no-knn-full-pool` restores the
+  30s-truncated behaviour. Note whisper is non-causal, so a 28s chunk taken alone and the first 28s of
+  a 60s file give different features (max|diff| 15.6) — irrelevant for retrieval, but do not expect
+  bit-identity between the two paths.
+- **Two plausible explanations for *which* frames kNN damages were both wrong; the cause is phone
+  coverage.** Worth recording because both looked obvious and each took one measurement to kill:
+  - *"It breaks unvoiced consonants"* (the /tʰ/ in 退), which would point at RVC's `protect` knob
+    (blend original features back where F0=0). **Unvoiced frames are under-represented among the
+    worst matches, not over**: 20% of the 25 lowest-nn1 frames vs a 46.3% baseline unvoiced rate,
+    an enrichment of 0.43×. `protect` targets "electro-acoustic tearing on consonants", a different
+    failure.
+  - *"The pool lacks the high notes"* — the worst-matching frames are indeed high (390-468Hz). But
+    binning source voiced frames by pitch against pool availability, the `ext` stage has already
+    pushed the pool to median 314Hz / p90 419Hz, and only the >450Hz bin is genuinely thin (6.5:1,
+    110 of 931 frames). Pitch is not the binding constraint.
+
+  What is left is phonetic coverage, which is also what the literature says: NeuCoSVC's table gives
+  14 unique phones at 5s, 23 at 10s, 38 at 30s, 46 at 60s, 49 at 90s, and kNN-VC's authors state
+  that below 30s of reference "intelligibility and target speaker similarity decrease to a point
+  where the more complex baselines perform better", saturating around 5 minutes. A 28.9s pool sits
+  exactly at the bad end of that curve, which is why enlarging it to 163s helped and why the residual
+  damage at high α is irreducible by tuning.
+- **The mechanism behind the kNN gain is NOT confirmed, and the obvious prediction failed.** If kNN
+  works by swapping the source residual for the target's, then amplifying the condition should stop
+  pushing the output toward the original singer, so high `cfg` should hurt *less* with kNN on. Tested
+  directly (seed 1234, song_2): the cfg 1.0 → 3.0 penalty is **−0.0331 at α=0.0 and −0.0455 at
+  α=0.4** — slightly *worse*, and both curves keep the same shape (peak at cfg=1.0, worst at cfg=3.0).
+  So the residual-substitution story is falsified as stated; kNN's α=0.4 gain at cfg=3.0 is only
+  +0.0026, i.e. the two knobs are not attacking the same quantity. A plausible alternative is that kNN
+  mainly pulls the condition's *statistics* toward the prompt's manifold (a mild smoothing/regularising
+  effect), which would also explain why drift rises. Recorded as unexplained rather than papered over:
+  the effect replicates, the explanation does not.
 - **`reverse_diffusion_v2` is dead code for a different training recipe — do not wire it up.** `flow_matching.py:320` looks like a free stability win: it builds `xt_input = cat([prompt, xt, prompt])`, i.e. the prompt bracketing the target on *both* sides instead of prefix-only, which is exactly the shape of fix you would want for cross-segment timbre drift. It is unreachable (nothing calls it) and it must stay that way: the training path builds the prompt mask as a contiguous *prefix* (`forward_diffusion`, `flow_matching.py:131-144` — `prompt_len = randint(...)` then `is_prompt[col_indices < prompt_len] = 1`), so the model has never seen a suffix prompt and would be OOD from the first Euler step. It also expects `target_len = cond.shape[1] − prompt_len*2`, which does not match how `CFMDecoder.reverse_diffusion` assembles the condition (`decoder.py:20`, prefix layout). Ruled out by reading the training code rather than by burning a run — worth remembering as the pattern for any other "unused upstream method" that shows up.
-- **The source material bounds everything.** This reference had 0.4s above 370Hz while the song spent 44.3% of its voiced frames there. Reference *selection* only reshuffles what exists; recording 30-60s of higher-register material is worth more than any parameter.
-- **`--max-prompt 25` starves the `ext` stage, which makes `--anchor-min-ratio` dead code.** `w_ext.py:168` computes `budget = max_sec − anchor_dur` with `max_sec=29` (whisper's ceiling), and the anchor is whatever `select` produced. Measured across all ten songs: `prompt.wav` is 19.6-25.0s and `prompt_ext.wav` is 28.7-29.0s, so the transposed material gets only **3.8-4.1s** on nine of them (song_1, whose reference only yielded 19.6s, is the sole exception at 9.4s). The anchor therefore occupies 86-87% of the prompt, far above the 55% floor, and `--anchor-min-ratio 0.55` never binds — the clamp at `w_ext.py:160` is unreachable at current settings. Two consequences: the band-gap allocator described above is dividing ~4s among all deficient bands, which is why the ext rewrite's +0.010 never cleared the noise floor; and the only way to actually give it room is lowering `--max-prompt` (e.g. 18s → ~11s of budget), which trades anchor length for pitch coverage. Untested — worth one A/B on a high-mismatch song (song_6 is +6.4st, song_0 +5.2st) before assuming either direction, and note the expected effect size is bounded by ext's historical ±0.01.
+- **The source material bounds everything.** This reference had 0.4s above 370Hz while the song spent 44.3% of its voiced frames there. Reference *selection* only reshuffles what exists; recording 30-60s of higher-register material is worth more than any parameter. **Update (2026-08): the material can now be *extended*, not just re-selected** — PC-NSF transposition covers 221-394Hz at SIM ≥0.83 (see "Reference material pitch extension"); TTS voice design cannot substitute (SIM 0.535, synthetic timbre).
+- **ext 占比/移调上限/最小分段的单因素扫点（song_0, 2026-08, seed 1234 固定）—— 三个维度里只有 ext 占比有效应。** 三组实验各 5-7 个点、全部 `--seed 1234`（配对），eval_sim 3s 窗 vs 真实语音：
+
+  **Exp1: ext 占比**（`--anchor-min-ratio`，0% = 直接喂 prompt.wav 跳过 ext）。粗扫 7 点 + 精细加密 8 点（0.20-0.65 区间，全部 seed 1234 配对）:
+
+  | ratio | 0.0 | 0.15 | 0.20 | 0.25 | 0.30 | **0.35** | **0.40** | 0.45 |
+  |---|---|---|---|---|---|---|---|---|
+  | ext占比 | 100% | 85% | 80% | 75% | 70% | **65%** | **60%** | 55% |
+  | SIM mean | 0.5660 | 0.5690 | 0.5694 | 0.5710 | 0.5681 | **0.5743** | **0.5737** | 0.5710 |
+
+  | ratio | 0.50 | 0.55 | 0.60 | 0.65 | 0.75 | 0.90 | (0% ext) |
+  |---|---|---|---|---|---|---|---|
+  | ext占比 | 50% | 45% (默认) | 40% | 35% | 25% | 14% | 0% |
+  | SIM mean | 0.5657 | 0.5673 | 0.5657 | 0.5642 | 0.5521 | 0.5489 | **0.5433** |
+
+  峰是 **ratio 0.35-0.40（ext 60-65%）的平台**：r035 与 r040 各 3 seed（+1234/2/3）均值 0.5694 vs 0.5686，差 0.0008 低于噪声底，**不可区分**；而 r035 vs r055 3 seed 配对 +0.0070/+0.0045/+0.0033 三战三胜（均值 0.5694 vs 0.5644），超过噪声底 ±0.004。形状是非单调的山：两头都掉（0% ext 掉 0.024，14% 掉 0.018）。`eval_stab` 同协议：r035 1.5s 窗 mean 0.5264 vs r055 0.5213（+0.0051），drift 0.1229 vs 0.1204（+0.0025）、dropouts 13 vs 12 —— 稳定性代价很小；r040 与 r035 在 eval_stab 上也几乎相同（0.5261/0.5264）。**注意 0% ext（纯锚点 25s）是最差的 0.5433** —— 这个参考的音域本身不够（med 274 vs 歌曲 369），ext 高音素材确实是必要的，但比例不是越大越好。
+
+  **跨歌复现（song_2 + song_6, 2026-08）—— 峰没有复制，song_2 是明确反例，不改默认。** 同协议 3 seed 配对（r035/r040/r055 × 1234/2/3）:
+
+  | 歌曲 | 错配 | r035 (65%) | r040 (60%) | r055 (45%默认) | r035 vs 默认 |
+  |---|---|---|---|---|---|
+  | song_0 | +9.1st | 0.5694 | 0.5686 | 0.5644 | **+0.0049** 三战三胜 |
+  | song_2 | +7.6st | 0.5934 | 0.5918 | **0.5995** | **−0.0061 三战三负** |
+  | song_6 | +11.2st | 0.5369 | 0.5331 | 0.5333 | +0.0036 三战三胜(噪声边) |
+
+  song_2 上 r035/r040 都比默认差，`eval_stab` 同方向（r055 0.5399 vs r035 0.5334，且 r035 dropouts 更多）—— 反例在稳定性协议上同样成立，不是单协议假象。三首歌的 r035/r040 prompt_ext 音高分布几乎相同（med 340-350 vs 314-318，ext 18.8s 全填满），排除产物差异。**唯一能解释的方向是歌曲的 prompt-vs-song 音域接近度**：song_2 的 prompt med 277Hz vs song 318Hz 只差 2.4st，素材本身覆盖够，vocoder 重合成的损伤（过一遍 NSF 掉 ~0.02-0.045 SIM）> 高音覆盖收益；song_0/song_6 差 4.6-5.1st，覆盖收益 > 损伤。**结论：默认 0.55 保持不动**；若歌曲与参考音域差 >~4.5st 且想要那 ~+0.004，可对单首歌调 0.35，但收益量级≈噪声底，不值得为此引入歌曲级配置。
+
+  **Exp2: 移调上限**（`--ext-max-shift`，固定 ratio 0.55）:
+
+  | max-shift | 2 | 3 | 4 | **5 (默认)** | 6 |
+  |---|---|---|---|---|---|
+  | SIM mean | 0.5548 | 0.5602 | 0.5647 | **0.5673** | 0.5598 |
+
+  单调升到 5 再跌 —— **默认 5 已经是最优，无需动**。2-4 的缺口恰好是 song_0 歌曲 p90 465Hz vs 素材+shift 上限 378→453Hz 的覆盖不足；6 的回落与 AGENTS.md 逐段扫点（+6 worst 掉到 0.81）一致。
+
+  **Exp3: 最小分段**（`--select-min-sec`，固定 ratio 0.55）:
+
+  | min-sec | 0.15 | **0.30 (默认)** | 0.50 | 0.80 | 1.20 |
+  |---|---|---|---|---|---|
+  | SIM mean | 0.5668 | **0.5673** | 0.5653 | 0.5635 | 0.5622 |
+
+  近于平坦：0.15-0.30 持平（0.15 不产生新候选 —— 现有最短候选就是 0.302s，md5 相同），之后单调慢降 −0.005。**0.30 默认已经是最优**；1.20 的下降部分来自素材池缩到 11 段/17.7s 导致 prompt 变短。短分段不伤 SIM —— 之前担心的"27 段 0.9s 碎片拼接伤音色"没有发生（prompt 是 whisper 一次性编码的整段 mel，不是逐段推理）。**用户提议的"用短窗峰值代替中位数选段"仍然不可行**（见上一条的 L1 模拟：峰值音高高估整段移调后的落格秒数，三首歌 L1 全部变差），但"峰值只用于选择不用于移调"的变体未测。
+
+- **`--anchor-min-ratio` is a *cap*, not a floor, and it binds on every run — an earlier note in this file claimed the opposite and was wrong.** `w_ext.py:165-172` reads `if anchor_dur > max_sec * ratio: 裁剪`, so the flag sets the **maximum** share the clean anchor may occupy, and everything left over goes to the transposed material. At the defaults (`max_sec=29`, `ratio=0.55`) the anchor is clamped to **15.95s** and ext receives **13.05s (45%)** on every song whose `prompt.wav` exceeds 15.95s — which is all of them (`prompt.wav` is 19.6-25.0s). Verified in three logs (`song_0`, `song_2`, `song_6`), each printing `锚点裁剪到 15.95s（max_sec 29s × anchor_min_ratio 0.55）`, and by counting F0 frames in the shipped `prompt_ext_f0.npy`. The superseded note asserted ext gets only 3.8-4.1s and that the clamp was unreachable; it had the inequality backwards. Consequences: (1) `--anchor-min-ratio` is the ext-share knob — sweeping it 0.0→1.0 spans "all transposed" to "all clean", and no code change is needed to test ext share; (2) lowering `--max-prompt` does **not** buy ext more room at ratio 0.55 (the clamp already decides the split), it only shortens the anchor once `prompt.wav` drops below 15.95s; (3) above `ratio ≈ 0.86` the material itself becomes the binding constraint (a 24.96s `prompt.wav` cannot fill 29·0.9), so ratios 0.90 and 1.00 produce identical prompts.
+- **ext 的选段排序键把素材池锁死在顶端 8%，加一个复用惩罚就换来 3 首歌全正的增益（2026-08，`--ext-div-weight` 默认 3.0）。** 由听感发现：ext 追加的部分"多样性严重不足，基本都是拿一两个高音段落升调拼接"。量化后比描述更严重 —— 10 首歌里 ext 平均只用到 **11-16 个源段**，复用 1.56-2.55×（28 个移调段来自 11 个源），且跨 10 首歌被选中的源段几乎是同一批（`seg 59/54/39/65/29/114/53/115` 每首都在）。
+
+  **根因不是贪心策略，是排序键的副作用。** `w_ext.py` 原排序是 `(inside, |shift|, 离格中心距离)`，`|shift|` 为第二优先，于是填 380Hz 格时 339Hz 的段（+2st）永远排在 248Hz 的段（+7st→钳到+5）之前。绿色的候选池有 **143 段/95.6s**，但 med≥290Hz 的只有 **15 段/7.7s**，要填 13.05s 的 ext 预算 → 数学上必然复用 2.2×。池里 116-339Hz 的其余 92% 素材从未参与竞争。这个排序本身有实测依据（每半音 0.014-0.020 SIM，每个输出音高桶内 `corr(|shift|,SIM)` 都在 −0.76…−0.99），但它把**单段保真度**当成唯一目标，而 prompt 是**池化平均使用**的 —— whisper 看到的音素多样性只有 13 段的量，正好落在 NeuCoSVC/kNN-VC 那条"<30s 参考吐字与相似度双降"的曲线最差端。
+
+  修法：`used_src[idx]` 计数 + 排序键改为 `(inside, |shift| + div_weight·已用次数, 离格中心距离)`，即把"复用一次同源段"折算成等价半音数，让算法能用更大的移调换更多不同源段。因惩罚随选择过程变化，改为**每次重算 cost 的逐个贪心**而非一次性排序。A/B（3 首 × `div_w ∈ {0,1,3}`，`--cfg 1.0 --seed 1234`，`paired_eval` 3s 公共窗）:
+
+  | 歌曲 | dw=0 | dw=1 | **dw=3** | gain(dw3) | wins | p_sign |
+  |---|---|---|---|---|---|---|
+  | 绿色 | 0.5925 | 0.6002 | **0.6034** | **+0.0109** | 60/70 | 0.0000 |
+  | 爱笑的眼睛 | 0.5583 | 0.5602 | **0.5635** | +0.0052 | 54/75 | 0.0002 |
+  | 冬眠 | 0.5454 | 0.5486 | **0.5489** | +0.0034 | 40/60 | 0.0135 |
+  | 均值 | | +0.0043 | | **+0.0065** | | |
+
+  9/9 arm 全正，`dw=3 > dw=1` 在 3/3 上一致，符号检验全部显著。**`dw=0` 与旧代码 `prompt_ext.wav` md5 完全一致**，所以重构无副作用、基线可信。
+
+  **机制是干净的：唯一变化的就是源段数。** ext 总时长恒定 ~13s，均 |shift| 几乎不动（绿色 3.82→3.74，爱笑 3.57→3.54，冬眠 3.11→3.46），而唯一源段 13→22 / 11→17 / 13→19，复用 2.15→1.05 / 2.55→1.41 / 2.15→1.37。增益最大的绿色正是多样性提升最多的那首。**即"旧排序的复用不是移调预算的必要代价，纯粹是排序键的浪费"** —— 换来 9 个额外源段几乎没有额外移调损失。
+
+  代价两项都查过（kNN 的教训：动内容侧必须查 CER）：
+  - **CER 无系统性代价**，方向不一致 —— 绿色 +0.0141、爱笑的眼睛 **−0.0377**、冬眠 +0.0109，均值 −0.004。与 kNN α=0.4 那种"3 首全负、+5.9 点"性质完全不同。
+  - **稳定性代价极小**：drift +0.0016…+0.0020（本文件其他杠杆都是 +0.006…+0.018），dropouts 基本不变（11→11 / 5→5 / 8→7），p90drift 两首反而改善（0.1959→0.1888、0.1924→0.1840）。
+
+  未测：`dw>3`（绿色在 dw=3 已到复用 1.05×，接近饱和，但另两首还有空间）、`dw` 与 `--ext-max-shift` 的交互（放宽多样性后是否值得把 max-shift 提到 6）。
+- **`ext` 阶段 2.2× 提速：把逐 shift 组 fork 合并成一次进程，输出 bit-identical（2026-08）。** 该阶段耗时几乎与音频长度无关 —— 逐组计时暴露了形状：0.30s 的组 4.7s、5.94s 的组 4.2s。拆开量：`pitch_transpose.py` 单次进程**固定开销 2.77s**（import torch 1.02 + import 项目模块 0.99 + load RMVPE 0.53 + load NSF-HiFiGAN 0.11），净计算只有 **0.87s**（mel 0.00 + rmvpe f0 0.11 + vocoder 0.76，5.94s 音频）。典型 5 组 = **~14s 纯开销**。
+
+  修法：新增 `tools/pcnsf/scripts/multi_transpose.py`（接 `--jobs` 的 JSON 列表，一个进程跑完所有 `(wav, shift)`），`w_ext.py` 先把各组输入全部落盘再一次性调用（`nsf_shift_many`）。**注意 fork 本身是省不掉的** —— `tools/pcnsf/.venv` 是 torch 2.13+**cpu**、与 `w_ext.py` 所在的 SoulX venv 不同，所以只能把 N 次降到 1 次，不能降到 0。全 10 首实测：
+
+  | | 逐组 fork（旧） | 批量（新） | 加速 |
+  |---|---|---|---|
+  | 单首范围 | 15.2-25.0s | 8.3-8.6s | 1.77-2.90× |
+  | 10 首合计 | **188.4s** | **84.6s** | **2.22×** |
+
+  新路径耗时几乎恒定（8.3-8.6s），因为剩下的就是那一次固定开销。**10/10 首 `prompt_ext.wav` md5 bit-identical**，端到端 SVC 后 `vocal.wav` md5 与 SIM（0.6034/0.6348）也完全不变。`multi_transpose.py` 的 per-job 计算是逐行照抄 `pitch_transpose.py` 的 `nsfhifigan` 分支（同样的 librosa dtype / `get_mel_torch` 参数 / `rmvpe.get_pitch` / `f0 *= 2**(n/12)` / `save_wav`），这是 bit-identical 的原因。`--shifter seedvc` 没有对应多 job 入口，仍走逐组 fork。
+
+  **验证这类改动时有个陷阱：`F0Extractor` 本身不可复现。** 同一进程内对同一文件连跑 4 次，`max|diff|` 达 2.2e-4（相对误差 2.5e-6），所以 `prompt_ext_f0.npy` **永远不会** byte-equal，一度让我误判成改动引入了偏差。判据要用 `prompt_ext.wav` 的 md5（它是确定性的）加下游 `vocal.wav` + SIM。另一个坑：对照基线必须显式带上 `--div-weight 3.0`，否则拿到的是 `dw=0` 时代的存档产物（`DIV_WEIGHT_DEFAULT` 仍是 0.0，3.0 由 `sing.py` 的 `Cfg.ext_div_weight` 下发），段数会从 26 变 28，看起来像本次改动的锅。
+- **`svc` 阶段没有显存可吃，`max_seg_sec` 已到架构顶。** 扫点（绿色，`--cfg 1.0 --seed 1234`）：20 → 78.8s / 5049 MiB，24 → 74.8s / 5257 MiB，28 → 73.7s / 6437 MiB。28 已是 whisper 30s 硬顶下的最大值，且 6437/16376 MiB 说明**瓶颈不是显存**。CFM 的 32 步 Euler 严格串行（`flow_matching.py:292`），CFG 每步两次前向（`:293` 的 `[prompt+xt]` 与 `:302` 的 `[xt]`）长度不同、不能 stack 成一个 batch。另外两处看似浪费的地方实测都不值得动：`infer_segment:513` 每段重算循环不变的 `pt_content_feat`（10 段冗余共 **0.11s** —— whisper-base 单次 28s 只要 **10.9ms**），`encode_long` 的 6 chunk 顺序编码（**0.07s**）。`eval` 的 71 窗 ERes2NetV2 逐窗推理也只有 1.38s。**这些是本文件里"看代码觉得浪费、实测微不足道"的典型，动手前先测。**
+- **覆盖率与 SIM 相关 +0.69，但这大概率是难度的代理变量，不要当成因果。** 10 首歌 `corr(select 覆盖%, SIM) = +0.692`（Spearman +0.733），cov<55% 的 5 首均值 0.5654 vs cov≥55% 的 5 首 0.6021（差 +0.0367）。看着像"提高覆盖率就能提分"，但覆盖率低本身就意味着歌曲音域离参考远，而本文件已记录 `corr(B, A) = +0.810`（B = ref vs target，任务难度基线）。同一批数据里 `corr(唯一源数, SIM) = +0.440`、`corr(复用率, SIM) = −0.452`、`corr(均|shift|, SIM) = +0.102` —— 这些变量彼此高度耦合，n=10 的观察性相关无法分离。**多样性那条之所以可信，是因为随后做了干预实验（上一条），而不是因为这个相关系数。**
+- **前移移调到 select 阶段（在 prompt 构建时就覆盖高音区）：已实验，SIM 无改善，已回滚（2026-08）。** 思路是把歌曲目标 F0 分布带入 select 的贪心，把每个候选段虚拟展开成 shift ∈ {−4…+5} 的多个候选，用 `score = (边际增益/时长) × fidelity[shift]` 打分，让高音区缺口在第一次选段时就被填上，省掉 ext 阶段单独的 4s 预算限制。仿真（7首歌，3 seed）：覆盖率 75.8%→84.9%，band L1 0.405→0.273。实际 A/B（song_2 3 seed, song_6 3 seed, seed 配对）：
+
+  | 歌曲 | 旧流程（seed 均值） | 新 select | 差值 |
+  |---|---|---|---|
+  | song_2（覆盖 62%→88%）| 0.5962（5 seed）| 0.6029（3 seed）| +0.0067 |
+  | song_6（覆盖 29%→64%）| 0.5313（3 seed）| 0.5251（3 seed）| −0.0062 |
+
+  两首合并均值差 +0.0002，seed 噪声底 ±0.004，**无显著效果**。根本原因：SoulX 从 `prompt.wav` 里用 WhisperEncoder 提取内容特征，speaker embedding 来自 mel 时序全貌而非 prompt 的音高分布；prompt 高音区覆盖率不在 `content_feat + f0_feat` 这条路径上。和 ext 改写时的结论完全一致——改的是 prompt 结构，不是送给模型的 F0 条件，所以覆盖率涨了但 SIM 不动。附一个在实验中发现的测量陷阱：**FIDELITY 表（`tools/pcnsf/score_segments.py` 的 `vs_real` 列）用的是「内容配对协议」**——对 seg_k 的移调版打分时，真实语音用的是 seg_k 对应时刻的同一段，不是全文件嵌入。这个协议比 `eval_sim` 宽松约 0.7（+5st：0.898 vs ~0.25），不能用来预测 `eval_sim` 分数，也不反映 SoulX prompt 读取时的实际音色保真度。
 
 ### SVC engine A/B (2026-08): SoulX-Singer vs YingMusic-SVC
 
@@ -223,7 +519,44 @@ Same inputs (257s lead vocal, same ref), same eval protocol (eval_sim vs real sp
       --semi-tone-shift 0
   ```
 
-### SVC engine A/B #2 (2026-08): HQ-SVC (AAAI'26 low-resource zero-shot)
+### SVC engine A/B #2 (2026-08): Vevo2 (Amphion, speech+singing joint tokenizer)
+
+**Conclusion: 30s whisper ceiling makes it unusable for full-song SVC.** Vevo2 is a unified speech+singing
+framework (7k hours of singing data in the tokenizer training), but its FM-only (style-preserved SVC) path
+uses whisper-medium as the content encoder, and whisper hard-truncates to 30s (`whisper.pad_or_trim`,
+N_SAMPLES=480000). Everything past 30s is **截断后用最后一帧重复填充** (`vevo2_utils.py:211-214`), so
+on song_2 (195.7s) only **15.3%** of the content is real — 1500 whisper frames real, 8285 frames repeated.
+
+Measured (smoke test, 20s source + 25s ref, both < 30s ceiling, 16GB VRAM):
+- **VRAM peak: 6.60 GB allocated / 7.53 GB reserved** (comfortable on 16GB)
+- **RTF 0.39** (20s audio in 7.9s, after 169s one-time whisper-medium download)
+- **No manual segmentation logic** — `inference_fm` sends the whole file to whisper, unlike SoulX which
+  auto-segments at silence with `build_vocal_segments`
+
+Why SoulX's 30s limit doesn't hurt but Vevo2's does:
+- **SoulX**: whisper only encodes *content*, timbre comes from a separate channel (`pt_mel`, the prompt's
+  mel spectrogram, which is global and never segmented). Each segment gets the same `pt_mel` as timbre
+  anchor → cross-segment音色一致. The 30s limit only affects content encoding, which is already split at
+  silence boundaries.
+- **Vevo2**: the `content_style_tokenizer` is a VQ-VAE trained on **whisper + chromagram joint features**
+  (`extract_coco_codec`, `:689-699`), so it encodes a混合of content and style, not pure content. The
+  timbre reference also gets whisper-encoded and contributes to `diffusion_input_codecs` (`:777`), so the
+  30s截断 affects both content *and* timbre. Manually segmenting the source doesn't help: each segment's
+  `contentstyle_codecs` would still carry that segment's source-singer style residual (the tokenizer was
+  never trained to disentangle them fully), and there's no global timbre anchor like SoulX's `pt_mel`.
+
+Setup (tools/vevo2/.venv, Python 3.10, torch 2.6+cu124, kept for reference but not wired into sing.py):
+- Weights: 2.72 GB (FM-only, skipped AR model; `download_fm_only.py` filters by `allow_patterns`)
+- Dependencies: 20+ packages resolved by repeated "missing module" loop (transformers 4.57, not 5.x;
+  torchvision 0.21+cu124 to match torch 2.6; setuptools<81 for pyworld's pkg_resources; ruamel.yaml, six)
+- CWD trap: same as seed-vc/yingmusic — must run from `tools/vevo2/Amphion/` or `whisper_stats.pt` path breaks
+
+Ruled out as a production option. The 7k-hour singing tokenizer advantage cannot overcome the 30s whisper
+architectural limit in a full-song zero-shot SVC use case. Changing the encoder (e.g. to WavLM) would
+invalidate the pretrained tokenizer (needs retraining with 101k hours of data). Manual segmentation trades
+音色一致性 for覆盖, and you'd still lose to SoulX which already has the segmentation + global timbre anchor.
+
+### SVC engine A/B #3 (2026-08): HQ-SVC (AAAI'26 low-resource zero-shot)
 
 HQ-SVC = 解耦 codec + EVA 模块 + DDSP/diffusion 渐进生成，主打低资源零样本。Same 257s song, same ref; here we compared on the full song with the real `prompt_ext` as target (SoulX via `sing.py` full pipeline, HQ-SVC via `tools/HQ-SVC/cli_infer.py --shift 0`):
 
@@ -237,10 +570,194 @@ HQ-SVC = 解耦 codec + EVA 模块 + DDSP/diffusion 渐进生成，主打低资�
 - Its selling point is **low-resource training** (single consumer GPU, <80h data), not zero-shot inference quality — training code was still not released as of 2026-08, so it's inference-only for now.
 - Setup gotchas (repo dir + weights removed 2026-08 to free 15G; re-download if ever needed): ships a ready-made conda env `environment.tar.gz` (4.7GB → unpack to `venv/`, torch 2.0.1+cu118, python3.9); weights on HF `shawnpi/HQ-SVC` (`utils/pretrain/*`: 250000_step_val_loss_0.50.pth 241M + ns3_facodec_* 450M + rmvpe 368M + nsf_hifigan 57M). `utils/pretrain/nsf_hifigan/` needs `config.json` copied from `configs/hifigan_config.json` (not shipped in place). `LD_LIBRARY_PATH` must be unset before running (`unset LD_LIBRARY_PATH`). Local CLI wrapper: `tools/HQ-SVC/cli_infer.py` (source + 1..N targets, `--shift 0` to keep melody; sys.path must use `append`, not `insert`, or `utils` shadows itself). RTF ≈ 0.05 on 16GB (10 diffusion steps).
 
+### Reference material pitch extension (2026-08): TTS voice design vs neural vocoder transposition
+
+Goal: extend a 163s speech reference (ref.wav, median F0 245.8Hz) to cover a song at 369.3Hz median — the gap is +5.8st. Two approaches tested on the same 15s material (ref_cut.wav, the highest-register 15s window of `data/songs/song_2/refsep2/lead.wav`, med 263.9Hz), scored by eval_sim vs the real voice unless noted.
+
+#### VoxCPM2 TTS (tools/voxcpm2/, torch 2.6+cu124, Apache 2.0, 48kHz out)
+
+| mode | variant | med F0 | SIM vs real |
+|---|---|---|---|
+| Style Control (ref + tag) | base (no tag) | 246.1Hz | 0.8456 |
+| | high | 255.9Hz | — |
+| | girl | 262.1Hz | — |
+| | soprano | 263.0Hz | 0.866 |
+| Voice Design (no ref) | vd_high | 357.6Hz | 0.535 |
+| | vd_soprano | 352.3Hz | — |
+| | vd_loli (中文) | 261.4Hz | — |
+| Voice Design → Clone | rt_ultimate (ref+cont) | 366.3Hz | 0.909 (vs vd_high) |
+
+- **Style Control ceiling is +1.15st, not enough** (need +5.8st). Tags only modulate *how* the speaker performs within their natural register; the ref channel locks the register itself. Proof: feeding a 263.9Hz window still output 246.1Hz — exactly the full-reference median (245.8Hz), i.e. the model extracted the speaker's *habitual* pitch, not the window's.
+- **Voice Design (no ref) reaches 357.6Hz but sounds like "game character voice"** — SIM vs real voice is 0.535 (vs 0.866 for a real clone). Round-tripping the designed voice back as a ref ("VoiceDesign→Clone") keeps pitch (366Hz) and locks that synthetic timbre (SIM 0.909 vs the synthetic, 0.535 vs real) — it does NOT recover the real timbre. So TTS is unsuitable as SVC reference material: pitch is achievable, timbre is not.
+- Gotchas: `voxcpm.generate()` has NO `seed` param (README example `seed=42` raises TypeError) — set `torch.manual_seed()` first. `_encode_wav` does NOT truncate the ref; 163s ref = 1020 tokens (max_length 8192) but training capped at 60s, so keep refs ≤ 60s. API: `--mode design` (no ref) vs `--mode clone` (ref + optional style tag). VoiceDesign output is random per run — must generate 3-5 and pick.
+
+#### PC-NSF-HiFiGAN transposition (existing `tools/pcnsf`, winner)
+
+Same ref_cut.wav, SIM vs real (unshifted):
+
+| shift | med F0 | SIM | | shift | med F0 | SIM |
+|---|---|---|---|---|---|---|
+| −12st | 131.5Hz | 0.6939 | | orig | 263.9Hz | 1.0000 |
+| −7st | 176.5Hz | 0.7844 | | +3st | 312.8Hz | 0.9346 |
+| −5st | 197.8Hz | 0.8500 | | +4st | 330.6Hz | 0.9139 |
+| −3st | 221.3Hz | 0.9163 | | +5st | 351.2Hz | 0.8789 |
+| | | | | +6st | 371.9Hz | 0.8540 |
+| | | | | +7st | 393.9Hz | 0.8303 |
+
+- **Asymmetry: downshift costs more than upshift.** Equal magnitudes: +3st 0.9346 vs −3st 0.9163 (+0.018); +5st 0.8789 vs −5st 0.8500 (+0.029); +7st 0.8303 vs −7st 0.7844 (+0.046). Cost per semitone ≈ 0.024 up / 0.030 down. −12st (0.6939) is below DSP level (rubberband 0.7728) — unusable. **The per-semitone figures here are inflated** — they include the vocoder resynthesis loss that `orig = 1.0000` hid; see the per-segment sweep below for the corrected 0.014-0.020/st and for the fact that the asymmetry only matters above ±2st.
+- **Mechanism: formants stay fixed.** Transposing multiplies F0 but keeps the spectral envelope; down to male register the female formants become impossible for a human, and ERes2NetV2 catches it. Consequence: for low-register songs, use `--pitch-shift auto` (raise the song, don't lower the ref) — this is the same direction the whole pipeline already takes.
+- **Voiced rate drops on upshift** (0.78→0.75 at +7st), rises on downshift (→0.81 at −12st) — RMVPE tracks low pitches more easily; the 0.75 at +7st is a real second cost.
+- Usable pool: SIM ≥0.87 → −3/orig/+3/+4/+5 (221-351Hz); ≥0.83 → add +6/+7 (up to 394Hz, covers song median 369Hz). **These pilot numbers are inflated (no vocoder baseline); see the per-segment sweep below for corrected figures: mean ≥0.85 → −4…+6, worst ≥0.85 → −4…+4.**
+- CLI: `tools/pcnsf/.venv/bin/python tools/pcnsf/scripts/pitch_transpose.py in.wav --transpose 5 --method nsfhifigan --config .../config.json --ckpt .../model.ckpt --pitchalgo rmvpe --rmvpeckpt SoulX-Singer/.../rmvpe.pt --out dir --title name`. Note `--transpose -3` needs `=` form (`--transpose=-3`) or argparse treats it as a flag.
+
+#### Full-reference per-segment sweep −4…+6 (2026-08, supersedes the 15s pilot above)
+
+The table above was one embedding per 15s clip scored against itself at `orig`, which conflated two
+different costs and let good passages average over bad ones. Redone on the **whole 163.1s
+`refsep2/lead.wav`** (the two-stage separation of `ref.wav`, med F0 245.8Hz, voiced 65.5%), split at
+silence into **20 segments of 3.05-8.0s**, every segment scored individually at all 11 shifts.
+
+Three comparisons per segment, and keeping them apart is what makes the numbers interpretable:
+
+| comparison | isolates |
+|---|---|
+| shifted vs **its own shift=0** (`vs_base`) | transposition cost alone |
+| shift=0 vs real (`base_vs_real`) | **vocoder resynthesis floor** — the ceiling for everything else |
+| shifted vs real (`vs_real`) | total = resynthesis + transposition |
+
+**The vocoder floor is 0.9748** (long segments; 0.9601 worst). No transposed output can beat it, and the
+pilot's `orig = 1.0000` row hid it entirely — roughly a quarter of what the pilot charged to
+"transposition" was really resynthesis.
+
+Headline table, **long segments only (n=18)**, `vs_real`:
+
+| shift | out F0 | mean | p10 | worst | verdict |
+|---|---|---|---|---|---|
+| −4 | 195.1 | 0.8811 | 0.8646 | 0.8543 | OK |
+| −3 | 206.7 | 0.9123 | 0.8986 | 0.8838 | OK |
+| −2 | 219.0 | 0.9427 | 0.9319 | 0.9266 | OK |
+| −1 | 232.0 | 0.9610 | 0.9530 | 0.9273 | OK |
+| **0** | 245.8 | **0.9748** | 0.9693 | 0.9601 | vocoder floor |
+| +1 | 260.4 | 0.9690 | 0.9654 | 0.9143 | OK |
+| +2 | 275.9 | 0.9586 | 0.9528 | 0.9048 | OK |
+| +3 | 292.3 | 0.9422 | 0.9323 | 0.9095 | OK |
+| +4 | 309.7 | 0.9208 | 0.9079 | 0.8738 | OK |
+| +5 | 328.1 | 0.8980 | 0.8777 | **0.8463** | mean/p10 pass, worst fails |
+| +6 | 347.6 | 0.8734 | 0.8513 | **0.8114** | mean/p10 pass, worst fails |
+
+- **`−4 … +6` holds at the mean, and that is where the "0.85" claim is true**: −4 → 0.8811, +6 → 0.8734,
+  and *every* shift in the range clears 0.85 on both mean and p10. So the working range from the pilot
+  survives — but only as an average statement.
+- **The tail breaks before the mean does, which is exactly what segmenting was for.** `worst ≥ 0.85`
+  only survives **−4 … +4**; at +5 one segment hits 0.8463 and at +6 two fall to 0.8425/0.8114. Pick the
+  bound by which statistic matters: `−4…+6` if the material gets pooled and averaged (the `ext` stage
+  does), `−4…+4` if any single segment can carry a phrase on its own.
+- **Degradation tracks shift *magnitude*, not absolute pitch — this overturns the natural reading of the
+  pilot.** Bucketing all shifted segments by **output** F0 and correlating within each bucket, so
+  absolute pitch is held fixed:
+
+  | out F0 | ≈180 | ≈200 | ≈220 | ≈240 | ≈260 | ≈280 | ≈300 | ≈320 | ≈340 | ≈360 |
+  |---|---|---|---|---|---|---|---|---|---|---|
+  | corr(\|shift\|, SIM) | −0.92 | −0.95 | −0.84 | −0.88 | −0.99 | −0.97 | −0.95 | −0.94 | −0.89 | −0.76 |
+
+  Every bucket is strongly negative: reaching 280Hz via +2 beats reaching it via +6. Overall
+  `corr(|shift|, vs_base)` is −0.93 up / −0.90 down, while `corr(output F0, vs_base)` is −0.65 up but
+  **+0.76 down** — the sign flip proves absolute F0 is only a proxy. Practical consequence: **pick the
+  source segment nearest the target pitch**, which is what `w_ext.py`'s "smallest shift wins" selector
+  already does, and this is the measurement that justifies it.
+- **Per-semitone cost is not constant — it accelerates.** Isolated with `vs_base`: 0.0140/st at +1 rising
+  to 0.0195/st at +6 (cumulative loss 0.0131 → 0.1172). The pilot's flat "0.024 up / 0.030 down" was
+  inflated by the missing vocoder baseline.
+- **The up/down asymmetry is real but grows with magnitude and is negligible when small.** Paired by
+  segment, `vs_base`:
+
+  | magnitude | ±1 | ±2 | ±3 | ±4 |
+  |---|---|---|---|---|
+  | up loss | 0.0131 | 0.0275 | 0.0474 | 0.0694 |
+  | down loss | 0.0131 | 0.0297 | 0.0549 | 0.0880 |
+  | down/up | **1.01×** | 1.08× | 1.16× | **1.27×** |
+  | segments where up is worse | 9/18 | 5/18 | 3/18 | **1/18** |
+
+  At ±1 it is a coin flip (9/18, ratio 1.01) — below ±2 the direction does not matter. By ±4 downshift
+  loses in 17/18 segments. Confirms the pilot's direction, corrects its magnitude, and reinforces
+  "raise the song rather than lower the reference" (`--pitch-shift auto`) only for the *large* shifts.
+- **Which segments fail is not predictable from any obvious feature.** For `+6`, correlation of segment
+  SIM against its vocoder floor is only +0.15 (`vs_base`) / +0.34 (`vs_real`), against source F0
+  +0.21…+0.40, against duration −0.31. The two casualties (`seg017` 258.9Hz, `seg009` 248.0Hz) have
+  perfectly normal floors (0.9601, 0.9737) and mid-range pitch. So there is no cheap pre-filter —
+  a segment's transposition headroom has to be measured, not inferred.
+- **Segments under ~5s score unreliably**: the two short ones (3.05s, 3.88s) sit at a 0.9501 vocoder
+  floor vs 0.9748 for the 18 long ones, i.e. ERes2NetV2 is noisier on short input and depresses them at
+  *every* shift. They are excluded from the table above; keep scoring windows ≥5s.
+- Cost: 4m24s for all 11 shifts of 163s, CPU-only. `batch_transpose.py` hoists the mel and the RMVPE
+  pass out of the shift loop (only `f0 *= 2**(n/12)` changes per shift, `pitch_transpose.py:180-186`),
+  so an 11-shift sweep costs barely more than one — the upstream script recomputes both every time.
+
+```bash
+# 1. sweep + silence segmentation (CPU, ~4.5min for 11 shifts)
+tools/pcnsf/.venv/bin/python tools/pcnsf/batch_transpose.py \
+    data/songs/song_2/refsep2/lead.wav --shifts -4 -3 -2 -1 0 1 2 3 4 5 6 \
+    --config tools/pcnsf_hifigan/pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/config.json \
+    --ckpt   tools/pcnsf_hifigan/pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/model.ckpt \
+    --rmvpe  SoulX-Singer/pretrained_models/SoulX-Singer-Preprocess/rmvpe/rmvpe.pt \
+    --out tools/pcnsf/out/sweep_lead
+# 2. per-segment F0 labels (86.13Hz grid = hop 512/44.1k, NOT eval_sim's 50Hz)
+tools/pcnsf/.venv/bin/python tools/pcnsf/dump_f0.py data/songs/song_2/refsep2/lead.wav \
+    --config .../config.json --rmvpe .../rmvpe.pt --out tools/pcnsf/out/sweep_lead/lead_f0.npy
+# 3. three-way paired scoring (GPU, needs the SV model)
+GPT-SoVITS/.venv/bin/python tools/pcnsf/score_segments.py \
+    --sweep-dir tools/pcnsf/out/sweep_lead --real-dir data/songs/song_2/refsep2 \
+    --shifts -4 -3 -2 -1 0 1 2 3 4 5 6 --f0 tools/pcnsf/out/sweep_lead/lead_f0.npy \
+    --out tools/pcnsf/out/sweep_lead/scores.txt --csv tools/pcnsf/out/sweep_lead/scores_full.csv
+```
+
+#### WORLD baseline
+
+Same material, `--method world` (pyworld, in pcnsf venv): +5st 353Hz/0.8289, +7st 394Hz/0.7655. PC-NSF beats WORLD by +0.050/+0.065 at the same pitch — the gap grows with shift size. Ranking so far: PC-NSF (0.879) > WORLD (0.829) > rubberband (0.773).
+
+#### Four-dimension acoustic analysis (parselmouth/Praat, tools/voxcpm2/acoustic4.py)
+
+Why does TTS sound like game voice? Measured on ref_cut (real), NSF +5st, WORLD +5st, and vd_high (TTS):
+
+| dimension | real 263Hz | NSF+5st | WORLD+5st | TTS 358Hz |
+|---|---|---|---|---|
+| F1 / F2 (formants) | 396/1830 | 430/1809 | 428/1835 | **921/2081** |
+| HNR (harm-noise ratio) | 23.23 | 26.08 | 25.20 | **15.72** |
+| jitter % | 1.276 | 0.966 | 0.961 | 1.101 |
+| shimmer % | 4.830 | 3.876 | 3.894 | 5.627 |
+| intensity std (dB) | 14.86 | 15.33 | 14.51 | **10.70** |
+
+- **TTS's F1=921Hz vs real 396Hz (+525Hz) is the smoking gun.** A female F1 of 921Hz is physically wrong (male /i/ territory) — the designed voice's vocal tract doesn't match its pitch. NSF shifts F1 by only +34Hz at +5st.
+- **TTS is also noisier (HNR −7.5dB) and flatter in envelope (intensity std −4dB)** — the "game voice" is breathier and lacks dynamic range.
+- **Jitter/shimmer are NOT the problem** — all three within normal range (jitter <2%, shimmer <6%). Do not chase perturbation metrics.
+- PC-NSF preserves all four dimensions; its only artifact is F1 drift (+34Hz @ +5st, +76Hz @ +7st) — the same physical limit WORLD has.
+
+#### Survey: what else exists for timbre-preserving pitch shift (2026-08)
+
+- **SiFi-GAN** (ICASSP'23, open weights, 24kHz): source-filter HiFi-GAN, MOS beats WORLD at ±6st but LOSES to hn-uSFGAN at F0×2.0; 24kHz is a downgrade vs PC-NSF's 44.1k. Not worth it here.
+- **NSF-Pupu-Vocoder** (2025-12): claims to beat PC-NSF at ±12st via bottleneck pitch injection; **no public weights yet** — watch list.
+- **HiFi-Glot** (2026-02, open code+ckpt): differentiable all-pole filters, explicit F1-F4 control — the only approach that could fix the downshift asymmetry (move formants with F0). But it's a formant synthesis system, not a drop-in transposer; ~2 weeks to wire in. Only worth it if low-register songs become a frequent target.
+- **DDSP/SawSing, FIRNet, CLPCNet**: singing-data vocoders (UV mask) / F0-robust but lower accuracy / <150c prosody-only. None beat PC-NSF for the ±5-6st, 44.1kHz, speech-to-singing material use case.
+- **Conclusion: PC-NSF stays the default ext engine.** It wins on formant preservation (+34Hz F1 vs TTS's +525Hz), HNR (26 vs 15.7), envelope (15.3 vs 10.7), and outranks WORLD. The real lever now is *material coverage*, not the transposer: `+4/+5/+6` covers 330-372Hz, and the existing `select`/`ext` stages can pool it.
+
 ### Separation notes
 
 - `tools/uvr5/uvr5_weights/` ships `.ckpt` files but **BS-RoFormer's `.yaml` config was missing**; fetched from `ZFTurbo/Music-Source-Separation-Training`. The karaoke model + config came from `Soul-AILab/SoulX-Singer-Preprocess`.
-- **`batch_size` in those yaml files is a real performance trap.** The karaoke model ships `batch_size: 8` with `chunk_size: 485100` (11s/chunk) = 88s of audio resident. On 6GB that overflows into host-memory swapping: VRAM pegged, GPU utilization low, 15+ min per track. Setting `batch_size: 1` gave 2.2GB VRAM, 92-100% utilization, **27 seconds** — ~33× faster. Read from config at `bsroformer.py:117`. **On the current 16GB card `batch_size: 4` is safe** (≈8.8GB with the karaoke chunk size); the yamls in the repo still carry `batch_size: 1` from the 6GB era — bump them if a track feels slow.
+- **`batch_size` in those yaml files is a real performance trap.** The karaoke model ships `batch_size: 8` with `chunk_size: 485100` (11s/chunk) = 88s of audio resident. On 6GB that overflows into host-memory swapping: VRAM pegged, GPU utilization low, 15+ min per track. Setting `batch_size: 1` gave 2.2GB VRAM, 92-100% utilization, **27 seconds** — ~33× faster. Read from config at `bsroformer.py:117`. **But raising it above 1 buys nothing on a 16GB card — see the next entry; the "bump it to 4" advice this line used to carry was never throughput-tested and is withdrawn.**
+- **`batch_size` is not a speed knob for any of the three separation models — swept and rejected (2026-08).** The 6GB-era note above only ever established that *too large* is catastrophic (paging); the natural inverse ("so on 16GB go bigger") turned out to be false. Swept on a 257s track with the page cache pre-warmed, 2 runs per point:
+
+  | model | bs=1 | bs=2 | bs=4 | bs=8 | bs=16 |
+  |---|---|---|---|---|---|
+  | **karaoke** time | 17.3s | 17.3s | 16.7s | 17.0s | — |
+  | VRAM MiB | 2467 | 3707 | 6177 | 11121 | — |
+  | **sep1 bs_roformer** time | 26.1s | 25.4s | 28.5s | 25.3s | 26.1s |
+  | VRAM MiB | 1671 | 2625 | 4539 | 8369 | **16025** |
+  | **stems4** time | 31.5s | 31.5s | 31.9s | — | — |
+  | VRAM MiB | 1663 | 2797 | 4907 | — | — |
+
+  **Time is flat while VRAM grows 5-10×**; sep1 at bs=16 reaches 16025/16376 MiB — 350MB from OOM — for zero gain. Cause: `nvidia-smi` sampling shows **GPU utilization is already 100% (median, 21/26 samples ≥90%) at `batch_size: 1`**. One chunk is 801-1101 STFT frames, so attention alone (`L²` = 0.64-1.21M) saturates the SMs; batching just lengthens the queue on an already-full GPU. Corollary for the whole file: **"we have spare VRAM" is not a reason to expect speed** — check utilization first, and only batch when the GPU is idling.
+
+  Two facts to know before touching these yamls anyway. (1) **Changing `batch_size` changes the output**: karaoke bs=1 vs bs=4 gave different `lead.wav` md5 at SNR 72dB (`max|diff|` 1.5e-3) because fp16 accumulation order shifts. It stays bit-exact at a *fixed* batch_size (verified by re-running), so reproducibility is intact — but the sep cache keys on input md5 + **ckpt** md5 and *not* the yaml, so any yaml edit requires a manual `rm -rf data/.sep_cache`. (2) Current committed values are **karaoke 1, sep1 4, stems4 2** — an earlier version of this file claimed all three were still at the 6GB-era `1`, which was wrong.
 - `tools/uvr5_cli.py` only writes the vocal stem, but the underlying `_path_audio_(input, others_root, vocal_root, ...)` writes both. Call it directly to keep the instrumental.
 - Karaoke separation measurably isolates backing vocals (37/128 windows contaminated, up to backing/lead 0.66) but **only marginally improved output stability** — residual bleed remains. For harmony-heavy songs, YingMusic-SVC is the model actually trained for this (its benchmark is graded by contamination level).
 
@@ -299,6 +816,103 @@ the 2026-08 ext rewrite gained +0.010 mean SIM but drift went 0.0660 → 0.0723 
 28 short transposed segments are less internally consistent than 20 longer ones. Raise `--anchor-min-ratio`
 if that trade is wrong for a given song.
 
+**Anything that touches the content features needs `singing/eval_cer.py` too — the three SIM tools are
+blind to articulation.** `eval_sim`/`eval_stab`/`eval_triad` all score speaker identity, so a change that
+edits `content_feat` (kNN replacement is the case in point) can post gains on every one of them while
+making the lyrics unintelligible. That happened: α=0.4 kNN looked like an 11/11 cross-song win and was
+in fact costing +5.9 CER points. `eval_cer.py` ASRs the output and scores it against the **original
+lead's own ASR transcript**, so the number means "characters lost by the conversion", not absolute
+recognisability. It reuses the already-cached `paraformer-large` + `fsmn-vad` (zero download; do not pass
+`model="paraformer-zh"`, that alias points at SeaCo-Paraformer and pulls another 990MB).
+
+```bash
+GPT-SoVITS/.venv/bin/python singing/eval_cer.py \
+    --src data/songs/<name>_base/sep2/lead.wav \
+    --gen data/songs/<name>_base/vocal.wav data/songs/<name>_knn/vocal.wav --labels base knn
+```
+
+**Two measurement traps found while building it, both of which produced wrong numbers first:**
+- **FunASR's VAD is non-deterministic.** Re-ASR'ing one unchanged file three times gave 345/281/345
+  characters, and the same arm scored CER 0.3059 then 0.1912. `eval_cer.py` now pins
+  `torch`/`numpy`/`random` seeds plus `cudnn.deterministic`; four consecutive runs are then identical.
+  **A CER measured without that seeding is noise.**
+- **`eval_sim`'s RMS gate (`eval_sim.py:87`, `rms < 0.01`) is applied per arm independently, so two arms
+  can be scored on different window sets.** On 冬眠 base reported 60 windows and knn 61 despite
+  byte-identical inputs and equal-length outputs; the extra window was a low-scoring one present in only
+  one arm, which shifted the gain from +0.0073 to +0.0042. Use `singing/paired_eval.py` for any A/B — it
+  scores only windows that pass the gate in **both** arms and adds a sign test:
+
+```bash
+GPT-SoVITS/.venv/bin/python singing/paired_eval.py \
+    --ref data/songs/<name>_base/refsep2/lead.wav \
+    --f0 data/songs/<name>_base/target_f0.npy --ref-f0 data/songs/<name>_base/prompt_f0.npy \
+    --a <base>/vocal.wav --b <variant>/vocal.wav --labels base knn
+```
+
+### Triad benchmark (2026-08): `singing/eval_triad.py`
+
+`eval_sim`/`eval_stab` only measure **A = out vs ref**. That leaves two blind spots, and adding them changed
+how the historical A numbers should be read. Same protocol as `eval_sim` (3s non-overlapping windows, RMS
+gate 0.01, window vs whole-file embedding), so A here is directly comparable to every SIM in this file.
+
+| | pair | what it is |
+|---|---|---|
+| **A** | out vs ref | 已有指标，获得的参考音色 |
+| **B** | ref vs target | **不是成绩，是任务难度基线** —— 也是 cos 的"不同说话人地板"实测值 |
+| **C** | out vs target | 原唱音色残留，**但裸值不可直接解读**，见下 |
+
+```bash
+GPT-SoVITS/.venv/bin/python singing/eval_triad.py --song-dir data/songs/song_2 \
+    --impostor data/songs/song_{1,4,8,9}/sep2/lead.wav      # --impostor 不是可选项，见下
+```
+
+Measured on all 9 songs with output (single ref speaker, `refsep2/lead.wav` is byte-identical across songs —
+verified by md5, so B varies only through the target):
+
+| song | B | A | C | excess | progress |
+|---|---|---|---|---|---|
+| song_0 | 0.3986 | 0.5672 | 0.6564 | **+0.1241** | 0.280 |
+| song_1 | 0.3607 | 0.5431 | 0.5576 | −0.0024 | 0.285 |
+| song_2 | 0.4295 | 0.6013 | 0.6470 | +0.0906 | 0.301 |
+| song_3 | 0.3058 | 0.5333 | 0.4499 | −0.0724 | 0.328 |
+| song_4 | 0.4069 | 0.6177 | 0.5592 | +0.0217 | **0.355** |
+| song_5 | 0.4015 | 0.5610 | 0.6159 | +0.0731 | 0.267 |
+| song_6 | 0.4046 | 0.5355 | 0.6604 | **+0.1414** | **0.220** |
+| song_8 | 0.3640 | 0.5214 | 0.5942 | +0.0615 | 0.247 |
+| song_9 | 0.2934 | 0.4544 | 0.5129 | −0.0401 | 0.228 |
+| mean | 0.3739 | 0.5483 | 0.5837 | +0.0442 | 0.279 |
+
+- **`C > A` on 7/9 songs, and it does NOT mean the conversion failed.** That was the first read and it is
+  wrong. Control: score every output against *other* songs' targets. Different singers' separated vocals
+  score **0.7765** with each other (t2↔t6 0.8865, t2↔t5 0.8869) while ref↔target averages 0.4586 — i.e.
+  "separated singing" is itself a huge domain cluster in ERes2NetV2 space, far larger than the speaker
+  difference being measured. C is dominated by domain, not identity. **Always pass `--impostor` and read
+  `excess = C − C_impostor`**; on the impostor-normalised number only **6/9** songs show real leakage, and
+  song_3/song_9/song_1 show none (−0.07…0.00) despite raw C looking high. A/C are not on comparable scales
+  and `A − C` is not interpretable.
+- **B explains most of the cross-song spread in A, so raw A was never comparable across songs.**
+  `corr(B, A) = +0.810`. song_9's famously bad 0.4544 comes with the lowest B in the set (0.2934): its
+  singer is simply the furthest from the reference speaker, and its `progress` (0.228) is ordinary, not an
+  outlier. Normalising as `progress = (A−B)/(1−B)` reorders the songs — song_3 goes from 8th on A to 3rd on
+  progress. It does not shrink the variance (std 0.0449 → 0.0422), so it is a **re-attribution**, not a
+  noise reduction: part of what looked like output quality was task difficulty all along.
+- **The worst song is song_6, and only the triad shows why.** It has a mid-range B (0.4046, 4th highest) yet
+  the lowest progress (0.220) *and* the highest leakage (excess +0.1414) — the one song where leakage
+  exceeds the normalised gain (net −0.018). Its pitch buckets show margin degrading monotonically to
+  −0.1872 at 8+ semitones. That is a specific, actionable diagnosis; A alone (0.5355, unremarkable) hid it.
+- **`corr(A, excess) = +0.396`** — mildly *positive*. Higher-A outputs tend to carry *more* original-singer
+  residue, not less, which fits the `--cfg` mechanism already documented above (the condition is
+  `content_feat + f0_feat`, carrying whisper's speaker residual). Both A and C rise together when the model
+  leans harder on the content condition. So a pure-A optimisation can be partly buying score with leakage;
+  `excess` is what tells them apart.
+- **Ceilings for calibration** (same protocol, window vs own global embedding): ref 0.8689, song_2 target
+  0.8005, song_6 target 0.7733. A ≈ 0.60 against a 0.87 self-consistency ceiling on a task whose floor
+  (B) is 0.43 — the usable dynamic range is much narrower than "0 to 1" suggests, another reason ±0.004
+  seed noise matters as much as it does.
+- Reuses the same `pretrained_eres2netv2w24s4ep4.ckpt` as `eval_sim`/`eval_stab`. Fine for A and B, but note
+  the caveat recorded under GPT-SoVITS: anything that injects timbre via v2Pro's `sv_emb` shares this exact
+  network, so those scores would be self-reinforcing.
+
 ## `sing.py` — one-command zero-shot singing CLI
 
 Automates the whole pipeline above; run from the workspace root with **system python3** (stdlib only, no venv needed):
@@ -316,9 +930,12 @@ lead，产出 `data/songs/<name>/refsep2/lead.wav`；select/eval 自动优先用
 `f0-target` (RMVPE 50Hz) → `select`
 (参考切片打分贪心选段 → `prompt.wav`+`prompt_f0.npy`+`prompt_stats.json`) → `ext` (原始 prompt 作
 音色锚点 + 按频段缺口追加移调段，PC-NSF-HiFiGAN 默认 `--ext-method nsf`，seed-vc 可选；
-`--anchor-min-ratio 0.55` 控制干净音频最低占比，拼出 ≤29s 的 `prompt_ext`) → `svc`
+`--anchor-min-ratio 0.55` 是干净锚点的占比**上限**（cap）；`--ext-div-weight 3.0` 默认开启的源段
+复用惩罚，防止素材被锁在 med 最高的少数段上，拼出 ≤29s 的 `prompt_ext`) → `svc`
 (SoulX, `--pitch-shift 0` 默认保留旋律；`12` 全曲高八度适配男→女；`auto` 按段自动对齐（男女对唱/跨音区）；
-`--max-seg-sec 28` 适配 16GB；`--cfg 0.5` 默认，上游 3.0 会放大原唱音色残留) →
+`--max-seg-sec 28` 适配 16GB；`--cfg 0.5` 默认，上游 3.0 会放大原唱音色残留；
+`--knn-alpha 0.2` 默认开启，检索池用完整参考人声（`--knn-full-pool`，绕开 whisper 30s）；
+0.1-0.2 是 CER 与 SIM 双赢区，0.4 会让 CER 涨 5.9 点，详见「kNN 的吐字代价」一节) →
 `eval` (eval_sim.py 对照真实语音) → `mix` (opt-in, `--mix`)。
 Worker 脚本在 `singing/w_*.py`，每个阶段用对应项目的 venv 跑。
 
@@ -346,28 +963,202 @@ Worker 脚本在 `singing/w_*.py`，每个阶段用对应项目的 venv 跑。
   - `soulxsinger/models/soulxsinger_svc.py`：`infer(max_seg_sec=...)`（显存分段）+
     `build_vocal_segments` 活性优先合并（跳过尾奏/间奏无人声）+ `append_segment` 回溯跨短静音格
     （修 `num_overlaps` 失效）+ `num_overlaps` 透传 + `_nearest_octave_shift` /
-    `pitch_shift="auto"` 按段八度对齐 + `infer/infer_segment` 的 `seed=`
+    `pitch_shift="auto"` 按段八度对齐 + `infer/infer_segment` 的 `seed=` +
+    `_knn_replace_content` / `knn_alpha`+`knn_k` 透传（内容特征 kNN 替换，见上文 kNN 一节；
+    `valid_pt_frames` 必须传 whisper 实际产出帧数，否则右侧 zero-padding 会进匹配池）+
+    `encode_long()` 分块编码（绕开 whisper 30s，给 kNN 检索池用）+ `infer(knn_pool_wav=)`
+    在段循环外一次性编码检索池并经 `infer_segment(knn_pool=)` 透传
   - `soulxsinger/models/modules/flow_matching.py`：`reverse_diffusion(seed=)` —— 用
     `torch.Generator` 取初始噪声，上游走全局 RNG 不可复现
   - `soulxsinger/models/modules/decoder.py`：`CFMDecoder.reverse_diffusion(seed=)` 透传
     （这层最容易漏，漏了会 `TypeError: unexpected keyword argument 'seed'`）
-  - `cli/inference_svc.py`：`--max_seg_sec` / `--num_overlaps` / `--seed`，以及
+  - `cli/inference_svc.py`：`--max_seg_sec` / `--num_overlaps` / `--seed` /
+    `--knn_alpha` / `--knn_k` / `--knn_pool_wav`（只在 `knn_alpha>0` 时才 load_wav），以及
     `--pitch_shift` 的 `_pitch_shift_arg`（接受整数或 `"auto"`，上游是 `type=int`）
-  - `tools/uvr5/uvr5_weights/*.yaml`（在 GPT-SoVITS 里）的 `batch_size: 1`（6GB 时代调的；
-    16GB 卡可提到 4，见 Separation notes）
+  - `tools/uvr5/uvr5_weights/*.yaml`（在 GPT-SoVITS 里）的 `inference.batch_size`
+    （现值 karaoke 1 / sep1 4 / stems4 2）。**不要动** —— 已实测调大零收益，见 Separation notes
 
   拉新版后要重打。
 - **本地补丁都在自己的 fork 里，可 diff 可回溯**（2026-08）：
   - `SoulX-Singer` → `CJYLZS/SoulX-Singer` 分支 `voice-patches`（基于上游 `81aeb3a`）
   - `tools/pcnsf` → `CJYLZS/pitch-transposition-using-DiffSinger` 分支 `voice-patches`
-    （基于上游 `0e40e97`，rmvpe 裸 state_dict 补丁）
+    （基于上游 `0e40e97`，rmvpe 裸 state_dict 补丁 + `save_wav` 就地修改 bug 修复，见下，
+    以及新增 `scripts/multi_transpose.py` 多 job 入口，见「ext 阶段 2.2× 提速」）
   - 本地 remote 名为 `fork`。升级上游后重打：`git fetch fork && git rebase origin/<branch> voice-patches`
     （或 `git cherry-pick`），冲突按 AGENTS.md 的语义修。
   - GPT-SoVITS 的 uvr5 yaml 改动在 `.gitignore` 里 fork 也带不走，仍靠本文件记录。
+  - **`tools/pcnsf/utils/infer_utils.py` 的 `save_wav` 有就地修改 bug（已修，2026-08）：** 原代码 `wav *= 32767` 在传入视图（`y_full[start:end]`）时会把 `y_full` 对应区域就地放大，导致后续写入 `full.wav` 的样本被二次放大进而 int16 溢出成垃圾。修法：改为 `wav = wav * 32767`（不就地修改）。受影响的只有 `batch_transpose.py` 写出的 `shift_*/full.wav`；各 `seg***.wav` 各自调用一次未被污染，FIDELITY 表数字不受影响。
 - **参考素材决定上限**：`select` 只在现有素材里选段。素材太短（如 7s 可用）时 prompt 短、
   SIM 偏低，自动建议的变调数也偏高；要多补高音区，录更长的素材而不是靠变调。
+  2026-08 补充：PC-NSF 移调可把素材池扩到 221-394Hz（SIM≥0.83），见
+  「Reference material pitch extension」一节——`select`/`ext` 的素材池可以直接吃移调产物。
 - `--max-prompt` 默认 25s，扩展后 ≤29s（whisper 30s 硬顶）。pt_f0 参与 SVC 的 f0 conditioning，
   不能只拼音频不拼 f0（`w_ext.py` 对扩展段重新提 RMVPE）。
+
+---
+
+# EchoMimicV3 — 单图 + 音频 → 说话/唱歌视频（`echomimic3/`）
+
+蚂蚁集团 AAAI'26，Apache-2.0，1.3B 参数。输入一张人像 + 一段音频，输出口型同步、带自然
+头部/身体动作的视频。**说话和唱歌都支持**（官方 gallery 有 Singing 分类，训练集含唱歌数据），
+所以既能吃 `GPT-SoVITS` 的 TTS 输出，也能吃 `sing.py` 的 SVC 干声。
+
+选它而不选 LongCat-Video-Avatar-1.5 / Wan2.2-S2V-14B 的理由：那两个是 14B 级、要 FP8 量化
++ block-swap 才勉强进 16GB，而 EchoMimicV3-flash-pro 官方标称 **12GB VRAM、768×768、8 步**，
+在这张卡上有余量，迭代快，适合先把「素材 → 视频」这条链路的问题（人脸角度、音频格式）暴露完。
+
+## 两条推理路径，只用 flash-pro
+
+| | preview | **flash-pro** |
+|---|---|---|
+| 步数 | 15-25 | **8** |
+| face mask | **需要** | 不需要 |
+| 音频编码器 | `wav2vec2-base-960h` | `chinese-wav2vec2-base` |
+| 权重 | `transformer/` | `echomimicv3-flash-pro/` |
+| 入口 | `infer_preview.py` / `app_mm.py` | `infer_flash.py` / `run_flash.sh` |
+
+flash-pro 不需要 mask，因此 **`tensorflow==2.15.0` + `retina-face` 这两个依赖可以整套跳过**
+（只有 `src/face_detect.py` 用，preview 路径才需要），省约 3GB。`mmgp` 也跳过（只有
+`app_mm.py` 这个量化 Gradio UI 用）。反过来，上游 `requirements.txt` **漏了 `pyloudnorm`**
+（`infer_flash.py:36` 直接 import），不补会在启动时报错。这套增删记在
+`echomimic3/requirements_slim.txt` 里，装它而不是上游的 `requirements.txt`。
+
+## 权重 23GB，`flash/` 目录结构
+
+`download_models.py` 会摆成 `run_flash.sh` 期望的样子（该脚本用的是 `flash/` 这个名字）：
+
+```
+flash/
+├── Wan2.1-Fun-V1.1-1.3B-InP/   base，含 4 个大文件
+│   ├── models_t5_umt5-xxl-enc-bf16.pth                       11.36 GB  ← 内存杀手
+│   ├── models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth 4.77 GB
+│   ├── diffusion_pytorch_model.safetensors                    3.13 GB
+│   └── Wan2.1_VAE.pth                                         0.51 GB
+├── chinese-wav2vec2-base/       0.38 GB（只要 pytorch_model.bin + config）
+└── transformer/                 3.73 GB（flash-pro DiT）
+```
+
+- **CLIP 那 4.77GB 不能省**，虽然 flash-pro 不需要 face mask。`infer_flash.py:270` 无条件
+  加载它并在 `:294` 传进 pipeline。我一度以为它只服务 preview 路径，是错的。
+- **`chinese-wav2vec2-base-fairseq-ckpt.pt`（~1.2GB）要跳过**：`infer_flash.py:210` 走
+  `Wav2Vec2Model.from_pretrained()`，只读 `pytorch_model.bin` + `config.json`，fairseq
+  原始 ckpt 是纯浪费。`download_models.py` 已按文件白名单下载，不用 `snapshot_download`。
+- 下载务必用 `download_models.py`（固定 `.part` 名 + `curl -C -` + sha256 校验），
+  **不要用 `snapshot_download`** —— 原因见开头「Downloading large weights」一节，
+  这次为此白下了 ~10GB。
+
+## 本地补丁（升级上游会被覆盖，拉新版后重打）
+
+- `infer_flash.py`：**让 `--GPU_memory_mode` 真正生效**。上游在 `:91` 定义、`:193` 读取这个
+  参数，然后无条件 `pipeline.to(device)`，**两种 offload 模式从来没被调用过**（默认值
+  `sequential_cpu_offload` 也是死的）。改成按模式分别调
+  `enable_sequential_cpu_offload()` / `enable_model_cpu_offload()`；并且删掉紧跟其后的
+  **第二次** `pipeline.to(device)`（原 `:332`）—— 那一句会把已 offload 的模块重新拉回 GPU，
+  把刚装好的 hook 全部作废。
+- `src/wan_text_encoder.py` + `src/wan_transformer3d_audio_2512.py`：
+  `load_model_dict_into_meta` 的 import 加 fallback。上游只从
+  `diffusers.models.modeling_utils` 导入，但 diffusers **0.39 已把它移到
+  `diffusers.models.model_loading_utils`**，导致 ImportError → 整个 meta-device 分支被跳过
+  → 静默退回 `low_cpu_mem_usage=False` → 峰值内存翻倍。日志里那句
+  `The low_cpu_mem_usage mode is not work because cannot import name
+  'load_model_dict_into_meta'` 就是它，**不是无害警告**（我第一次读代码时误判成无害，因为
+  `:1506` 的默认值本来就是 `False`，且 `:1558` 有注释提到 0.33 重构；但 T5 那条路径
+  `:264` 显式传了 `low_cpu_mem_usage=True`，所以确实被这个 ImportError 打掉了）。
+  补丁生效的判据：该警告从日志里消失。
+- `infer_flash.py:234`：**`load_state_dict(..., assign=True)`，本轮最危险的一个 bug**。
+  开启 `low_cpu_mem_usage=True`（`:220`）后 base checkpoint 走 meta 设备加载，而 base 里
+  **没有** flash-pro 那 220 个音频注入参数（`audio_injection.*` +
+  `blocks.*.cross_attn.*_audio.*`），它们因此留在 meta 上。紧接着上游用不带 `assign=` 的
+  `load_state_dict` 加载 flash 权重，而该调用是**就地拷贝**语义 —— 对 meta 张量是
+  PyTorch 明确定义的 **no-op**。实测：
+
+  | | 剩余 meta 参数 | load_state_dict 报告 |
+  |---|---|---|
+  | 上游（无 assign） | **220** | `missing=0, unexpected=0` |
+  | `assign=True` | **0** | `missing=0, unexpected=0` |
+
+  两者的返回值完全一样，**失败没有任何信号**。之所以能发现，是因为 offload hook 随后调
+  `.to()` 撞上 `NotImplementedError: Cannot copy out of meta tensor`；如果当时图省事改用
+  别的 offload 模式绕过报错，模型会带着一整套空的音频层跑完，**产出一个完全没有口型的
+  视频且不报任何错**。补丁里加了断言（剩余 meta 参数 >0 直接 raise），复发时不再静默。
+  修复后抽查 `audio_injection.proj1.weight`：`is_meta=False, absmean=0.002871`。
+- **`sequential_cpu_offload` 在本仓库不可用，别去试。** 它是 `--GPU_memory_mode` 的上游默认值，
+  文档上也确实最省显存，但 diffusers 的 submodule 级 offload 需要先把 `modulation` 类参数
+  固定到 GPU 并搬 `transformer.freqs`——同源项目 FlashPortrait 的 `infer.py` 里就是这么做的
+  （`replace_parameters_by_name(transformer, ["modulation",], device=device)` +
+  `transformer.freqs = transformer.freqs.to(device)`），而 **echomimic_v3 的 `src/` 下这两个
+  辅助函数根本不存在**（已 grep 确认）。用 **`model_cpu_offload`**：整模型级卸载
+  （transformer 用完换 VAE），1.3B 规模下粒度已经足够，实测显存峰值 **13983 MiB / 16376 MiB**。
+
+## 内存：真正的瓶颈不是显存
+
+在 15.9GB 的 WSL 默认配额下，`infer_flash.py` **必然被 OOM 杀掉**（exit 137），
+日志停在 VAE 加载完、T5 即将加载处，`nvidia-smi` 全程健康、显存峰值只有 599MiB。
+上面两个补丁都是必要的但都不够——`load_file()`/`torch.load()` 仍要把 11.36GB 整个读进内存。
+
+实测数字（本机）：
+
+| 加载方式 | T5 峰值 RSS |
+|---|---|
+| `torch.load(map_location="cpu")`（上游） | ~23 GB（≈2× 文件） |
+| `torch.load(..., mmap=True, weights_only=True)` | **0.38 GB** |
+
+**已修（2026-08）：`src/utils.py` 新增 `load_torch_ckpt_mmap()`，替换 4 个文件共 6 处
+`torch.load(..., map_location="cpu")`**（`wan_text_encoder.py` ×2、`wan_vae.py`、
+`wan_image_encoder.py`、`wan_transformer3d_audio_2512.py` ×2；`wan_transformer3d_audio.py`
+是 preview 路径，未改）。T5/CLIP/VAE 三个文件都实测支持 `mmap=True` + `weights_only=True`
+（242/784/194 keys 干净加载），helper 里对需要真正 unpickle 的 checkpoint 保留了退回分支。
+
+**mmap 改善的是内存增长曲线，不是峰值 —— 别指望它省内存。** 同一条 `smoke` 命令，
+`/usr/bin/time -v` 实测：
+
+| | 补丁前 | 补丁后 |
+|---|---|---|
+| **峰值 RSS** | ~23 GB | **21.9 GB**（几乎没降） |
+| GPU 开始工作 | 256s | **<90s** |
+| 90s 时 VRAM | 92 MiB（仍在换页） | **13983 MiB**（满负荷） |
+| Major page faults（真实盘 I/O） | 38592 | **94825**（涨 2.5×） |
+| 产物 | 97597 bytes | 97597 bytes（字节一致，无损） |
+
+那个到处流传的「0.38GB」只在**只加载、不使用**时成立：`torch.load(mmap=True)` 返回时张量
+还在磁盘上。推理必须 `.to(device)`，这一步把 mmap 页全部 page-in，峰值几乎回到原点。
+（我一度把该数字当成推理峰值写进本文件，与同一批监控里 90s 时 RSS 13.8GB 直接矛盾 ——
+凡是引用「加载峰值」的结论，都要用 `/usr/bin/time -v` 的 Maximum RSS 复核。）
+
+机制上的收益是真实的：eager 加载要先把 11.36GB 整个读进缓冲、再复制成张量（瞬时 2× 尖峰），
+mmap 则按页逐步载入，没有那个尖峰，所以 GPU 能早约 3 倍开始工作；代价是 major page faults
+涨 2.5 倍（读盘从「一次大批量」变成「多次按需」）。
+
+**所以 `memory=24GB` 必须保留**：21.9GB 峰值在 16GB 配额下必然 OOM。
+
+## 跑通实测（2026-08，4070 Ti SUPER 16GB + WSL 24GB RAM）
+
+首个成功产物：`smoke` 预设（`LEN=25`，`--sample_size 512 512`）→ 97.6KB / **368×672** /
+25 帧 / 1.000s / 双声道音频。用 `echomimic3/run.sh` 跑，不要手敲那串 20+ 参数的命令。
+
+- **`--sample_size` 是面积预算，不是精确尺寸。** 传 `512 512` 而输出 368×672 —— 模型按输入图
+  的宽高比（demo 图是 640×1138 竖屏）重排了。Wan 系列的既有行为，不是 bug，但意味着不能靠它
+  精确控制输出分辨率。
+- **视频时长 = `--video_length ÷ --fps`**，且代码取 `min(音频时长×fps, video_length)`
+  （`infer_flash.py:343`），所以 6.5s 的音频配 `LEN=25` 只会用到前 1 秒。帧数须为 8n+1。
+- **加载阶段 VRAM 一直是 92MiB，不代表卡住。** `model_cpu_offload` 下权重先进 RAM，只在
+  forward 时才拉进 GPU；实测 122s 时 VRAM 仍是 92MiB，256s 时才升到 7945MiB（RSS 8.0GB），
+  峰值 13983MiB。T5 无 mmap 读盘本身就慢，别把加载慢误判成 hang。
+- **不要用 `nohup ... &` 在受超时限制的会话里跑。** 会话超时会连带杀掉整个进程组，表现是
+  日志停在半路、无 traceback、显存归零 —— 极易误判成程序卡死或 OOM（本轮为此浪费了大量时间）。
+  用 `setsid`，或直接在自己的终端里跑。
+
+## 关键参数（官方 Tips + `run_flash.sh` 默认值）
+
+- `--audio_guidance_scale`：**1.8~2** 最佳。调高口型更准，调低画面更好。
+- `--guidance_scale`（文本 CFG）：3~6。调高更贴 prompt，调低画面更好。
+- `--num_inference_steps`：说话头 5 步够，半身/带手势 15~25 步。flash-pro 标称 8 步。
+- `--teacache_threshold`：0~0.1。
+- `--video_length` > 138 帧要开 Long Video CFG；`--partial_video_length` 调到 81/65 可降显存。
+- 音频侧三个社区验证过的坑（LTX/Wan 同源，值得先排除）：**必须立体声 WAV**（mono 或 mp3
+  会导致完全没有口型）、**太干净的 TTS 音频反而不同步**（加一点底噪才对上）、
+  **唱歌音频要先分离人声**（LongCat 官方 pipeline 内置 `Kim_Vocal_2.onnx` 做这步，
+  说明伴奏会干扰音频编码器）。本工作区 `sing.py` 的 SVC 干声天然满足第三条。
 
 ---
 

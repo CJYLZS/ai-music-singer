@@ -143,11 +143,17 @@ class Cfg:
     gpu: str = "0"
     stages: list[str] = None  # type: ignore[assignment]
     max_prompt: float = 25.0
+    select_min_sec: float = 0.3   # select 候选最短时长（见 AGENTS.md「最小分段长度」）
     semitone_shift: int | None = None
     ext_method: str = "nsf"
     anchor_min_ratio: float = 0.55
+    ext_max_shift: int = 5   # ext 单段最大移调半音（见 AGENTS.md「逐段扫点」）
+    ext_div_weight: float = 3.0  # ext 源段复用惩罚（等价半音数），见 AGENTS.md「ext 多样性」
     max_seg_sec: float = 28.0
     num_overlaps: int = 1   # 每段往前取几个活性格作上下文（见 AGENTS.md「num_overlaps」）
+    knn_alpha: float = 0.2   # kNN 内容特征替换强度（0.1-0.2 是 CER/SIM 双赢区，≥0.3 起吐字退化）
+    knn_k: int = 4   # kNN 近邻数（默认 4，同 kNN-VC）
+    knn_full_pool: bool = True   # kNN 检索池用完整参考人声而非 28.9s prompt_ext（绕开 whisper 30s）
     n_steps: int = 32
     cfg: float = 0.5   # 上游默认 3.0，实测偏高（见 AGENTS.md「cfg 扫点」）
     rescale_cfg: float = 0.75   # CFG 外推的 std 归一化混合比（上游默认，0=关闭归一化）
@@ -334,6 +340,7 @@ def stage_select(cfg: Cfg) -> None:
     run([VENVS["soulx"], os.path.join(WORKERS, "w_select.py"),
          "--ref", cfg.ref_clean, "--target-f0", cfg.target_f0,
          "--out-dir", cfg.out_dir, "--budget", str(cfg.max_prompt),
+         "--min-sec", str(cfg.select_min_sec),
          "--device", cfg.device], stage="select")
 
 
@@ -355,6 +362,8 @@ def stage_ext(cfg: Cfg) -> None:
          "--seedvc-dir", seedvc_out,
          "--shifter", cfg.ext_method,
          "--anchor-min-ratio", str(cfg.anchor_min_ratio),
+         "--max-shift", str(cfg.ext_max_shift),
+         "--div-weight", str(cfg.ext_div_weight),
          "--max-sec", "29", "--device", cfg.device], stage="ext")
 
 
@@ -372,7 +381,13 @@ def _svc_cmd(cfg: Cfg, svc_dir: str, seed: int | None) -> list[str]:
            "--n_steps", str(cfg.n_steps), "--cfg", str(cfg.cfg),
            "--rescale_cfg", str(cfg.rescale_cfg),
            "--max_seg_sec", str(cfg.max_seg_sec),
-           "--num_overlaps", str(cfg.num_overlaps)]
+           "--num_overlaps", str(cfg.num_overlaps),
+           "--knn_alpha", str(cfg.knn_alpha),
+           "--knn_k", str(cfg.knn_k)]
+    # kNN 检索池默认用完整参考人声（163s）而非 prompt_ext（28.9s）：检索池不进模型，
+    # 不受 whisper 30s 硬顶约束，分块编码后匹配失败帧 9.8% -> 1.9%
+    if cfg.knn_alpha > 0 and cfg.knn_full_pool and os.path.exists(cfg.ref_clean):
+        cmd += ["--knn_pool_wav", cfg.ref_clean]
     if seed is not None:
         cmd += ["--seed", str(seed)]
     return cmd + ["--fp16"]
@@ -503,17 +518,40 @@ def main() -> None:
                          f"（{'/'.join(sorted(OPT_IN_STAGES))} 默认不跑，需 --mix）")
     ap.add_argument("--max-prompt", type=float, default=25.0,
                     help="选段 prompt 时长上限(秒)，需 <30（whisper 硬顶）")
+    ap.add_argument("--select-min-sec", type=float, default=0.3,
+                    help="select 候选段最短时长(秒)，默认 0.3。降到 0.15 可捕捉极短高音，"
+                         "提到 0.8-1.2 可减少拼接点")
     ap.add_argument("--semitone-shift", type=int, default=None,
                     help="覆盖自动计算的 seed-vc 变调半音数（默认按 song/prompt 的 p90 自动）")
     ap.add_argument("--ext-method", default="nsf", choices=["seedvc", "nsf"],
                     help="音域扩展引擎: nsf（默认，PC-NSF-HiFiGAN）| seedvc")
     ap.add_argument("--anchor-min-ratio", type=float, default=0.55,
-                    help="prompt_ext 中原始干净音频的最低占比（音色锚点，默认 0.55）")
+                    help="原始干净音频在 prompt_ext 中占的份额上限 cap，默认 0.55 时锚点裁到 "
+                         "15.95s、ext 拿 45 pct。扫 0.0 到 0.9 即 ext 占比 100 pct 到 14 pct")
+    ap.add_argument("--ext-div-weight", type=float, default=3.0,
+                    help="ext 源段复用惩罚，折算为等价半音数（默认 3）。0=旧行为。"
+                         "只按移调量最小排序会把素材锁在 med 最高的少数段上（实测 143 段池"
+                         "只用到 13 个源段，复用 2.2x）；调大用更大移调换更多不同源段")
+    ap.add_argument("--ext-max-shift", type=int, default=5,
+                    help="ext 阶段单段最大移调半音数（默认 5）。素材 med 上限不足、"
+                         "高音格补不满时可提到 6")
     ap.add_argument("--max-seg-sec", type=float, default=28.0,
                     help="SVC 单段最长秒数（默认 28，16GB 卡无压力；上游默认 30，6GB 卡需降到 20）")
     ap.add_argument("--num-overlaps", type=int, default=1,
                     help="SVC 每段往前取几个活性格作前置上下文（默认 1）。"
                          "总窗仍受 --max-seg-sec 限制，段本来就接近上限时提高它无效")
+    ap.add_argument("--knn-alpha", type=float, default=0.2,
+                    help="kNN 内容特征替换强度（默认 0.2）。把 source 的 whisper 帧向参考的帧做 "
+                         "kNN 插值，用目标说话人的残留替换原唱残留（mean-shift 删除已实测变差）。"
+                         "0.1-0.2 是 CER 与 SIM 双赢区；0.3 起吐字开始退化，0.4 时 CER +5.9 点不可用。"
+                         "0=关闭")
+    ap.add_argument("--knn-k", type=int, default=4,
+                    help="kNN 近邻数（默认 4，同 kNN-VC）")
+    ap.add_argument("--knn-full-pool", action="store_true", default=True,
+                    help="kNN 检索池用完整参考人声(默认开启)，分块编码绕开 whisper 30s 截断；"
+                         "匹配失败帧 9.8%%->1.9%%. --no-knn-full-pool 回退到 prompt_ext")
+    ap.add_argument("--no-knn-full-pool", dest="knn_full_pool", action="store_false",
+                    help="禁用完整检索池，回退到 prompt_ext（30s 截断行为）")
     ap.add_argument("--n-steps", type=int, default=32, help="SVC 采样步数（默认 32）")
     ap.add_argument("--cfg", type=float, default=0.5,
                     help="SVC classifier-free guidance 强度（默认 0.5；上游默认 3.0 实测过强，"
@@ -553,9 +591,14 @@ def main() -> None:
 
     cfg = Cfg(ref=args.ref, song=args.song, name=args.name, gpu=args.gpu,
               stages=stages, max_prompt=args.max_prompt,
+              select_min_sec=args.select_min_sec,
               semitone_shift=args.semitone_shift, ext_method=args.ext_method,
               anchor_min_ratio=args.anchor_min_ratio,
+              ext_max_shift=args.ext_max_shift,
+              ext_div_weight=args.ext_div_weight,
               max_seg_sec=args.max_seg_sec, num_overlaps=args.num_overlaps,
+              knn_alpha=args.knn_alpha, knn_k=args.knn_k,
+              knn_full_pool=args.knn_full_pool,
               n_steps=args.n_steps, cfg=args.cfg, rescale_cfg=args.rescale_cfg,
               pitch_shift=args.pitch_shift,
               seed=args.seed, n_seeds=args.n_seeds, dp_lam=args.dp_lam,

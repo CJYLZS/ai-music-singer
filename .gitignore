@@ -5,6 +5,10 @@
 /seed-vc/
 /tools/pcnsf/
 /tools/yingmusic/
+/tools/voxcpm2/
+/tools/hifiglot/
+/tools/vevo2/
+/echomimic3/
 
 # ---- 模型权重 ----
 /tools/pcnsf_hifigan/
