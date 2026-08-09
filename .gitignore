@@ -25,6 +25,12 @@
 /girlish_v2Pro.zip
 *.zip
 
+# ---- 批量跑歌的临时脚本与日志、试听目录（一次性，不入库）----
+/batch_run*.sh
+/batch_run*.log
+/check_batch_progress.sh
+/listen_*/
+
 # ---- Python ----
 __pycache__/
 *.py[cod]

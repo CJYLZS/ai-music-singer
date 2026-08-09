@@ -379,6 +379,48 @@ Measured on a 257s Chinese song with a 163s female speech reference (median F0 2
   30s-truncated behaviour. Note whisper is non-causal, so a 28s chunk taken alone and the first 28s of
   a 60s file give different features (max|diff| 15.6) — irrelevant for retrieval, but do not expect
   bit-identity between the two paths.
+- **The kNN pool gain is *pool size*, not pitch coverage — and adding the `ext` transposed segments to
+  it is not worth doing.** The natural next step from the entry above was to append the 12.8s of
+  PC-NSF material `ext` already writes to `seedvc/seg_*.wav`, since a retrieval pool has no 29s budget
+  and the song spends 41.8% of its voiced frames above 380Hz where the reference has 10 frames.
+  Measured on 绿色 (query = 9.2k active song frames, `nn1` = best cosine against the pool):
+
+  | pool | mean nn1 | p10 | nn1<0.5 | ≥380Hz mean |
+  |---|---|---|---|---|
+  | 163s reference (current default) | 0.6997 | 0.5702 | 1.6% | 0.6874 |
+  | + `ext` segments (12.8s) | 0.7031 | 0.5735 | 1.4% | 0.6939 |
+  | + whole reference transposed +5st (163s) | **0.7125** | **0.5895** | **0.8%** | 0.7000 |
+
+  The `ext` version moves +0.0034 — an 7.8% larger pool buys almost nothing, so the obvious reading is
+  "too little material". Scaling it up to a full 163s transposed copy does help (+0.0128, unmatchable
+  halved), **but the per-band breakdown kills the pitch-coverage explanation**: the 0-260Hz bucket
+  gains +0.0121, the same as 380-440Hz. A +5st pool cannot possibly supply better neighbours for
+  *low* query frames.
+
+  Decisive control — same experiment at −5st (moving the reference *away* from the song), all three
+  addons generated with `librosa.effects.pitch_shift` so the arms are paired:
+
+  | addon | global | 0-260Hz | 380-440Hz | nn1 taken from the addon (≥380Hz) |
+  |---|---|---|---|---|
+  | +5st | +0.0130 | +0.0131 | +0.0142 | 59.6% |
+  | **−5st** | **+0.0104** | **+0.0108** | **+0.0117** | 60.3% |
+  | +0st (resample only) | +0.0042 | +0.0045 | +0.0040 | 50.2% |
+
+  **−5st captures 80% of the +5st gain**, and ~60% of nearest neighbours come from the addon in every
+  band regardless of direction. The gain is "a bigger pool has a closer neighbour for everything",
+  not "the high notes are now covered". Note even +0st (a pure DSP round-trip, no pitch change) buys
+  +0.0042 — which also means the transposer's fidelity is not the binding constraint here.
+
+  **Why**: kNN matches whisper-base final-layer features, an ASR encoder, so the space is organised by
+  *phonetic content*, not F0. An /a/ sung at 250Hz and at 350Hz are near-neighbours there, which is
+  why the baseline pool's ≥380Hz nn1 (0.687) was already no worse than its 0-260Hz nn1 (0.706) —
+  pitch was never the pool's blind spot. **This also re-reads the entry above**: 30s→163s did not help
+  by covering more pitch, it helped by covering more phones and prosody.
+
+  Ceiling: +0.0128 on `nn1` scales through the historical ratio (p10 +0.064 → SIM +0.020) to about
+  **SIM +0.004**, i.e. the noise floor, and that is already at 2× pool size with diminishing returns.
+  Not implemented; `--knn-pool-wav` stays at `refsep2/lead.wav`. The real levers for kNN would be a
+  longer reference (163s is near saturation) or richer phone coverage (needs re-recording).
 - **Two plausible explanations for *which* frames kNN damages were both wrong; the cause is phone
   coverage.** Worth recording because both looked obvious and each took one measurement to kill:
   - *"It breaks unvoiced consonants"* (the /tʰ/ in 退), which would point at RVC's `protect` knob
@@ -405,8 +447,64 @@ Measured on a 257s Chinese song with a 163s female speech reference (median F0 2
   So the residual-substitution story is falsified as stated; kNN's α=0.4 gain at cfg=3.0 is only
   +0.0026, i.e. the two knobs are not attacking the same quantity. A plausible alternative is that kNN
   mainly pulls the condition's *statistics* toward the prompt's manifold (a mild smoothing/regularising
-  effect), which would also explain why drift rises. Recorded as unexplained rather than papered over:
-  the effect replicates, the explanation does not.
+  effect). Recorded as unexplained rather than papered over: the effect replicates, the explanation
+  does not. **The smoothing half of that guess is now confirmed and the "which would also explain why
+  drift rises" half is refuted** — see the next entry: at α=0.2 kNN makes the condition *smoother*
+  frame-to-frame, so the measured drift rise must originate in the CFM decoder or the timbre channel,
+  not in the candidate selection.
+- **kNN at α=0.2 is a *smoother*, not a noise source — which kills the whole "add a temporal constraint"
+  family (kNN-SVC, arXiv 2504.05686).** The plan was to port its autoregressive candidate reselection
+  (`L = L_src + m·L_concat`, restricting frame *t*'s candidates to pool-continuations of frame *t−1*'s),
+  motivated by the local observation that raising `--knn-alpha` raises drift. Measuring the condition
+  tensor directly refuted the premise before any of it was implemented. Frame-to-frame jump
+  (adjacent-frame `1−cos`, active frames only), 4/4 songs:
+
+  | song | source feats | α=0.2 mixed | ratio | α=1.0 |
+  |---|---|---|---|---|
+  | 绿色 | 0.08661 | **0.07786** | 0.90× | 0.10854 (1.25×) |
+  | 爱笑的眼睛 | 0.08997 | **0.08156** | 0.91× | — |
+  | 冬眠 | 0.08974 | **0.07992** | 0.89× | — |
+  | 最后一页 | 0.08030 | **0.07200** | 0.90× | — |
+
+  The α curve is a **U**: 0.94× at α=0.1, minimum 0.86× at α=0.4, back to 0.97× at α=0.7, and only
+  α=1.0 is rougher than the source (+25%). The default 0.2 sits on the smoothing side. Three more
+  independent refutations, each cheap:
+  - **The ideal temporal constraint makes it worse.** A greedy autoregressive selector (prefer
+    `prev+1` when it appears in top-16) lifts strict-continuity from 9-17% to 55-63% at almost no
+    cosine cost (−0.0003…+0.0023), and frame jump *rises* 2.9-3.2% on all four songs.
+  - **The long sustained notes the paper targets do not exist in this material.** Stable runs
+    (adjacent-frame F0 change <0.5 semitone): `≥0.5s` covers 5.9-48.3% of active frames, `≥1.0s` is
+    ~0%, longest run 0.62-1.48s. Mandarin pop diction does not leave room for the multi-second notes
+    the paper's Figure 3 is about.
+  - **α=0.2 only edits ~1% of the condition, so every reordering variant is fighting over that 1%.**
+    `srcKeep` = cos(mixed, source): 0.9914 at the current k=4, and the whole variant space
+    (k=1 → 0.9876, consistency-filter τ=0.9 → 0.9879, softmax-weighted → 0.9911, k=16 → 0.9934) spans
+    **0.6%**. Scaling by the known anchor (srcKeep 1.0000→0.9914 bought +0.0145 SIM) caps the most
+    aggressive variant at **+0.0064**, and even that assumes "further from source ⇒ higher SIM"
+    monotonically, which the α sweep already disproves.
+
+  **Confirmed end to end with the variant that fully satisfies the paper's objective.** `k=1` makes
+  every substituted vector a genuine pool frame (`onManifold` 0.9395 → **1.0000**) and needs no code
+  change at all (`--knn-k 1`). cfg=1.0, seed 1234, paired: 绿色 0.6034 → 0.6028 (**−0.0006**,
+  36/70 wins, p=0.905), 爱笑的眼睛 0.5635 → 0.5624 (**−0.0011**, 31/75, p=0.165). The paper's core
+  ask is free here, and worthless.
+
+  **Root cause is architectural, and it generalises.** In kNN-VC/kNN-SVC the retrieved frames go
+  **straight into the vocoder**, so concatenation smoothness *is* waveform smoothness. Here they are
+  blended at α=0.2 into the **CFM condition**, with the source at 80%, followed by 32 Euler steps and
+  a separate `pt_mel` timbre channel. Edit 1% of the condition and the ordering stops mattering. This
+  also pre-empts the Sinkhorn-OT idea (E2 in OPTIMIZATION.md): it manipulates the same quantity, and
+  the k=1…k=16 sweep already spans Gini 0.95→0.79 with SIM flat-to-negative. **Corollary: a high Gini
+  in the kNN pool is not a defect.** Treating it as one came from analogy with `ext`'s reuse penalty
+  (where it genuinely worked) — but `ext` rewrites the 25s of audio that whisper actually encodes,
+  while kNN nudges a tensor the CFM then dilutes 5×.
+
+  Worth keeping from the probes: the current k=4 candidates are **spatially scattered** — 78.5% of
+  frames draw their 4 neighbours from pool positions >1s apart, and those candidates agree with each
+  other at only **0.742** cosine, i.e. the average really is a blended timbre rather than any real
+  frame. That is a genuine defect in the paper's framing and a harmless one here. Constraining
+  candidates to a ±1.5s pool window costs **0.0756** of cosine, 30-250× the frame-level constraint's
+  cost, so that variant is not worth trying either.
 - **`reverse_diffusion_v2` is dead code for a different training recipe — do not wire it up.** `flow_matching.py:320` looks like a free stability win: it builds `xt_input = cat([prompt, xt, prompt])`, i.e. the prompt bracketing the target on *both* sides instead of prefix-only, which is exactly the shape of fix you would want for cross-segment timbre drift. It is unreachable (nothing calls it) and it must stay that way: the training path builds the prompt mask as a contiguous *prefix* (`forward_diffusion`, `flow_matching.py:131-144` — `prompt_len = randint(...)` then `is_prompt[col_indices < prompt_len] = 1`), so the model has never seen a suffix prompt and would be OOD from the first Euler step. It also expects `target_len = cond.shape[1] − prompt_len*2`, which does not match how `CFMDecoder.reverse_diffusion` assembles the condition (`decoder.py:20`, prefix layout). Ruled out by reading the training code rather than by burning a run — worth remembering as the pattern for any other "unused upstream method" that shows up.
 - **The source material bounds everything.** This reference had 0.4s above 370Hz while the song spent 44.3% of its voiced frames there. Reference *selection* only reshuffles what exists; recording 30-60s of higher-register material is worth more than any parameter. **Update (2026-08): the material can now be *extended*, not just re-selected** — PC-NSF transposition covers 221-394Hz at SIM ≥0.83 (see "Reference material pitch extension"); TTS voice design cannot substitute (SIM 0.535, synthetic timbre).
 - **ext 占比/移调上限/最小分段的单因素扫点（song_0, 2026-08, seed 1234 固定）—— 三个维度里只有 ext 占比有效应。** 三组实验各 5-7 个点、全部 `--seed 1234`（配对），eval_sim 3s 窗 vs 真实语音：
@@ -441,7 +539,19 @@ Measured on a 257s Chinese song with a 163s female speech reference (median F0 2
   |---|---|---|---|---|---|
   | SIM mean | 0.5548 | 0.5602 | 0.5647 | **0.5673** | 0.5598 |
 
-  单调升到 5 再跌 —— **默认 5 已经是最优，无需动**。2-4 的缺口恰好是 song_0 歌曲 p90 465Hz vs 素材+shift 上限 378→453Hz 的覆盖不足；6 的回落与 AGENTS.md 逐段扫点（+6 worst 掉到 0.81）一致。
+  单调升到 5 ~~再跌 —— **默认 5 已经是最优，无需动**~~。**2026-08 更正**：该扫点在 
+  dw=0 时代测得，当时素材被锁在 med 最高的少数段。dw=3 改变了竞争结构，ms=8 能解锁
+  低音段参与高音格（med 283-285Hz 的段以 +8st 达到 450+Hz）。A/B 三首（seed 1234 配对）：
+  
+  | 歌曲 | 初始复用 | ms5→ms8 唯一源 | 复用 | 增益 | wins | p |
+  |---|---|---|---|---|---|---|
+  | 爱笑的眼睛 | 1.41× | 17→21 | 1.41→1.10× | **+0.0046** | 50/75 | 0.005 |
+  | 冬眠 | 1.37× | 19→21 | 1.37→1.10× | **+0.0072** | 46/60 | <0.0001 |
+  | 绿色（已饱和） | 1.05× | 22→22 | 1.05→1.05× | **+0.0033** | 49/69 | 0.0006 |
+  
+  3/3 全正且全部统计显著。绿色已饱和但仍正向，说明即使不解锁新段，高音格覆盖范围扩展
+  本身也有轻微收益。**默认改为 8**（2026-08，`sing.py --ext-max-shift` / 
+  `w_ext.py MAX_SHIFT_DEFAULT`）。2-4 的缺口恰好是 song_0 歌曲 p90 465Hz vs 素材+shift 上限 378→453Hz 的覆盖不足；~~6 的回落与 AGENTS.md 逐段扫点（+6 worst 掉到 0.81）一致~~（该结论作废，单段保真度不是 ext 的判据，因为 prompt 是池化平均使用）。
 
   **Exp3: 最小分段**（`--select-min-sec`，固定 ratio 0.55）:
 
@@ -473,7 +583,7 @@ Measured on a 257s Chinese song with a 163s female speech reference (median F0 2
   - **CER 无系统性代价**，方向不一致 —— 绿色 +0.0141、爱笑的眼睛 **−0.0377**、冬眠 +0.0109，均值 −0.004。与 kNN α=0.4 那种"3 首全负、+5.9 点"性质完全不同。
   - **稳定性代价极小**：drift +0.0016…+0.0020（本文件其他杠杆都是 +0.006…+0.018），dropouts 基本不变（11→11 / 5→5 / 8→7），p90drift 两首反而改善（0.1959→0.1888、0.1924→0.1840）。
 
-  未测：`dw>3`（绿色在 dw=3 已到复用 1.05×，接近饱和，但另两首还有空间）、`dw` 与 `--ext-max-shift` 的交互（放宽多样性后是否值得把 max-shift 提到 6）。
+  未测：`dw>3`（绿色在 dw=3 已到复用 1.05×，接近饱和，但另两首还有空间）、`dw` 与 `--ext-max-shift` 的交互（放宽多样性后是否值得把 max-shift 提到 6）。**2026-08 已测：见下一条「ext 移调上限扩展」。**
 - **`ext` 阶段 2.2× 提速：把逐 shift 组 fork 合并成一次进程，输出 bit-identical（2026-08）。** 该阶段耗时几乎与音频长度无关 —— 逐组计时暴露了形状：0.30s 的组 4.7s、5.94s 的组 4.2s。拆开量：`pitch_transpose.py` 单次进程**固定开销 2.77s**（import torch 1.02 + import 项目模块 0.99 + load RMVPE 0.53 + load NSF-HiFiGAN 0.11），净计算只有 **0.87s**（mel 0.00 + rmvpe f0 0.11 + vocoder 0.76，5.94s 音频）。典型 5 组 = **~14s 纯开销**。
 
   修法：新增 `tools/pcnsf/scripts/multi_transpose.py`（接 `--jobs` 的 JSON 列表，一个进程跑完所有 `(wav, shift)`），`w_ext.py` 先把各组输入全部落盘再一次性调用（`nsf_shift_many`）。**注意 fork 本身是省不掉的** —— `tools/pcnsf/.venv` 是 torch 2.13+**cpu**、与 `w_ext.py` 所在的 SoulX venv 不同，所以只能把 N 次降到 1 次，不能降到 0。全 10 首实测：
@@ -486,8 +596,117 @@ Measured on a 257s Chinese song with a 163s female speech reference (median F0 2
   新路径耗时几乎恒定（8.3-8.6s），因为剩下的就是那一次固定开销。**10/10 首 `prompt_ext.wav` md5 bit-identical**，端到端 SVC 后 `vocal.wav` md5 与 SIM（0.6034/0.6348）也完全不变。`multi_transpose.py` 的 per-job 计算是逐行照抄 `pitch_transpose.py` 的 `nsfhifigan` 分支（同样的 librosa dtype / `get_mel_torch` 参数 / `rmvpe.get_pitch` / `f0 *= 2**(n/12)` / `save_wav`），这是 bit-identical 的原因。`--shifter seedvc` 没有对应多 job 入口，仍走逐组 fork。
 
   **验证这类改动时有个陷阱：`F0Extractor` 本身不可复现。** 同一进程内对同一文件连跑 4 次，`max|diff|` 达 2.2e-4（相对误差 2.5e-6），所以 `prompt_ext_f0.npy` **永远不会** byte-equal，一度让我误判成改动引入了偏差。判据要用 `prompt_ext.wav` 的 md5（它是确定性的）加下游 `vocal.wav` + SIM。另一个坑：对照基线必须显式带上 `--div-weight 3.0`，否则拿到的是 `dw=0` 时代的存档产物（`DIV_WEIGHT_DEFAULT` 仍是 0.0，3.0 由 `sing.py` 的 `Cfg.ext_div_weight` 下发），段数会从 26 变 28，看起来像本次改动的锅。
+- **选段从两阶段贪心换成一个 MILP（`--select-method cov_anchor`）—— clip 上 3 首歌 0 负，但全曲 10 首交叉验证后增益归零，默认已改回 `greedy`。** 原流水线里 `w_select` 先贪心选锚点、`w_ext` 再贪心填频段缺口，两者互不知情，于是同一源段可被两阶段各用一次（原声 + 移调版）。候选池其实是**互不重叠的分割**（绿色 143 段 / 95.6s，重叠对数 0，并集 = 段长和），所以"一段素材出现两次"可以精确定义并消除。`singing/ext_milp.py` 把两阶段合并成一个 (段, 移调) 指派问题：变量 `x[i,s] ∈ {0,1}`（143 段 × 13 shift = 1859 个 0-1 变量），"每段最多用一次" = `Σ_s x[i,s] ≤ 1`，`scipy.milp` 求解，词典序优化覆盖缺口 → 时长加权 `|shift|`。
+
+  用户提的优先级是 **①音域覆盖 > ②不重叠 > ③移调最小**，实测只有一半成立。跨 3 首歌、clip 90s / 6 seed / 统一窗口集、`--seed` 配对：
+
+  | 臂 | 策略 | 绿色 | 冬眠 | 爱笑的眼睛 | 均值 | 负 |
+  |---|---|---|---|---|---|---|
+  | `shift_first` | ③ 先最小化移调 | −0.0195 | −0.0013 | −0.0241 | −0.0150 | **3** |
+  | `satisfice` 80% | 覆盖够 80% 即止 | −0.0022 | +0.0018 | +0.0070 | +0.0022 | 1 |
+  | `satisfice` 90% | 覆盖够 90% 即止 | −0.0010 | +0.0023 | +0.0103 | +0.0039 | 1 |
+  | **`cov_anchor`** | **① + 干净锚点 ≥55%** | **+0.0038** | **−0.0000** | **+0.0112** | **+0.0050** | **0** |
+  | `cov_only` | ① 纯覆盖优先 | −0.0009 | −0.0033 | +0.0140 | +0.0033 | 2 |
+
+  三条可迁移的结论：
+  - **③ 不能排第一。** `shift_first` 会退化：移调压到 0 之后全部段都是 0st，覆盖塌到 33-54%，加上"不重叠"连 45s 都填不满（只有 28-34s，素材用光），三首歌全负。
+  - **① 排第一有效，但必须配干净锚点下限。** 纯覆盖优先会把 0st 素材压到 27-36%（`base` 是 55%），两首歌因此转负；加上 `0st 段 ≥ 55% 总时长` 的硬约束后 0 负。这与本文件已有的"过一遍 vocoder 就掉 0.02-0.045 SIM"一致。
+  - **② 是免费的，而且让求解更快。** 加上不重复约束后绿色 66s 求解完，允许复用反而要 227s —— 它大幅收紧了 LP 松弛。所以没必要把它当成要权衡的成本。
+
+  端到端验证（`sing.py --stages ext` 走新默认，绿色 clip 6 seed）：**base 0.6268 → 新默认 0.6347，+0.0079，5/6 seed 正，p=0.0002**，比实验期的 `a55` 臂还高 +0.0041（收紧了 MILP 的 `mip_rel_gap`）。`--select-method greedy` 保留旧路径，**md5 与改动前产物 bit-identical**（重构无副作用，可用于回归）。
+- **然后把它放到全曲 10 首上，增益消失 —— clip 协议过拟合了那 3 首调参歌，`cov_anchor` 已撤回默认。** 全量重跑（`--seed 1234` 与旧基线严格配对，`--pitch-shift 0`，`paired_eval` 公共窗）：
+
+  | | 均值 | 正/负 | t | 符号检验 |
+  |---|---|---|---|---|
+  | 全 10 首 | **+0.0012** | **5/5** | 0.49 | **p=1.000** |
+
+  95% CI ≈ [−0.0044, +0.0069]，**包含 0**。逐首：爱笑的眼睛 +0.0129、绿色 +0.0094、云烟成雨 +0.0092、爱的回归线 +0.0053、陪你看星星 +0.0047｜冬眠 −0.0033、那女孩对我说 −0.0051、白色毛衣 −0.0064、追光者 −0.0064、最后一页 −0.0080。
+
+  **调参歌 vs 留出歌把过拟合摊开了**，这是本轮最重要的一个数字：
+
+  | | 均值 | 正 |
+  |---|---|---|
+  | 3 首调参歌（clip 实验用过：绿色/冬眠/爱笑的眼睛） | **+0.0063** | 2/3 |
+  | **7 首留出歌（从未参与调参）** | **−0.0010** | **3/7** |
+
+  clip 上选出 `cov_anchor` 的那批 15 臂实验，全部只在这 3 首歌上跑过；全曲复现时它们仍是表现最好的 3 首（+0.0094/−0.0033/+0.0129，与 clip 的 +0.0038/−0.0000/+0.0112 同号且同序）。当时把它读成"clip 过拟合了调参歌"——**这个解释被下一轮全曲双臂复跑推翻了**：7 首留出歌里有 5 首显著，其中 3 首 MILP 胜、2 首 greedy 胜，"留出歌均值为负"是组内相消的假象，真正的规律是效应按歌分向（见下一条）。正确表述：**clip 只测了 3 首歌，不足以定默认值；n=3 定策略、n=10 才勉强够看出"没效果"的结论本身也要修正。**
+
+  代价那一侧是明确的：`ext` 阶段从 **12.9s 涨到 253.6s（19.7×，最慢绿色 584.8s）**，MILP 求解是全部开销。一个零收益的改动换 20 倍耗时，**默认已改回 `--select-method greedy`**；`cov_anchor` 保留为可选项。
+
+  三条可迁移的教训：(1) **clip 用来扫参数可以，用来定默认不行** —— 它只降低单次成本，不增加歌曲样本量，而歌曲间方差（sd 0.0079）才是这里的主导误差；(2) 报"跨 N 首歌 0 负"时必须写清那 N 首是否就是调参用的那 N 首；(3) `corr(gain, 唯一源数) = −0.831` 看起来又是个漂亮的预测因子，**但不要用** —— MILP 把每首歌都推到 60-70 段，自变量跨度只有 60→70，且 n=10，与"覆盖率 +0.771"那次被一个极端点拉出来的情形同构；顺带一提 `corr(gain, MILP 覆盖%) = −0.381` 是**负**的，这是覆盖率不转化为 SIM 的第四次否证。
+- **全曲双臂复跑后对结论的修正：「均值 +0.0012、5 正 5 负」是错的读法 —— 真实现象是「两首歌组，组内效应又大又一致」。** 上一轮把 MILP 和 greedy 产物直接归档比较（两版都在 `data/songs/<名>/` 与 `data/songs/<名>_greedy/`），用 `paired_eval` 对 10 首全曲逐窗重比（3s 窗、公共 RMS 门、与 `eval_sim` 同协议），逐首：
+
+  | 歌 | gain | wins/n | win% | p_sign | | 歌 | gain | wins/n | win% | p_sign |
+  |---|---|---|---|---|---|---|---|---|---|---|
+  | 爱笑的眼睛 | **+0.0129** | 62/75 | 82.7% | 0.0000 | | 追光者 | **−0.0064** | 14/53 | 26.4% | 0.0008 |
+  | 绿色 | **+0.0094** | 44/70 | 62.9% | 0.0414 | | 白色毛衣 | **−0.0064** | 19/59 | 32.2% | 0.0086 |
+  | 云烟成雨 | **+0.0092** | 43/63 | 68.3% | 0.0052 | | 最后一页 | **−0.0080** | 20/67 | 29.9% | 0.0013 |
+  | 爱的回归线 | +0.0053 | 47/70 | 67.1% | 0.0056 | | 冬眠 | −0.0033 | 25/60 | 41.7% | 0.2451 |
+  | 陪你看星星 | +0.0047 | 32/52 | 61.5% | 0.1263 | | 那女孩对我说 | −0.0053 | 34/82 | 41.5% | 0.1507 |
+
+  两组内部的效应都是又大又一致（MILP 胜的 5 首：mean +0.0083、69.1% 窗同向；greedy 胜的 5 首：mean −0.0059、65.1% 窗同向）——**这不可能都是噪声**。`t=0.49、p=1.000` 说明的是"方向随机"，但按窗口的符号检验（5 首 p<0.01、其余 2 首 p≈0.13）说明的是"每首歌内部效应真实"——两者同时成立，唯一的解释是**效应存在但按歌分向**。clip 的 3 首恰好 2 首落在 MILP 组（绿色 +0.0038、爱笑的眼睛 +0.0112），才让人误以为全覆盖。
+
+  **分向的机制没找到；四个候选变量全部否掉，包括一度写进本文件的 `song_med`。** 逐个查（全部零 GPU，只读已有日志与 `prompt_stats.json`）：
+
+  | 候选 | 检验 | 结论 |
+  |---|---|---|
+  | select∩ext 交集（同段被锚点与 ext 各用一次） | 已有**干预实验** `--ext-exclude-anchor`：3 首均值 +0.0034，仅绿色(重叠62%)显著；本轮 `corr(gain, 重复占ext%) = +0.051` | 影响小，且重叠最高的两首(76.6%/76.8%)都是 MILP 胜、58%/53% 的两首是 greedy 胜，无规律 |
+  | **移调时长占比** | 两版都被 `anchor_min_ratio 0.55` 锁死在 **44.2-45.3%** | **压根不是变量**，跨度 0.5pp；在它上面算出的 `corr = −0.552` 是拟合噪声 |
+  | 移调幅度 | `corr(gain, Δ移调段 w\|shift\|) = −0.119` | 不解释 |
+  | `song_med`（歌的调性） | 最佳阈值 >344Hz 可分 8/10，`corr = +0.516`，**但 LOO 掉到 5/10 = 瞎猜基线** | **否证** |
+
+  `song_med` 那条值得单独记，因为它看起来最像规律：最高的 3 首全 MILP 胜、最低的 2 首全 greedy 胜。但中间段是乱的 —— **陪你看星星 318Hz(MILP 胜 +0.0047) 与白色毛衣 319Hz(greedy 胜 −0.0064) 只差 1Hz 而方向相反**，云烟成雨 308Hz 还是 MILP 胜 +0.0092。那个 8/10 全靠挑阈值挑出来。这是本文件第三次踩"n≈10 上挑阈值拟合规律"（前两次：`corr(8st+桶占比, 最大增益)=+0.995`、锚点占比线性拟合），**LOO 是这类规律的标准反例检验，先做再信**。
+
+  另有一个**必须记住的口径错误**：MILP 的移调段其实移得**更狠**（移调段内部 w|shift| 3.59-7.84 vs greedy 4.43-5.88，8/10 首更大），但按"全 prompt 加权"算却更小（1.59-3.52 vs 1.98-2.79）——因为 MILP 段数多一倍(60-70 vs 26-35)、0st 段占比高，把均值稀释了。**比较移调幅度必须只在移调段内部算**，否则会得出方向完全相反的结论（我据此错判过一次）。
+
+  还需注意 10 首里只有 4 首（爱笑的眼睛 +0.0129、绿色 +0.0094、云烟成雨 +0.0092、最后一页 −0.0080）的效应确实超出单 seed 噪声底 ±0.004；其余 6 首绝对值都在 0.0033-0.0064，**单 seed 下方向本身就不可靠**。要定机制得先给这几首补 seed。
+  
+  **9/10 首 bit-identical 复现，说明整条链（select→ext→svc→eval）是确定性的**；唯一例外 那女孩对我说 的旧归档 vocal 与其 sing.log 时间戳不符（12:36 vs 13:52，归档时目录被复用），用今天的重跑作基线后结论不变（−0.0053）。**这也修正了上一轮的表述**："clip 协议过拟合那 3 首调参歌"解释不了"5 首留出歌显著为正"的事实 —— 正确表述是"clip 只测了 3 首歌，分向现象需要全曲才看得见"。
+- **两条路径的分叉点只有 `ext`，但 MILP 不是在 select 结果上做增量 —— 它把 `prompt.wav` 整个丢掉重解。** 逐阶段 md5 对比（绿色）：`sep`/`ref-sep` bit-identical（同一缓存），`select` 的 `selected` 段列表**完全相同**（28/28，idx 与 start 全同）、`prompt.wav` md5 一致，`*_f0.npy` 与 `*_stats.json` 的差异只是路径串与 `F0Extractor` 的 1e-6 浮点噪声（本文件已记录它永不 byte-equal）。真正分叉的是 `prompt_ext.wav`。
+
+  但"分叉只在 ext"容易被误读成"MILP 在锚点之上填缺口"。实际是 `w_ext.py:233-235` 把 `anchor` 置成 `np.zeros(0)`、**完全不读 `prompt.wav`**，直接把 143 段全池交给 `ext_milp.solve()`，锚点（0st 段）由求解器自己重选。实测 MILP 的 35 个 0st 段与 `w_select` 的 28 段只重合 **16 个**（冬眠 14/27），只是时长同样凑到 `45×0.55=24.75s` 上限。**所以 MILP 路径下 `prompt.wav` 是死产物，`select` 阶段对它的唯一贡献是 `cands_meta.json`。**
+
+  `no_repeat` 约束（`Σ_s x[i,s] ≤ 1`）的作用域也常被误解：它只禁止**同一次求解内**一段被用两次（实测 `0st ∩ 移调 = 0`），**不会因为 select 选过某段就禁用它** —— 绿色 select 的 28 段里 25 段被 MILP 再次用到（16 当锚点、9 当移调段）。反而是 **greedy 才会重复用段**：绿色有 16 段在 `prompt_ext` 里出现两次（原声进锚点 + 移调版进 ext），ext 内部还有 6 段用了多个 shift。消除这个重复正是 MILP 的设计动机，也是 `--ext-exclude-anchor` 只对 greedy 有意义的原因。
+
+  两版 ext 的结构差异（10 首一致，绿色为例）：
+
+  | | greedy | MILP |
+  |---|---|---|
+  | ext 段数 / 时长 | 30 段 / 17.5s（45s 预算剩 ~20s 未用） | **67 段 / 44.9s（填满）** |
+  | 源素材复用 | ~1.2×（同段多 shift + 与锚点重复） | **0（硬约束）** |
+  | shift 分布 | 集中 +3/+4/+5 | 双峰：35 段 **+0** + 21 段 **+8** |
+  | 移调段内部 w\|shift\| | 5.71 | **7.44**（更狠，见上条口径说明） |
+- **"覆盖率高就好"仍然不成立 —— 上面那个默认是配置调优，不是找到了机制。** 15 个臂上 `corr(Δ覆盖, gain) = +0.771` 看着很有说服力，但**去掉退化的 `shift_first` 臂后变成 −0.001**：那个相关完全由一个极端点拉出来。而且 Δ覆盖 与 Δw|shift| 本身相关 **+0.882**，这批臂在设计上就无法把两者分开。所以 `cov_anchor` 只是这批可行解里表现最好的配置，不能推论成"提高 prompt 频段覆盖能提分"——那个命题在本文件里已被独立否证两次（select 阶段前移移调：覆盖 75.8%→84.9%，SIM +0.0002；预移调整条参考 +5st：覆盖 50.6%→75.7%，SIM −0.0029）。
+- **不要按歌曲类型切换选段策略 —— 分档规则被 leave-one-out 否证。** 每首歌的最优臂确实不同（冬眠→`satisfice90`、绿色→`cov_anchor`、爱笑的眼睛→`cov_only`），且 `corr(8st+ 桶占比, 最大可得增益) = +0.995` 看起来是个漂亮的分档依据（<10% / 10-25% / >25%）。同一批数据上"每歌选最优"能到 **+0.0067** vs 单一 `cov_anchor` 的 +0.0050。但那个 +0.995 和那个 +0.0067 都是**用同一批数据挑出来的**，必然过拟合：做 LOO（阈值只由另两首歌定，预测留出的那首该用哪个臂）后掉到 **+0.0034，反而低于单一 `cov_anchor`**。额外收益 +0.0017 本来就在 ±0.004 噪声底以下。**n=3 不足以支撑任何按歌分档的规则**，这也是本文件里第二次踩"3 个点拟合 2 个参数"（前一次是锚点占比线性拟合，同样被否）。
+- **MILP 的碎片化不伤吐字（已用 CER 验证）。** 它选出的段中位长 0.57s、约 27 段 <0.5s，远碎于原贪心（本文件此前担心"短参考音素覆盖不足"）。`singing/eval_cer.py` 实测：绿色 **−0.0060**、冬眠 **−0.0380**（两首不升反降）、爱笑的眼睛 +0.0256。听感也确认吐字无问题。`corr(中位段长, ΔCER) = −0.19`、`corr(<0.5s 占比, ΔCER) = +0.20`，即碎片化与 CER 基本无关。
+- **`prompt_ext` 总长的 29s 上限是历史包袱，不是架构限制；默认已改 45s（2026-08，跨 3 首歌）。** whisper 的 30s 硬顶只约束 `pt_content_feat`，而 `encode_long()` 补丁已绕开它；音色通道 `pt_mel` 直接从波形算（`soulxsinger_svc.py:301`），**从来没有 30s 限制**。真正的天花板是 LLaMA 的 RoPE `max_position_embeddings=4096`（`llama.py:142`）：`pt_frames + gt_max` 在 24kHz/hop480 下 = 45s→3650、50s→3900，都还有余量（60s 会超）。实测（90s 代表性 clip，`--cfg 1.0 --knn-alpha 0.2 --pitch-shift auto`，3 seed 配对，统一窗口集）：
+
+  | 歌 | 29s | 45s | 50s | 29→45 | 45→50 |
+  |---|---|---|---|---|---|
+  | 绿色 | 0.6223 | **0.6452** | 0.6339 | **+0.0229** (59/72) | **−0.0113** (22/72) |
+  | 白色毛衣 | 0.6078 | 0.6211 | **0.6231** | **+0.0133** (61/81) | +0.0020 (噪声内) |
+  | 爱笑的眼睛 | 0.5814 | 0.5837 | — | +0.0023 (**噪声内**) | — |
+
+  29→45 在两首歌上 3/3 seed 一致且远超 ±0.004 噪声底，这是本文件里第三大的单参数增益（仅次于 `--cfg` 和 kNN）。**注意 `--max-sec` 之前是 `sing.py:374` 硬编码的字符串 `"29"`，压根没接 `Cfg`** —— 现在是 `Cfg.max_sec` / `--max-sec`。
+- **45s→50s 的方向由「歌曲需求是否超出素材移调上限」决定，可零 GPU 预判。** 绿色在 50s 退化 −0.0113，白色毛衣不退化，机制是纯粹的组合学：`w_ext.py:226` 的 `need_sec` 按缺口比例把预算摊到各频段格，预算从 20s 涨到 25s 时高音格的配额同比放大，一旦超过近距离素材的供给，贪心（`:272`）只能往下拿移调量更大的候选。判据是**时长加权 mean |shift|**：
+
+  | 歌 | 超「素材最高段 med × 2^(8/12) = 538Hz」的帧占比 | 45→50 Δw\|sh\| | 实测 |
+  |---|---|---|---|
+  | 绿色 | 9.7% | **+0.61** (hi7 46%→61%) | **−0.0113** |
+  | 白色毛衣 | 0.0% | **−0.15** | +0.0020 |
+
+  按已记录的 0.014-0.020 SIM/半音，+0.61st 折算 −0.009…−0.012，与实测 −0.0113 吻合。**具体到段**：`seg 72/127/138` 在 45s 计划里拿 `+4st`，在 50s 计划里全被降级到 `+8st`。两个计划不是嵌套关系（45s 独有 6 个 `(idx,shift)` 组合在 50s 里消失），所以**长度扫点的相邻档之间混着「重规划抖动」，报 SIM 时必须同时报成分统计**（w\|shift\| / hi7 / uniq / reuse），否则无法回溯。
+
+  但 **Δw|shift| 只能判断「继续加长会不会开始变差」，不能判断「加长有没有用」**：绿色 29→45 的 Δw|sh| 也是正的（+0.25）却大幅改善 +0.0229，因为那一段长度和多样性的收益压过了移调成本。
+- **「甜点 = prompt_dur / anchor_min_ratio」这个公式已被否证。** 9/10 首歌的 `prompt.wav` 都撞在 `w_select --max-prompt 25s` 上限（24.82-25.00s），算出 `25/0.55 = 45.4s`，与绿色实测最优的 45s 一致 —— 但那是**巧合**，因为这 9 首的自变量没有变化，无法互相验证。唯一能验证的样本是**爱笑的眼睛**（`prompt.wav` 仅 18.55s → 公式预测甜点 33.7s）：实测 29/34/40/45s 四档全部落在 0.5814-0.5839，**跨度 0.0025，低于噪声底**，34s 处没有任何拐点。切换点本身确实存在（日志里锚点占比从 55% 掉到 46%/42%，确认 34s 以后被素材封顶在 18.55s），但**它不产生 SIM 上的拐点**。
+- **`--anchor-min-ratio` 在大 `max_sec` 下是惰性参数（已实测确认）。** 锚点取 `min(prompt_dur, max_sec × ratio)`，所以一旦 `max_sec × ratio > prompt_dur`，ratio 就完全失效。白色毛衣 50s 那行日志写着 `锚点(干净) 24.92s (50%)` —— 名义 ratio 0.55、实际占比 50%，因为 `27.5 > 24.92`。**推论：在 45s 以上调 ratio 无效，只有调 `max_sec` 有效**（之前"降 ratio 到 0.45 值得扫"的建议因此撤回）。可迁移的量是 **ext 预算 = `max_sec − min(prompt_dur, max_sec×ratio)`**，绿色最优在 20s、白色毛衣 25s 仍可。
+- **若歌曲 8st+ 桶占比 >25%，prompt 侧调参无收益，别花时间。** 爱笑的眼睛的桶分布是 `[11.7 10.2 27.6 20.3 30.2]`（错配 +6.0st，10 首里最大），30% 的帧距参考 8 半音以上、只有 11.7% 在 2 半音内，绝对分也是三首里最低（0.5814 vs 绿色 0.6223 / 白色毛衣 0.6078 @29s）。这种「素材与歌曲根本不匹配」的场景下 prompt 构造不是瓶颈，所以四档全平。**提高 `--ext-max-shift` 也救不了它**：模拟显示 ms 8→12 时 `hi8+` 恒定在 33%、`ext` 恒定 ~15s，只有 `w|sh|` 从 5.18 爬到 5.53（纯加成本不加覆盖）。根因在 `build_grids`——最高格上界是 `p99 × 2^(3/12)`，而 ms=8 时最上面 4 格（547-975Hz，占全曲 13.8%）**候选数为 0**，487-547Hz 格也只有 10 个候选。该做的是换更高音区的素材或 `--pitch-shift`，不是调 prompt 参数。
+- **零 GPU 预筛工具（本轮建立，四次验证全中）：`/tmp/opencode/sim_plan.py` 复现 `w_ext.py` 的 `need_sec` 分配 + 贪心，只算成分不做移调。** 校验记录：绿色 45s 预测 `n=36 / ext=20.05 / w|sh|=5.71 / hi7=46% / uniq=30`，真实产物五项**全中**；白色毛衣 45s 三项全中；爱笑的眼睛 29s 与 45s 三项全中，34s/40s 误差 ≤0.06。**关键实现细节**：锚点 F0 必须按 `max_sec × ratio` 裁剪（对应 `w_ext.py:201-209`），否则 45s 档会算出 `w|sh|=6.12 / hi7=56%` 而不是真实的 5.71/46% —— 第一版就是这么错的，且它在 50s 档看起来是对的，很容易误判成"模拟器可用"。
 - **`svc` 阶段没有显存可吃，`max_seg_sec` 已到架构顶。** 扫点（绿色，`--cfg 1.0 --seed 1234`）：20 → 78.8s / 5049 MiB，24 → 74.8s / 5257 MiB，28 → 73.7s / 6437 MiB。28 已是 whisper 30s 硬顶下的最大值，且 6437/16376 MiB 说明**瓶颈不是显存**。CFM 的 32 步 Euler 严格串行（`flow_matching.py:292`），CFG 每步两次前向（`:293` 的 `[prompt+xt]` 与 `:302` 的 `[xt]`）长度不同、不能 stack 成一个 batch。另外两处看似浪费的地方实测都不值得动：`infer_segment:513` 每段重算循环不变的 `pt_content_feat`（10 段冗余共 **0.11s** —— whisper-base 单次 28s 只要 **10.9ms**），`encode_long` 的 6 chunk 顺序编码（**0.07s**）。`eval` 的 71 窗 ERes2NetV2 逐窗推理也只有 1.38s。**这些是本文件里"看代码觉得浪费、实测微不足道"的典型，动手前先测。**
 - **覆盖率与 SIM 相关 +0.69，但这大概率是难度的代理变量，不要当成因果。** 10 首歌 `corr(select 覆盖%, SIM) = +0.692`（Spearman +0.733），cov<55% 的 5 首均值 0.5654 vs cov≥55% 的 5 首 0.6021（差 +0.0367）。看着像"提高覆盖率就能提分"，但覆盖率低本身就意味着歌曲音域离参考远，而本文件已记录 `corr(B, A) = +0.810`（B = ref vs target，任务难度基线）。同一批数据里 `corr(唯一源数, SIM) = +0.440`、`corr(复用率, SIM) = −0.452`、`corr(均|shift|, SIM) = +0.102` —— 这些变量彼此高度耦合，n=10 的观察性相关无法分离。**多样性那条之所以可信，是因为随后做了干预实验（上一条），而不是因为这个相关系数。**
+- **给 prompt「挑更好的段」这一整类思路都会撞上同一面墙：prompt 级指标由总时长主导，单段质量被平均掉。** 2026-08 用留一法直接测出了天花板：从选中的 28 段里逐一移除一段、重拼 prompt、测 SIM 变化，得到每段的*真实*边际贡献 —— 三首歌的贡献 **std 只有 0.00206 / 0.00156 / 0.00104**。即便存在一个完美排序键，换掉若干段的收益也只有千分之几，乘传导系数 k=0.51 后必然落在 ±0.004 噪声底之下。同一实验的 H1 分支说明了原因：移除 10 段「质量最差」使 SIM **+0.0014**（时长掉 7.5s 但质量升，净持平），移除 10 段「最短」使 SIM **−0.0036**。这解释了三个独立实验为何都失败 —— CAM++ 质心选段（本条）、select 阶段前移移调（下一条）、kNN 池加移调段（`:382`，增益来自池子变大而非音高覆盖）。**在动 select/ext 的选段逻辑之前，先用留一法量一下边际贡献的 std；若 <0.005，不必往下做。**
+
+  附带一个可复用的测量事实：**段级 SV 分数在 <1s 音频上基本不可用，且 57% 的方差是时长伪影。** 同一段音频从 0.3s 截到 2.0s，CAM++ 分数抬升 **+0.475**，而整个 143 段候选池的分数跨度只有 0.90 —— 一半以上的"质量差异"其实是"片段更短"。`corr(段级分数, 时长)` = +0.711 (CAM++) / +0.705 (ERes)。同段 +0.05s 偏移的子窗 std 达 0.029-0.043。去时长残差的信噪比其实不差（6.95×），但它与真实边际贡献的相关性跨歌符号都不一致（−0.229 / +0.083 / +0.224，均值 +0.026）——**信噪比高 ≠ 预测力强**。另注意用 CAM++ 选段、CAM++ 打分会自我强化：端到端重拼后 CAM++ 3/3 报正（+0.003…+0.007）而独立的 ERes2NetV2 只有 1/3 正、均值 +0.0030。
 - **前移移调到 select 阶段（在 prompt 构建时就覆盖高音区）：已实验，SIM 无改善，已回滚（2026-08）。** 思路是把歌曲目标 F0 分布带入 select 的贪心，把每个候选段虚拟展开成 shift ∈ {−4…+5} 的多个候选，用 `score = (边际增益/时长) × fidelity[shift]` 打分，让高音区缺口在第一次选段时就被填上，省掉 ext 阶段单独的 4s 预算限制。仿真（7首歌，3 seed）：覆盖率 75.8%→84.9%，band L1 0.405→0.273。实际 A/B（song_2 3 seed, song_6 3 seed, seed 配对）：
 
   | 歌曲 | 旧流程（seed 均值） | 新 select | 差值 |
@@ -606,7 +825,7 @@ Same ref_cut.wav, SIM vs real (unshifted):
 
 - **Asymmetry: downshift costs more than upshift.** Equal magnitudes: +3st 0.9346 vs −3st 0.9163 (+0.018); +5st 0.8789 vs −5st 0.8500 (+0.029); +7st 0.8303 vs −7st 0.7844 (+0.046). Cost per semitone ≈ 0.024 up / 0.030 down. −12st (0.6939) is below DSP level (rubberband 0.7728) — unusable. **The per-semitone figures here are inflated** — they include the vocoder resynthesis loss that `orig = 1.0000` hid; see the per-segment sweep below for the corrected 0.014-0.020/st and for the fact that the asymmetry only matters above ±2st.
 - **Mechanism: formants stay fixed.** Transposing multiplies F0 but keeps the spectral envelope; down to male register the female formants become impossible for a human, and ERes2NetV2 catches it. Consequence: for low-register songs, use `--pitch-shift auto` (raise the song, don't lower the ref) — this is the same direction the whole pipeline already takes.
-- **Voiced rate drops on upshift** (0.78→0.75 at +7st), rises on downshift (→0.81 at −12st) — RMVPE tracks low pitches more easily; the 0.75 at +7st is a real second cost.
+- **Voiced rate drops on upshift** (0.78→0.75 at +7st), rises on downshift (→0.81 at −12st) — a real second cost, **but the "RMVPE tracks low pitches more easily" explanation this line used to carry is wrong**. `pitch_transpose.py`/`multi_transpose.py` run `rmvpe.get_pitch` on the **original** audio and only then apply `f0 *= 2**(n/12)`, so the estimator never sees shifted audio and the input-side voiced rate is *identical* for every shift by construction. Re-extracting F0 from the **vocoder output** reproduces the drop (8s segment, CPU: voiced 0.5196 @+0 → 0.4862 @+5 → 0.4848 @+7 → 0.4688 @+12, i.e. −0.035 at +7, matching the −0.03 above on different material), so the loss is created at **synthesis**: the mel is unchanged while F0 rises, and the vocoder must place wider-spaced harmonics under a spectral envelope measured for narrower spacing. Corollary: **a better/ensembled F0 estimator cannot recover it** — see OPTIMIZATION.md. Same run also shows output F0 is systematically **flat** vs target and worsens with shift (−9 cents @+0, −18 @+5, −27 @+12); the +0 offset is the vocoder's intrinsic bias.
 - Usable pool: SIM ≥0.87 → −3/orig/+3/+4/+5 (221-351Hz); ≥0.83 → add +6/+7 (up to 394Hz, covers song median 369Hz). **These pilot numbers are inflated (no vocoder baseline); see the per-segment sweep below for corrected figures: mean ≥0.85 → −4…+6, worst ≥0.85 → −4…+4.**
 - CLI: `tools/pcnsf/.venv/bin/python tools/pcnsf/scripts/pitch_transpose.py in.wav --transpose 5 --method nsfhifigan --config .../config.json --ckpt .../model.ckpt --pitchalgo rmvpe --rmvpeckpt SoulX-Singer/.../rmvpe.pt --out dir --title name`. Note `--transpose -3` needs `=` form (`--transpose=-3`) or argparse treats it as a flag.
 
@@ -836,6 +1055,21 @@ GPT-SoVITS/.venv/bin/python singing/eval_cer.py \
   characters, and the same arm scored CER 0.3059 then 0.1912. `eval_cer.py` now pins
   `torch`/`numpy`/`random` seeds plus `cudnn.deterministic`; four consecutive runs are then identical.
   **A CER measured without that seeding is noise.**
+  - **Pinning the seeds once at process start is NOT enough, and the fix above was incomplete until
+    2026-08.** The VAD consumes the global RNG on every `generate()`, so file *k* in a `--gen` list sees
+    an RNG advanced by the previous *k−1* calls: **a file's transcript depends on its position in the
+    list.** Measured on one unchanged file, three consecutive calls: **58 / 55 / 54 chars** without
+    re-seeding vs **58 / 58 / 58** when the seed is reset before each call. That was enough to move one
+    arm's CER by 0.4+ purely by reordering. `eval_cer.py` now re-seeds inside `asr()`; verified by
+    running the same pair in both orders and getting identical CERs. Any CER table produced before this
+    fix is only valid for the arm that happened to be scored first.
+  - **A CER spike can be VAD truncation rather than degraded audio — check the waveform before believing
+    it.** 爱笑的眼睛's MILP arms reported CER 0.72/0.63 with D=68/46 (i.e. "most words swallowed"), which
+    looked like catastrophic content collapse. But per-3s-window RMS was **near-identical across arms**
+    (0.09/0.12/0.11… vs base 0.08/0.11/0.10…), so nothing collapsed. Bypassing the VAD with fixed 15s
+    chunks took the transcript from 58 chars back to **109**. The real ΔCER was +0.026, not +0.42.
+    Rule: if D is large, dump the ASR text *and* check window RMS; if the energy profile matches the
+    baseline, re-run with fixed chunking before drawing any conclusion.
 - **`eval_sim`'s RMS gate (`eval_sim.py:87`, `rms < 0.01`) is applied per arm independently, so two arms
   can be scored on different window sets.** On 冬眠 base reported 60 windows and knn 61 despite
   byte-identical inputs and equal-length outputs; the extra window was a low-scoring one present in only
@@ -928,10 +1162,15 @@ python3 sing.py --ref ... --song ... --name exp1 --stages sep,select
 Stages: `sep` (BS-RoFormer → karaoke, 人声+伴奏+主唱+和声) → `ref-sep` (参考音频同样两步分离取纯人声
 lead，产出 `data/songs/<name>/refsep2/lead.wav`；select/eval 自动优先用分离产物，无则退回原 ref) →
 `f0-target` (RMVPE 50Hz) → `select`
-(参考切片打分贪心选段 → `prompt.wav`+`prompt_f0.npy`+`prompt_stats.json`) → `ext` (原始 prompt 作
-音色锚点 + 按频段缺口追加移调段，PC-NSF-HiFiGAN 默认 `--ext-method nsf`，seed-vc 可选；
-`--anchor-min-ratio 0.55` 是干净锚点的占比**上限**（cap）；`--ext-div-weight 3.0` 默认开启的源段
-复用惩罚，防止素材被锁在 med 最高的少数段上，拼出 ≤29s 的 `prompt_ext`) → `svc`
+(参考切片打分贪心选段 → `prompt.wav`+`prompt_f0.npy`+`prompt_stats.json`) → `ext` (选段 + 移调，
+PC-NSF-HiFiGAN 默认 `--ext-method nsf`，seed-vc 可选。**默认走 MILP：`--select-method cov_anchor`**
+—— 锚点与 ext 合并成一个 (段,移调) 指派问题，"一段素材只用一次"是硬约束，覆盖最大化 +
+干净锚点 ≥`--anchor-min-ratio 0.55`；跨 3 首歌 +0.0050 且 0 负，端到端绿色 +0.0079 (p=0.0002)。
+`--select-method greedy` 回到旧两阶段贪心（此时 `--ext-div-weight 3.0` 的源段复用惩罚与
+`--ext-exclude-anchor` 才有意义；MILP 下"不重复"已是硬约束）。`--ext-max-shift 8` 允许单段
+最大移调 8st，拼出 ≤`--max-sec` 的 `prompt_ext`（**默认 45s，原 29s**；跨歌 A/B 绿色 +0.0229 /
+白色毛衣 +0.0133，再加到 50s 是否退化取决于歌曲是否超出素材移调上限，见「prompt_ext 总长」
+一节）) → `svc`
 (SoulX, `--pitch-shift 0` 默认保留旋律；`12` 全曲高八度适配男→女；`auto` 按段自动对齐（男女对唱/跨音区）；
 `--max-seg-sec 28` 适配 16GB；`--cfg 0.5` 默认，上游 3.0 会放大原唱音色残留；
 `--knn-alpha 0.2` 默认开启，检索池用完整参考人声（`--knn-full-pool`，绕开 whisper 30s）；
@@ -992,8 +1231,10 @@ Worker 脚本在 `singing/w_*.py`，每个阶段用对应项目的 venv 跑。
   SIM 偏低，自动建议的变调数也偏高；要多补高音区，录更长的素材而不是靠变调。
   2026-08 补充：PC-NSF 移调可把素材池扩到 221-394Hz（SIM≥0.83），见
   「Reference material pitch extension」一节——`select`/`ext` 的素材池可以直接吃移调产物。
-- `--max-prompt` 默认 25s，扩展后 ≤29s（whisper 30s 硬顶）。pt_f0 参与 SVC 的 f0 conditioning，
-  不能只拼音频不拼 f0（`w_ext.py` 对扩展段重新提 RMVPE）。
+- `--max-prompt` 默认 25s（这是 `prompt.wav` 即锚点素材的上限），扩展后 ≤`--max-sec` **默认 45s**。
+  「whisper 30s 硬顶」只约束 `pt_content_feat` 且已由 `encode_long()` 绕开；`pt_mel` 无此限制。
+  真正的顶是 RoPE 4096（`llama.py:142`），45s+28s 段 = 3650 帧尚有余量，60s 会超。
+  pt_f0 参与 SVC 的 f0 conditioning，不能只拼音频不拼 f0（`w_ext.py` 对扩展段重新提 RMVPE）。
 
 ---
 

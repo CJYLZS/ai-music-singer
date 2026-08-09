@@ -147,8 +147,28 @@ class Cfg:
     semitone_shift: int | None = None
     ext_method: str = "nsf"
     anchor_min_ratio: float = 0.55
-    ext_max_shift: int = 5   # ext 单段最大移调半音（见 AGENTS.md「逐段扫点」）
+    ext_max_shift: int = 8   # ext 单段最大移调半音。原默认 5，2026-08 A/B 3首
+    # 结论：ms=8 在复用未饱和的歌上解锁新源段（1.37-1.41×→1.10×），在饱和的歌上
+    # 扩展高音格覆盖，3/3 全正（+0.003-0.007，p<0.01）。见 AGENTS.md「ext 移调上限扩展」。
     ext_div_weight: float = 3.0  # ext 源段复用惩罚（等价半音数），见 AGENTS.md「ext 多样性」
+    ext_exclude_anchor: bool = False  # ext 是否排除锚点已含的源段。2026-08 跨 3 首歌：
+    # 绿色(重叠62%) +0.0090 p=0.0002，但冬眠(39%) -0.0004、爱笑的眼睛(33%) +0.0017 都在
+    # 噪声底内，3 首均值仅 +0.0034 —— 不够格当默认。重叠比例高(>~60%)的歌可手动开
+    # `--ext-exclude-anchor`。见 AGENTS.md「ext 与锚点的段落重复」
+    # 注意：select_method != greedy 时本项无意义（MILP 把"一段只用一次"做成硬约束）。
+    select_method: str = "greedy"  # 选段求解器。cov_anchor(MILP) 曾短暂做过默认，已撤回：
+    # 它把「选锚点」与「填频段缺口」合并成一个 (段,移调) 指派问题，"一段素材只用一次"是
+    # 硬约束，在 3 首歌的 90s clip 上 +0.0050 且 0 负 —— 但全曲 10 首配对复现后均值只有
+    # +0.0012：5 首显著正（+0.005…+0.013）、5 首显著负（−0.003…−0.008），效应按歌分向
+    # （corr(gain, song_med) = +0.516，高音歌 MILP 胜、低音歌 greedy 胜）。ext 耗时
+    # 12.9s -> 253.6s（19.7×）。均值上零收益、一半歌还变差，故回退；若歌曲音域明显高于
+    # 参考（song_med 差 >~4st）可对单首歌试 cov_anchor。见 AGENTS.md 同名条目。
+    # 仍保留为可选项：MILP 的"不重复"硬约束本身是免费的（收紧 LP 松弛，反而更快收敛）。
+    cov_target: float = 0.90  # 仅 select_method=satisfice 时生效
+    max_sec: float = 45.0   # prompt_ext 总长上限。原默认 29，2026-08 跨歌 A/B 改为 45：
+    # 绿色/白色毛衣在 45s 均比 29s 增益 +0.013…+0.023；爱笑的眼睛 29-45s 平坦（错配
+    # 太大导致 prompt 非瓶颈）。45s 是素材 prompt.wav 普遍在 ~25s 时的甜点 (25/0.55)。
+    # 见 AGENTS.md「prompt 长度与素材上限的关系」。
     max_seg_sec: float = 28.0
     num_overlaps: int = 1   # 每段往前取几个活性格作上下文（见 AGENTS.md「num_overlaps」）
     knn_alpha: float = 0.2   # kNN 内容特征替换强度（0.1-0.2 是 CER/SIM 双赢区，≥0.3 起吐字退化）
@@ -234,6 +254,11 @@ class Cfg:
     @property
     def log_file(self) -> str:
         return self.p("sing.log")
+
+    @property
+    def ext_shifted_dir(self) -> str:
+        """ext 阶段的移调段输出目录（seedvc/ 或其他）。"""
+        return self.p("seedvc")  # w_ext.py 写死这个名字
 
 
 def preflight(cfg: Cfg) -> None:
@@ -364,7 +389,11 @@ def stage_ext(cfg: Cfg) -> None:
          "--anchor-min-ratio", str(cfg.anchor_min_ratio),
          "--max-shift", str(cfg.ext_max_shift),
          "--div-weight", str(cfg.ext_div_weight),
-         "--max-sec", "29", "--device", cfg.device], stage="ext")
+         "--max-sec", str(cfg.max_sec),
+         ("--exclude-anchor-segs" if cfg.ext_exclude_anchor else "--no-exclude-anchor-segs"),
+         "--select-method", cfg.select_method,
+         "--cov-target", str(cfg.cov_target),
+         "--device", cfg.device], stage="ext")
 
 
 def _svc_cmd(cfg: Cfg, svc_dir: str, seed: int | None) -> list[str]:
@@ -532,9 +561,30 @@ def main() -> None:
                     help="ext 源段复用惩罚，折算为等价半音数（默认 3）。0=旧行为。"
                          "只按移调量最小排序会把素材锁在 med 最高的少数段上（实测 143 段池"
                          "只用到 13 个源段，复用 2.2x）；调大用更大移调换更多不同源段")
-    ap.add_argument("--ext-max-shift", type=int, default=5,
-                    help="ext 阶段单段最大移调半音数（默认 5）。素材 med 上限不足、"
-                         "高音格补不满时可提到 6")
+    ap.add_argument("--ext-max-shift", type=int, default=8,
+                    help="ext 阶段单段最大移调半音数（默认 8）。2026-08 A/B 3 首歌：ms=8 vs ms=5 全正 "
+                         "(+0.003-0.007, p<0.01)，机制是解锁低音段参与高音格竞争，唯一源段 17→21，"
+                         "复用 1.37×→1.10×。见 AGENTS.md「ext 移调上限扩展」")
+    ap.add_argument("--select-method", default="greedy",
+                    choices=["cov_anchor", "cov_only", "satisfice", "greedy"],
+                    help="prompt 选段求解器（默认 greedy = 两阶段贪心）。cov_anchor/cov_only/"
+                         "satisfice 走 MILP：锚点与 ext 合并求解，'一段素材只用一次' 为硬约束。"
+                         "MILP 曾做过默认后撤回：3 首调参歌的 clip 上 +0.0050(0负)，但全曲 10 "
+                         "首仅 +0.0012：5 首显著正、5 首显著负（效应按歌分向，高音歌 MILP 胜），"
+                         "且 ext 耗时 19.7×。见 singing/ext_milp.py 与 AGENTS.md")
+    ap.add_argument("--cov-target", type=float, default=0.90,
+                    help="--select-method satisfice 的覆盖率目标（默认 0.90）")
+    ap.add_argument("--ext-exclude-anchor", dest="ext_exclude_anchor",
+                    action="store_true", default=False,
+                    help="ext 不复用锚点(prompt.wav)已含的源段，避免同一素材在 prompt_ext 里"
+                         "以原声+移调版出现两次。默认关：跨 3 首歌只有重叠比例最高的绿色(62%%)"
+                         "显著受益 (+0.0090, p=0.0002)，冬眠(39%%) -0.0004 与爱笑的眼睛(33%%) "
+                         "+0.0017 都在噪声底内。corr(重叠%%, gain)=+0.91 但 n=3 不足以定标")
+    ap.add_argument("--max-sec", type=float, default=45.0,
+                    help="prompt_ext 总长上限（默认 45，原 29）。2026-08 跨歌 A/B：绿色 +0.0229、"
+                         "白色毛衣 +0.0133（均 3/3 seed 一致）；再加到 50s 则视素材而定 —— 歌曲若有 "
+                         "帧超出「素材最高段 med × 2^(max_shift/12)」，高音格填不满会逼贪心堆 +8st，"
+                         "反而退化（绿色 45→50 为 −0.0113）。见 AGENTS.md「prompt 长度」")
     ap.add_argument("--max-seg-sec", type=float, default=28.0,
                     help="SVC 单段最长秒数（默认 28，16GB 卡无压力；上游默认 30，6GB 卡需降到 20）")
     ap.add_argument("--num-overlaps", type=int, default=1,
@@ -596,6 +646,10 @@ def main() -> None:
               anchor_min_ratio=args.anchor_min_ratio,
               ext_max_shift=args.ext_max_shift,
               ext_div_weight=args.ext_div_weight,
+              ext_exclude_anchor=args.ext_exclude_anchor,
+              select_method=args.select_method,
+              cov_target=args.cov_target,
+              max_sec=args.max_sec,
               max_seg_sec=args.max_seg_sec, num_overlaps=args.num_overlaps,
               knn_alpha=args.knn_alpha, knn_k=args.knn_k,
               knn_full_pool=args.knn_full_pool,

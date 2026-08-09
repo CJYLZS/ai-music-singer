@@ -95,6 +95,13 @@ def main():
                   device=args.device, disable_update=True, disable_pbar=True)
 
     def asr(path: str) -> str:
+        # 种子必须在**每次** generate 前重置，不能只在进程启动时设一次。
+        # FunASR 的 VAD 会消耗全局 RNG，所以顺序调用时第 k 个文件拿到的是被前
+        # k-1 次调用推进过的 RNG 状态 —— 同一文件的转写因此取决于它在 --gen
+        # 列表里的位置。实测同一文件连续三次: 58/55/54 字（不重置）对比
+        # 58/58/58 字（每次重置）。这个偏差足以让一个臂的 CER 凭排序变化 0.4+。
+        _torch.manual_seed(0); _torch.cuda.manual_seed_all(0)
+        _np.random.seed(0); random.seed(0)
         r = m.generate(input=path, batch_size_s=300)
         return norm("".join(seg.get("text", "") for seg in r))
 

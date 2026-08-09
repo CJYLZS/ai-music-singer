@@ -46,8 +46,10 @@ NSF_CONFIG = ROOT / "tools" / "pcnsf_hifigan" / "pc_nsf_hifigan_44.1k_hop512_128
 NSF_CKPT = ROOT / "tools" / "pcnsf_hifigan" / "pc_nsf_hifigan_44.1k_hop512_128bin_2025.02" / "model.ckpt"
 
 RMVPE = SOULX / "pretrained_models" / "SoulX-Singer-Preprocess" / "rmvpe" / "rmvpe.pt"
-MAX_SHIFT_DEFAULT = 5  # +10 半音退化到 DSP 水平（AGENTS.md 实测）
+MAX_SHIFT_DEFAULT = 8  # 2026-08 A/B 3首全正（见 AGENTS.md）
 DIV_WEIGHT_DEFAULT = 0.0  # 源段复用惩罚（等价半音数）；0 = 旧行为。
+EXCLUDE_ANCHOR_SEGS_DEFAULT = False  # ext 是否排除锚点已含段；跨 3 首歌均值仅 +0.0034
+# （只有重叠 62% 的绿色显著），不够格当默认，与 sing.py 的 Cfg.ext_exclude_anchor 一致。
 # 注意：这里保持 0.0 只为「不带 --div-weight 直接跑本脚本时复现旧行为」；
 # 实际默认由 sing.py 的 Cfg.ext_div_weight = 3.0 下发（A/B 3 首全正，见 AGENTS.md）。
 FADE_SEC = 0.01
@@ -161,13 +163,39 @@ def main() -> None:
                     help="原始干净音频占 prompt_ext 的份额上限（cap，不是下限）: "
                          "锚点超过 max_sec×ratio 即裁剪，余量全给移调段")
     ap.add_argument("--max-shift", type=int, default=MAX_SHIFT_DEFAULT,
-                    help=f"单段最大移调半音数（默认 {MAX_SHIFT_DEFAULT}）。AGENTS.md 的逐段扫点显示"
-                         "-4..+6 在均值上都过 0.85，但 worst>=0.85 只到 +4；ext 是池化平均使用，"
-                         "可放到 6")
+                    help=f"单段最大移调半音数（默认 {MAX_SHIFT_DEFAULT}）。逐段保真度扫点显示 "
+                         "-4..+6 均值都过 0.85、worst>=0.85 只到 +4，但 ext 是池化平均使用，"
+                         "所以单段保真度不是判据：2026-08 A/B 三首歌 ms=8 全胜 ms=5"
+                         "（+0.003-0.007, p<0.01），收益来自解锁低音段参与高音格竞争"
+                         "（唯一源段 17->21，复用 1.41x->1.10x），不是移调本身变好")
     ap.add_argument("--div-weight", type=float, default=DIV_WEIGHT_DEFAULT,
                     help=f"源段复用惩罚，折算为等价半音数（默认 {DIV_WEIGHT_DEFAULT}）。"
                          "0=旧行为（纯按移调量最小选，会把素材锁在 med 最高的少数段上）；"
                          "越大越倾向用更大移调换更多不同源段（音素多样性）")
+    ap.add_argument("--exclude-anchor-segs", action="store_true",
+                    default=EXCLUDE_ANCHOR_SEGS_DEFAULT,
+                    help="ext 不复用锚点(prompt.wav)里已有的源段（默认关，见下）。这类段会让同一素材"
+                         "在 prompt_ext 里出现两次（原声 + 移调版），whisper 看到的内容多样性下降。"
+                         "默认关的原因：跨 3 首歌只有重叠比例最高的绿色(62%%)显著受益 "
+                         "(22/36 个 ext 段属于此类，+0.0090, 3/3 seed, p=0.0002)，冬眠(39%%) "
+                         "-0.0004 与爱笑的眼睛(33%%) +0.0017 都在 ±0.004 噪声底内，均值仅 "
+                         "+0.0034。重叠 >~60%% 的歌可手动开。代价是 458Hz+ 高音格从 4.24s 掉到 "
+                         "0.93s、8+st 桶 -0.0042，但该桶只占 16%% 窗口且补回高音并不能修复它 "
+                         "(已验证软惩罚分层版：高音填充恢复到 4.34-4.62s，8+ 桶仍是 -0.004，"
+                         "而 0-6st 收益从 +0.011~+0.014 塌到 +0.001~+0.003)。见 AGENTS.md")
+    ap.add_argument("--no-exclude-anchor-segs", dest="exclude_anchor_segs",
+                    action="store_false", help="恢复旧行为（允许 ext 复用锚点段）")
+    ap.add_argument("--select-method", default="greedy",
+                    choices=["cov_anchor", "cov_only", "satisfice", "greedy"],
+                    help="选段求解器（默认 greedy = 两阶段贪心：锚点+填缺口）。其余三个走 "
+                         "MILP，把锚点与 ext 合并成一个 (段,移调) 指派问题、'一段素材只用一次' "
+                         "为硬约束；cov_anchor = 覆盖最大化 + 干净锚点占比下限，cov_only 无该"
+                         "下限，satisfice 只要求覆盖达 --cov-target。MILP 曾做过默认后撤回："
+                         "3 首调参歌 clip 上 +0.0050(0负)，但全曲 10 首均值仅 +0.0012 —— "
+                         "5 首显著正、5 首显著负（效应按歌分向，机制未知），且耗时 19.7×。"
+                         "详见 singing/ext_milp.py")
+    ap.add_argument("--cov-target", type=float, default=0.90,
+                    help="--select-method satisfice 时的覆盖率目标（默认 0.90）")
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
     max_shift = args.max_shift
@@ -194,6 +222,26 @@ def main() -> None:
     anchor, sr_out = librosa.load(prompt_wav, sr=None, mono=True)
     anchor_f0 = np.load(prompt_f0_path)
     anchor_dur = len(anchor) / sr_out
+
+    # ---- MILP 路径：锚点与 ext 合并求解，直接产出完整 plan ----
+    # 与下面的贪心路径互斥。贪心把「选锚点」和「填缺口」分两阶段各自贪心，同一源段
+    # 可被两阶段各用一次；MILP 把两者合成一个 (段, 移调) 指派问题，"不重复"是硬约束。
+    # 详见 singing/ext_milp.py 的模块 docstring（含跨歌 A/B 与被否证的替代方案）。
+    if args.select_method != "greedy":
+        import ext_milp
+        milp_sel = ext_milp.solve(
+            list(cands.values()), np.load(args.target_f0), max_sec=args.max_sec,
+            anchor_ratio=args.anchor_min_ratio, max_shift=max_shift,
+            method=args.select_method, cov_target=args.cov_target)
+        # plan 里 shift=0 的段就是干净锚点素材，与移调段同走一条渲染路径
+        # （0st 组在下面会跳过 vocoder），所以这里不再单独拼 anchor。
+        plan = [(cands[i], sh, 0) for i, sh, _, _ in milp_sel]
+        anchor = np.zeros(0, dtype=np.float32)
+        anchor_f0 = np.zeros(0, dtype=np.float64)
+        anchor_dur = 0.0
+        used_sec = sum(d for _, _, d, _ in milp_sel)
+        return _render(args, plan, anchor, anchor_f0, anchor_dur, used_sec,
+                       sr_out, F0Extractor, librosa, sf)
 
     # ---- 1. 原始 prompt 作锚点，必要时裁剪到 anchor_min_ratio ----
     anchor_cap = args.max_sec * args.anchor_min_ratio
@@ -234,6 +282,21 @@ def main() -> None:
     # ---- 3. 为每个缺口格挑"移调量最小就能到达"的候选段 ----
     # 候选池 = 全部通过质量过滤的段（不限于 select 选中的 20 段）
     pool = list(cands.values())
+
+    # 锚点里实际保留下来的段（select 按时间顺序拼接，锚点裁剪只截前 anchor_dur 秒）。
+    # 只有这些段才会在 prompt_ext 里"原声 + 移调版"各出现一次，构成真正的重复。
+    anchor_idx: set[int] = set()
+    _t = 0.0
+    for _s in sel:
+        if _t >= anchor_dur:
+            break
+        anchor_idx.add(int(_s["idx"]))
+        _t += float(_s["dur"])
+    if args.exclude_anchor_segs:
+        before = len(pool)
+        pool = [c for c in pool if c["idx"] not in anchor_idx]
+        print(f"  排除锚点已含的 {before - len(pool)} 个源段（避免原声+移调版重复），"
+              f"候选池 {before} -> {len(pool)}")
     plan: list[tuple[dict, int, int]] = []   # (cand, shift, grid_idx)
     used_copies: dict[tuple[int, int], bool] = {}
     used_src: dict[int, int] = {}      # 源段 idx -> 已用次数（多样性惩罚用）
@@ -274,7 +337,9 @@ def main() -> None:
                     continue
                 if used_sec + c["dur"] > budget:
                     continue
-                # 排序键: 先要"落进本格"的，再按 移调量+复用惩罚、离格中心近
+                # 排序键: 先要"落进本格"的，再按 移调量+复用惩罚+锚点重复惩罚、离格中心近。
+                # 锚点惩罚只在同格内比较时起作用（ins 优先级更高），所以高音格里
+                # 只有锚点段能 inside 时它仍会被选中 —— 这正是分层的关键。
                 key = (ins, ash + args.div_weight * used_src.get(c["idx"], 0), dist)
                 if best_key is None or key < best_key:
                     best_key, best_i = key, i
@@ -289,6 +354,17 @@ def main() -> None:
         if filled > 0:
             print(f"  格 {g_lo:.0f}-{g_hi:.0f}Hz: 需 {need_sec[gi]:.2f}s 实补 {filled:.2f}s")
 
+    return _render(args, plan, anchor, anchor_f0, anchor_dur, used_sec,
+                   sr_out, F0Extractor, librosa, sf)
+
+
+def _render(args, plan, anchor, anchor_f0, anchor_dur, used_sec,
+            sr_out, F0Extractor, librosa, sf) -> None:
+    """把 plan（[(cand, shift, grid_idx)]）渲染成 prompt_ext.wav / _f0.npy。
+
+    贪心路径与 MILP 路径共用：区别只在 plan 怎么来的，以及 MILP 路径把 0st 素材
+    也放进 plan（anchor 传空数组），因此 0st 组在下面同样跳过 vocoder。
+    """
     if not plan:
         print("  无可用移调段，prompt_ext = 原始 prompt")
         sf.write(args.out_wav, anchor, sr_out)
@@ -397,9 +473,14 @@ def main() -> None:
     np.save(args.out_f0, f0)
     v = f0[f0 > 0]
     ext_dur = sum(len(s) for s in ext_parts) / sr_out
-    print(f"\n-> {args.out_wav} ({len(audio) / sr_out:.2f}s, {sr_out}Hz)")
-    print(f"   锚点(干净) {anchor_dur:.2f}s ({anchor_dur / (len(audio) / sr_out) * 100:.0f}%)"
-          f" + 移调段 {ext_dur:.2f}s ({len(ext_parts)} 段)")
+    total = len(audio) / sr_out
+    # MILP 路径下 0st 素材也走 plan（anchor 为空），所以"干净时长"要把 plan 里
+    # shift=0 的段算进来，否则会误报成 "锚点 0.00s (0%)"。
+    clean = anchor_dur + sum(c["dur"] for c, sh, _ in plan if sh == 0)
+    print(f"\n-> {args.out_wav} ({total:.2f}s, {sr_out}Hz)")
+    print(f"   干净(未过 vocoder) {clean:.2f}s ({clean / total * 100:.0f}%)"
+          f" + 移调段 {ext_dur - (clean - anchor_dur):.2f}s"
+          f"  [共 {len(ext_parts)} 段渲染 + 锚点 {anchor_dur:.2f}s]")
     print(f"-> {args.out_f0} ({len(f0)} frames, med {np.median(v):.1f}Hz, "
           f"p90 {np.percentile(v, 90):.1f}Hz)")
 
