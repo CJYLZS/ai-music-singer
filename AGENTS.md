@@ -70,12 +70,18 @@ voice/
 │                     .venv = torch 2.6+cu124. 结论是否定的，见「共振峰」一节
 ├── tools/stems4.py   4-stem separation (drums/bass/other/vocals) via BS-RoFormer 4stems_ft.
 │                     Uses GPT-SoVITS venv + uvr5 weights; see "Separation notes".
+├── a25rig/           Anime2.5DRig (MIT) fork + 离线渲染补丁: PSD → 逐帧 PNG（口型吃
+│                     make_cues.py 时间轴）. driver/ 是 WSL 内无头 Chrome 驱动.
+│                     入口 ./render.sh（必须用它，见「Anime2.5DRig 离线渲染」一节）
 ├── echomimic3/       EchoMimicV3 (AAAI'26, Apache-2.0): 单图 + 音频 → 说话/唱歌视频.
 │                     .venv = torch 2.6+cu124. 1.3B params, flash-pro 8-step, ≤768×768.
 │                     可吃 GPT-SoVITS 的 TTS 输出或 sing.py 的 SVC 干声。见「EchoMimicV3」一节
+├── listen_lipsync/   口型流水线脚本: make_cues.py（歌词→口型时间轴）、
+│                     split_visemes.py（九宫格→9 张 sprite）。用 GPT-SoVITS venv
 ├── data/             Shared audio. voices/ = speaker source material; songs/ = songs, stems, SVC output
 ├── logs/             GPT-SoVITS training features + checkpoints
 ├── AGENTS.md         this file
+├── README.md         MV 出片流程（sing.py 产物 → cues → beats → a25rig 渲染），操作向
 └── eval_sim.py       speaker-similarity scoring (pitch-bucketed), see "Measuring similarity"
 ```
 
@@ -1400,6 +1406,124 @@ mmap 则按页逐步载入，没有那个尖峰，所以 GPU 能早约 3 倍开�
   会导致完全没有口型）、**太干净的 TTS 音频反而不同步**（加一点底噪才对上）、
   **唱歌音频要先分离人声**（LongCat 官方 pipeline 内置 `Kim_Vocal_2.onnx` 做这步，
   说明伴奏会干扰音频编码器）。本工作区 `sing.py` 的 SVC 干声天然满足第三条。
+
+---
+
+# Anime2.5DRig 离线渲染（`a25rig/`）
+
+PSD 立绘 + `make_cues.py` 口型时间轴 → MV。上游是交互式浏览器工具，本 fork 加的是
+**确定性离线渲染**：无头 Chrome 里跑同一套 rig，固定步长推进，直接出视频。
+**详细文档在 `a25rig/RENDER.md`**（含全部旗标、实测数字、物理推导），这里只记
+工作区级别的坑。
+
+- **入口必须是 `./render.sh`**，不能直接 `node driver/render.mjs`。wrapper 负责设
+  `LD_LIBRARY_PATH`：puppeteer 自带的 Chrome 需要 libnss3/libnspr4，本机无 root，
+  这些 `.so` 是 `apt-get download` + `dpkg-deb -x` 解到 `driver/nsslib/` 的。
+  直接跑 node 会报 `libnss3.so: cannot open shared object file`。
+- **puppeteer 脚本必须放在 `driver/`**（`node_modules` 所在处），否则
+  `ERR_MODULE_NOT_FOUND: Cannot find package 'puppeteer'`。
+- **GPU 可用，但必须显式点名适配器**，否则选到 AMD 核显（比软渲染更慢）。
+  Vulkan 必然回落 SwiftShader（`/usr/share/vulkan/icd.d/` 无 `nvidia_icd.json`）。
+  实测 17.3 → 38.3 fps：
+  ```bash
+  MESA_LOADER_DRIVER_OVERRIDE=d3d12 GALLIUM_DRIVER=d3d12 MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA \
+  A25_GL_ARGS="--use-gl=angle --use-angle=gl --ignore-gpu-blocklist" ./render.sh ...
+  ```
+  **`h264_nvenc` 反而更慢**（32.8 vs 38.3 fps）—— 瓶颈是像素读取 + JPEG 编码，不是编码器。
+- **雨是两个互不相干的层，不要试图用一个函数生成。** `--rain-glass` 是贴在玻璃上的水
+  （raindrop-fx，MIT，画在角色**后面**），`--streaks` 是落雨丝（显式粒子，画在角色
+  **前面**，因为真实雨落在主体与镜头之间）。早先自研的 Heartfelt 移植把两者塞进同一个
+  函数，导致密度与长度无法独立设定，**已删除**（连带 `--rain-bg` 及 14 个 `--rain-*`
+  旗标）。参考片按帧间持久性拆分是 **94/MP 静止水痕 + 10/MP 真正在落**；单帧形状区分不了
+  两者（都是宽 ~6px、纵横比 4-5），我曾把 104/MP 全当雨丝，放大了约 10 倍。
+- **玻璃的"模糊"与"水珠划过变清晰"是同一个机制**：玻璃上有一层逐帧累积的雾，水珠把雾
+  **擦掉**（`[Zero, OneMinusSrcAlpha]`，即雾 alpha `*= 1-dropAlpha`），不是把画面变锐。
+  水痕露出的正是 `--glass-blur` 那一层，所以它单独决定玻璃有多透。实测底图锐度占原图：
+  0 → 100%、1 → 2.7%、2 → 0.8%、3 → 0.4%。**旧默认 3 时水痕只有周围的 0.5×（根本没变清晰）**，
+  故默认已改 **0**（水痕/周围 8.8×）。`--glass-mist-time` 同时决定雾的上限与水痕保持清晰
+  多久（恢复就是那个逐帧累加本身）。raindrop-fx 表达不了 0（`upSample(0)` 不写输出 → 黑屏），
+  由 `setRainGlass` 包装 `blurBackground` 绕过。
+- **落雨丝的长度和倾斜都不是自由参数。** 长度 = 速度 × 曝光时间（`--streak-shutter`
+  度数，180° @30fps = 1/60s，Garg & Nayar SIGGRAPH'06）；倾斜 = `atan(U(t)/v_t)`，
+  `U(t)` 是**全帧共享的单一风速**（多秒周期谐波叠加），`v_t` 是各滴终端速度
+  （Gunn-Kinzer 1949）。曾按滴独立高斯抽样倾斜角，帧内 std 12.2°、范围 0.5-34.5°，
+  物理上不可能；且误把 Bringi 的 canting σ（**滴轴摆动**）当轨迹散布。修好后帧内
+  std 7.8°、相邻帧漂移 0.55°。
+- **合成必须在页面内做（canvas2d），不能用 ffmpeg overlay。** 角色 canvas 是预乘 alpha，
+  边缘亮度差：页面内 **−2.9** / ffmpeg overlay **−75.4** / `unpremultiply`+overlay **−49.4**。
+- **`CW`/`CH` 直接等于 PSD 尺寸，所有锚点/形变常数都在这套坐标里，不能改**；换比例必须
+  另加输出画布层（`--size` + `--char-scale/-x/-y/-anchor`）。
+- **`<video>` 背景必须支持 Range 请求（206）**，否则 `currentTime` 赋值永不完成，
+  **卡在第一帧且不报错**。
+- **未知旗标现在会 exit 2。** 之前 `arg()` 对没问过的参数一概忽略，所以拼错或用了已删的
+  旗标会静默渲染出黑背景并 exit 0。**但旗标的"取值"仍无校验，同一类坑低一层还在**：
+  `--char-x/--char-y` 是 0..1 归一化比例（`cy=y*h`，`index.html:1338`），传 `--char-y 60`
+  等于把角色推到画面下方 60 个画面高处，产出纯背景且 exit 0；`--char-anchor` 只认 `face`
+  （`:1340`），`bottom`/`top`/`centre` 全部静默退化成画布中心。
+- **`--size` 必须配背景**，否则 `renderFrame` 在 `index.html:1356` 抛
+  `Cannot read properties of undefined (reading 'getContext')` 且 0 帧产出 ——
+  合成画布 `_c2` 只在 `setBg()` 里创建，`setOutput()` 只建 `_oc`。纯色背景传 `--bg '#000'`。
+- **`--out`（PNG 序列）比 `--video` 慢 2.6×，不要用 `--out` 测性能。** 同一条 8s 命令
+  （1920×1080 + 玻璃 + 雨丝）只换输出方式：`--out` 25.3s / 9.5 fps / 105ms 每帧，
+  `--video` 9.6s / 25.0 fps / 40ms。`--out` 走 PNG 编码 → base64 → `writeFileSync`
+  （`render.mjs:401-408`），`--video` 直接 JPEG 管进 ffmpeg。两个反直觉的后果：
+  (1) **PNG 耗时取决于画面复杂度而非像素数** —— 1280²(63.8ms) 比 1920×1080(44.2ms) 更慢，
+  因为方画幅被角色细节填满而宽画幅有大片平坦区；水珠/雨丝的噪声同理，玻璃在 PNG 路径
+  上 +61ms 而在 video 路径上只 +20ms。(2) **在 `--out` 下观察到的变慢与渲染器无关** ——
+  本轮据此误判 `--cues` 造成 4× 变慢，实际全是 PNG 路径。`--out` 只在需要逐帧像素分析时
+  用，用完即删：8 组 24s/1080p 实验占了 **21 GB**。另外要读驱动打印的 fps 而不是 wall
+  时间，进程启动（Chrome + PSD 加载 + 玻璃 warmup）有固定 4-6s，短测试里它占主导。
+- **`--cues` 本身零开销**（配对 A/B，8s，其余参数相同）：27.90s / 202092 KB peak RSS
+  无 cues vs 28.34s / 201904 KB 有 cues，即 +1.6% 时间、−0.1% 内存，都在噪声内。
+  内存大头是 `--rain-glass`（1920×1080 + `--glass-droplets/limit 900` + 多级模糊金字塔
+  ≈ 2.4 GB Chrome+node）。
+- **传了 `--cues` 但时间轴有空洞，照样落到随机嘴 —— 这是更隐蔽的一层，已修。** 上一条说的是
+  完全不传 cues；真正会在每首歌上发生的是 cues 存在但**有洞**：intro、间奏、乐句休止处
+  `make_cues.py` 本来就不产 cue，`cueMouth()` 未命中返回 `null`，同一个 `auto.talk` 接手。
+  实测一份 100s 的 cues **22.6% 时长完全没有 cue**（intro 19.0s + 间奏 3.3s + 3 个碎片），
+  那 22.6% 全程由随机数驱动。已改成按 `OFF.cues` 分支：有时间轴就以它为权威，空洞即闭嘴，
+  `--rest-form`（默认 0.35）给一点嘴角上扬（0 是平嘴，19s intro 里显得阴沉）。
+  显式 `X` 走同一姿态，否则表情会取决于 make_cues 是吐了 X 还是留了洞。
+- **验证「嘴动没动」不能用口腔色块探针，必须用帧间差分 + 面部对照。** `auto.talk` 驱动的是
+  单图**形变**而非换贴图，所以色块探针对两个臂都报 ~0，bug 能完整躲过这道检查（本轮就是
+  这样差点判成已修好）。正确做法是对嘴部区域做相邻帧差分，并与脸颊/额头对照：合格成片里
+  嘴区 **0.324** < 脸颊 1.253 < 额头 1.322，且嘴与脸颊正相关 **+0.61** —— 这个相关性才是
+  「残留微动是 `auto.idle` 呼吸带动整张脸」而非「嘴在开合」的判据。
+- **口型只启用 A/B/C/E 四种（`make_cues.py` 侧收缩）。** 九宫格素材的 D(大开)/F(撅唇)/
+  G(唇齿)/H(长L) 在本立绘上很难用对，D 一出现就明显违和。40 个韵母全部映射到
+  C(开口)/E(微圆)/B(微开)，辅音只留 A(闭唇) 给 b/p/m；归并沿 Rhubarb 官方过渡链回退一步
+  （D→C、F→E、G→B、H→C），`push()` 里有 `FOLD` 兜底。依据是 Bristow《5 things that can go
+  wrong with animated lip sync》——口型过大是新手错误第一位，且 anime 常只用 open/shut
+  两型也没人抱怨。**注意 Rhubarb 的 H 是 long "L"（舌尖抬起），不是 ü**，我一度弄错。
+- **不传 `--cues` 时嘴部由随机生成器驱动，且完全静默。** `cueMouth()` 无时间轴返回 `null`，
+  代码落到 `else if(auto.talk)`（`index.html:915`）—— 上游"随便动动嘴"空闲动画，
+  而 `begin()` 从不关掉 `auto.talk`。720 帧对真实人声包络实测：随机臂 r=**−0.06**、
+  「在唱却闭嘴」**43.8%**；关掉 `auto.talk` 嘴部开合归零（0/720 帧张开，证明它是唯一
+  驱动源）；带 `--cues` 后 r=+0.22、「在唱却闭嘴」降到 **2.4%**。随机臂 r≈0 正是判据：
+  它不是"同步但被扰动"，而是与音频互相独立的随机过程。
+- **cues 质量不能用「与人声能量的相关」判断，要看字级对齐。** 带 cues 的 r=+0.22 是
+  **正常的**：口型编码**元音形状**（a 大张 / i 微开 / u 收圆），本就与音量无关 ——
+  「i」唱得再响嘴也是小的。判据应是「每字都有时间戳、无倒序、起点落在有声处」。
+  本轮两次静音阈值用错，先后把同一份对齐判成坏和好：用 RMS **p25** 报出「32.9% 字起点
+  落在静音里」，换绝对阈值（−40dB rel peak）后是 **0/79**，且起点后 100ms 内 79/79 有
+  能量 —— p25 在唱歌素材上圈的是 −15dB 的连音而非静音；镜像错误是「79% 静音帧嘴大张」，
+  那个 p20 阈值圈出的 144 帧里真静音只有 **4 帧**（其中 2 帧张嘴），连音时嘴本该张开。
+- **cues 与音频窗口严格绑定**：现成 `cues_hybrid.json` 对应某曲 66-86s，而视频用 60-84s，
+  差 6s 即不可用，必须对实际渲染的窗口重新对齐。**在 SVC 干声上对齐、混音版出片是可行的**
+  —— SoulX-SVC 保留源时间轴：`vocal.wav` 与 `sep2/lead.wav` 逐 10s 窗互相关最大位移
+  **10ms**（= 测量 hop，0.3 帧 @30fps）。有一个窗报 −10s 是伪值（间奏，RMS 0.000000，
+  相关无定义）—— 看到离群值先查该窗是否全静音。
+- **「角色不见了」不能靠像素统计判断。** 饱和度剖面、暖色掩码、分块帧差在带 `--rain-glass`
+  时全部失效 —— 雾和水珠主导了这些统计量，量到的是玻璃不是人。本轮据此连续得出两个错误
+  结论（先"水珠糊住了角色"，再"角色其实在画面里"）。**有效判据**：渲染两帧只改
+  `--char-scale`，若角色在画，差异必然达 80% 像素级别；最终观感必须由人目视确认。
+- 确定性靠三件事：固定步长 `1/fps`、播种 mulberry32、`vendor/raindrop-fx.js` 内 6 处
+  `Math.random()` 改走 `globalThis.__rdRandom`。另外玻璃 sim 要先 warmup 固定帧数
+  （水珠数 44→280 于 ~30s 饱和），否则开场是干玻璃、且帧 N 会依赖起始位置。
+  验收方法：同种子渲染两次比 md5。
+- **fork 已推到 `CJYLZS/Anime2.5DRig` 分支 `offline-render`**（remote 名 `fork`，
+  上游 `852wa/Anime2.5DRig` 为 `origin`）。`driver/node_modules/`、`driver/nsslib/`、
+  `out/`、`frames/` 在 `.gitignore` 里。
 
 ---
 

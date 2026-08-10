@@ -9,6 +9,11 @@
 /tools/hifiglot/
 /tools/vevo2/
 /echomimic3/
+# a25rig 是 CJYLZS/Anime2.5DRig 分支 offline-render，单独提交到它自己的 remote。
+# 不做 submodule：没有 .gitmodules 的裸 gitlink 对 clone 的人毫无用处，
+# 而加 submodule 会把 driver/node_modules 与 nsslib 的获取方式也绑进来。
+# 获取方式见 AGENTS.md「Anime2.5DRig 离线渲染」一节。
+/a25rig/
 
 # ---- 模型权重 ----
 /tools/pcnsf_hifigan/
@@ -30,6 +35,13 @@
 /batch_run*.log
 /check_batch_progress.sh
 /listen_*/
+
+# listen_lipsync/ 撞上了上面的 /listen_*/ 规则，但它不是试听目录 —— 口型流水线的
+# 脚本住在这里（README.md 的 ③ ④ 两步）。目录里另有 ~95MB 的 demo 视频和调试图，
+# 所以只白名单脚本本身，不放行整个目录。
+!/listen_lipsync/
+/listen_lipsync/*
+!/listen_lipsync/*.py
 
 # ---- Python ----
 __pycache__/

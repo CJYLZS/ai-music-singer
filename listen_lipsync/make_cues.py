@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""中文唱歌口型时间轴生成：强制对齐(字级起点) + pypinyin(韵母→口型)。
+
+为什么不用 Rhubarb：实测其 phonetic recognizer 在中文唱歌上元音区分力 AUC=0.555
+（≈随机，语音是 0.679），口型分布与歌词要求的 L1 距离 0.688 —— 歌词要 20% 大张口(D)
+它只给 3.2%。它的长静音检测是好的（>1s 段 100% 命中），但元音形状不可用。
+
+本方案：
+  1. FunASR fa-zh 强制对齐（iic/speech_timestamp_prediction-v1-16k-offline, 167MB）
+     用「音频 + 歌词文本」得到每个字的起点。实测 64 字对齐 64 个时间戳，
+     0/64 落在静音里，无重叠。
+  2. pypinyin 取韵母 → 口型（元音主导张口形状，这是 2D 动画既有做法）。
+
+关键修正（实测发现）：该对齐模型 47/64 个字的时长恰好被截在 240ms —— 它为**语音**
+设计，不建模唱歌拖腔。所以**只用起点，终点由下一个字的起点决定**，否则长音期间口型
+会提前回到默认，看起来像"唱一半就闭嘴"。
+
+用法（GPT-SoVITS venv）:
+  python make_cues.py --wav clip.wav --text lyrics.txt --out cues.json
+  # 不给 --text 则先用 ASR 转写当歌词（口型准确度略降，但无需人工准备歌词）
+"""
+import argparse
+import json
+import os
+import random
+import re
+import sys
+
+# 韵母 → 口型。**当前只启用 A / B / C / E 四种**。
+#
+# 为什么收缩到四种：D(大开)、F(撅唇)、G(唇齿)、H(长L) 这几张贴图在本立绘上很难用对，
+# 尤其 D 一出现就明显违和。四型方案的依据是动画业界的常规做法 ——
+# "An extreme is anime — whose limited animation style typically achieves lip sync
+#  with two mouth shapes — open and shut (millions of anime fans never complained)"
+# （Bristow, "5 things that can go wrong with animated lip sync"）。
+# 也就是说，口型数量少不是缺陷；用错口型才是。四型已经能覆盖开合与圆展两个维度。
+#
+# 四型的官方语义（Rhubarb README.adoc 原文，Preston Blair 名在括号里）：
+#   A (MBP)  Closed mouth for "P","B","M". 双唇闭合
+#   B (etc)  Slightly open mouth with clenched teeth. 多数辅音 + "EE" as in bee
+#   C (E)    Open mouth. "EH" as in men / "AE" as in bat；也是 →D 的中间形，
+#            所以用它承接原本给 D 的 a 类元音，语义上是连续的
+#   E (O)    Slightly rounded mouth. "AO" as in off / "ER" as in bird；
+#            官方强调「开口不得大于 C」，且是 →F 的中间形，
+#            所以用它承接原本给 F 的 u/ü 撅唇类，同样是沿官方过渡链回退一步
+#
+# 归并规则（每条都沿官方过渡链，不跨族）：
+#   D → C   （官方 C 是 B→D 的中间形）
+#   F → E   （官方 E 是 C/D→F 的中间形）
+#   G → B   （唇齿收进微开）
+#   H → C   （官方 H 开口介于 C 与 D 之间，取 C）
+#   X       仍用于静音（闭嘴），与 A 共用同一张闭嘴图
+#
+# 只取**韵腹**（主元音）：口型由开口最大的那个元音主导，韵尾 -n/-ng 不改变唇形，
+# 介音 i-/u-/ü- 只在起始瞬间存在。
+VOWEL_SHAPE = {
+    # ---- C: 开口档。承接 a 系全部（含原本给 D 的纯 a）与 e 系 ----
+    "a": "C", "ia": "C", "ua": "C",           # 原 D，归并到 C
+    "ai": "C", "uai": "C", "ao": "C", "iao": "C",
+    "an": "C", "uan": "C", "ang": "C", "iang": "C", "uang": "C",
+    "ian": "C", "van": "C",
+    "e": "C", "ie": "C", "ei": "C", "en": "C", "eng": "C",
+    "ve": "C",
+    # ---- B: 官方 "EE as in bee"，i 类高前元音 ----
+    "i": "B", "in": "B", "ing": "B",
+    # ---- E: 微圆唇。o 系 + 原本给 F 的 u/ü 撅唇类 ----
+    "er": "E",
+    "o": "E", "io": "E", "ou": "E", "iou": "E", "iu": "E",
+    "uo": "E", "ong": "E", "iong": "E",
+    "ui": "E", "uei": "E",
+    "un": "E", "uen": "E", "ueng": "E",
+    "u": "E",                                  # 原 F，归并到 E
+    "v": "E", "vn": "E",                       # ü/ün 原 F，归并到 E
+}
+
+# 声母 → 字首过渡口型。b/p/m 必须先闭唇（这是唯一不能省的辅音口型，
+# 官方与多篇动画教程都强调 M/B/P 要在发声前 1-2 帧闭合）。
+# f 原本用 G(唇齿)，四型方案下归并到 B(微开)。
+INITIAL_SHAPE = {"b": "A", "p": "A", "m": "A", "f": "B"}
+
+# 拖腔衰减：沿官方过渡链回退一步，四型内部闭合。
+DECAY_SHAPE = {
+    "C": "C",   # 开口档是中性，保持（早先 C→B 曾让 B 占到 57%）
+    "B": "B",   # 已是最小展唇
+    "E": "E",   # 四型下 E 已是最圆最小，不再往 F 走
+    "A": "A", "X": "X",
+}
+# 短音（VOCAL 的 Ma）降档表。四型下 C 已是最大开口，且它同时承载 a 与 e 两类，
+# 再压会丢失元音辨识度，所以留空 —— 开口过大的问题已由 D→C 的归并解决。
+SHORT_SHAPE = {}
+
+# 允许输出的口型集合。渲染端缺图会按 VIS.fallback 退化，但这里直接不产出，
+# 保证 cues 文件本身就只含这四型（外加静音 X）。
+ENABLED_SHAPES = set("ABCEX")
+
+
+def load_pinyin():
+    from pypinyin import Style, pinyin
+    return pinyin, Style
+
+
+def shape_of(ch, pinyin, Style):
+    # strict=True 才能拿到《汉语拼音方案》的真实韵母：strict=False 会把 yu/ju/qu/xu 的
+    # ü 按书写形式给成 "u"，于是「与/居/去/需」全部错判成强圆唇的 u 口型（F）而不是 ü（H）。
+    # 同理 strict=True 下 yi→i、wu→u、yuan→üan，介音归属也正确。
+    try:
+        fin = pinyin(ch, style=Style.FINALS, strict=True, errors="ignore")
+        ini = pinyin(ch, style=Style.INITIALS, strict=True, errors="ignore")
+    except Exception:
+        return "C", ""
+    f = (fin[0][0] if fin and fin[0] else "").replace("ü", "v").replace("ū", "v")
+    i = (ini[0][0] if ini and ini[0] else "").lower()
+    s = VOWEL_SHAPE.get(f) or VOWEL_SHAPE.get(f[-2:]) or VOWEL_SHAPE.get(f[-1:]) or "C"
+    return s, i
+
+
+def norm_text(s):
+    """只保留汉字（对齐模型按字建模，标点/空白会打乱字数对应）。"""
+    return "".join(re.findall(r"[\u4e00-\u9fff]", s))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--wav", required=True, help="16k 单声道 wav（唱歌干声）")
+    ap.add_argument("--text", help="歌词文件；不给则用 ASR 转写")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--closure-sec", type=float, default=0.06,
+                    help="b/p/m/f 字首闭合时长")
+    ap.add_argument("--silence-gap", type=float, default=0.30,
+                    help="字间隔超过此值判为乐句停顿，插入闭嘴 X")
+    ap.add_argument("--hold-to-next", action="store_true", default=True,
+                    help="口型保持到下一个字起点（补偿对齐模型 240ms 时长上限）")
+    ap.add_argument("--gate-db", type=float, default=-40.0,
+                    help="静音门限（相对峰值 dB）。闭嘴只发生在真正无声处，"
+                         "而不是按字间隔时长猜——见下方 build_timeline 注释")
+    ap.add_argument("--no-energy-gate", action="store_true",
+                    help="退回旧的按 --silence-gap 时长判静音（不推荐，唱歌上不成立）")
+    ap.add_argument("--max-hold-sil", type=float, default=0.35,
+                    help="hold 到下一字时，尾部允许夹带的连续静音上限（秒）。"
+                         "is_voiced 是「任意一帧过门限」，混响尾巴或伴奏泄漏擦过门限就会"
+                         "把整段停顿判成拖腔，嘴僵在半开；超出则回退到该静音起点")
+    ap.add_argument("--melisma-sec", type=float, default=0.45,
+                    help="超过此时长的字视为拖腔，按「枣核型」拆成峰值+衰减两段；0=关闭。"
+                         "唱歌时 17/27 个字超过 0.8s，不拆则口型长时间定格")
+    ap.add_argument("--no-decay", action="store_true",
+                    help="拖腔不做衰减降档（保持峰值口型到底）")
+    # VOCAL (SIGGRAPH Asia'22) 的 Melodic accent：唱歌时元音承载旋律、辅音只管节奏，
+    # Ma 越高则辅音越弱化、相邻元音互相融合、嘴保持半开。
+    # 这里用它控制「短元音不给满开口」——论文指出语音模型用于唱歌的典型失败正是
+    # 短元音 over-articulate（为每个元音机械地全开全闭下巴）。
+    ap.add_argument("--melodic-accent", type=float, default=0.6,
+                    help="Ma∈[0,1]：0=按说话方式逐字清晰发音，1=元音充分融合、"
+                         "短音不满开口。流行歌 0.5-0.7，说唱接近 0，抒情/美声接近 1")
+    ap.add_argument("--short-vowel-sec", type=float, default=0.20,
+                    help="说话元音平均时长 τ（Kuwabara 1996，VOCAL 采用 0.2s）。"
+                         "短于 τ·(1+Ma) 的元音按 Ma 降档，避免机械式全开全闭")
+    args = ap.parse_args()
+
+    cache = os.path.expanduser("~/.cache/modelscope/models")
+    fa_dir = os.path.join(cache, "iic--speech_timestamp_prediction-v1-16k-offline",
+                          "snapshots", "master")
+    asr_dir = os.path.join(
+        cache, "iic--speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+        "snapshots", "master")
+    vad_dir = os.path.join(cache, "iic--speech_fsmn_vad_zh-cn-16k-common-pytorch",
+                           "snapshots", "master")
+    if not os.path.exists(os.path.join(fa_dir, "model.pt")):
+        sys.exit(f"缺少强制对齐模型: {fa_dir}")
+    os.environ["MODELSCOPE_OFFLINE"] = "1"
+    os.environ["HF_HUB_OFFLINE"] = "1"
+
+    # FunASR 的 VAD/推理消耗全局 RNG，不固定种子同一文件多次结果不同
+    # （AGENTS.md 已记录该陷阱）。每次 generate 前都重置。
+    import numpy as np
+    import torch
+
+    def seed():
+        torch.manual_seed(0); torch.cuda.manual_seed_all(0)
+        torch.backends.cudnn.deterministic = True; torch.backends.cudnn.benchmark = False
+        np.random.seed(0); random.seed(0)
+
+    from funasr import AutoModel
+    seed()
+
+    if args.text:
+        lyr = norm_text(open(args.text, encoding="utf-8").read())
+        src = args.text
+    else:
+        m = AutoModel(model=asr_dir, vad_model=vad_dir, device=args.device,
+                      disable_update=True, disable_pbar=True)
+        seed()
+        r = m.generate(input=args.wav, batch_size_s=300)
+        lyr = norm_text("".join(s.get("text", "") for s in r))
+        src = "ASR 转写"
+        del m
+    if not lyr:
+        sys.exit("歌词为空")
+
+    seed()
+    fam = AutoModel(model=fa_dir, device=args.device, disable_update=True,
+                    disable_pbar=True)
+    seed()
+    res = fam.generate(input=(args.wav, lyr), data_type=("sound", "text"))
+    ts = res[0].get("timestamp")
+    if not ts:
+        sys.exit("对齐失败：没有返回时间戳")
+    if len(ts) != len(lyr):
+        print(f"警告: 时间戳数 {len(ts)} != 字数 {len(lyr)}，按较短者截断", file=sys.stderr)
+    n = min(len(ts), len(lyr))
+
+    pinyin, Style = load_pinyin()
+    cues = []
+
+    # 归并到启用集合：四型方案下 D/F/G/H 一律沿官方过渡链回退。
+    # 放在 push 里做兜底，这样无论上游哪条分支产出的口型都不会漏出去。
+    FOLD = {"D": "C", "F": "E", "G": "B", "H": "C"}
+
+    def push(a, b, v):
+        if b - a <= 1e-4:
+            return
+        v = FOLD.get(v, v)
+        if v not in ENABLED_SHAPES:
+            v = "C"
+        if cues and cues[-1]["value"] == v and abs(cues[-1]["end"] - a) < 1e-6:
+            cues[-1]["end"] = b
+        else:
+            cues.append({"start": round(a, 3), "end": round(b, 3), "value": v})
+
+    chars = []
+    prev_end = 0.0
+
+    # 能量门限：按实际音频判静音，而不是按字间隔时长猜。
+    # 唱歌拖腔时字间隔通常 0.6-1.5s，全都有声；乐句间停顿也可能只有 0.3s。
+    # 时长判据（silence_gap）对这两种情况都说错，测量结果：9 个 X 段里 8 个有声。
+    import soundfile as sf
+    import numpy as np
+    _y, _sr = sf.read(args.wav)
+    _hop = _sr // 200          # 5ms 分辨率
+    _rms = np.sqrt(np.mean((_y[:len(_y)//_hop*_hop].reshape(-1, _hop))**2, axis=1))
+    _gate = _rms.max() * 10 ** (args.gate_db / 20.0)
+
+    def is_voiced(t_start, t_end):
+        """该时段内是否有任何有声帧（超过能量门限）。"""
+        a = int(round(t_start * 200))
+        b = min(int(round(t_end * 200)), len(_rms))
+        if b <= a:
+            return False
+        return bool((_rms[a:b] > _gate).any())
+
+    def last_voiced_before(t, t_floor, min_run=0.08):
+        """[t_floor, t) 内最后一段「持续」有声的结束时刻；没有则 None。
+
+        判据必须是持续而非单帧：混响尾巴和伴奏泄漏会让孤立帧擦过门限
+        （实测 72.6-73.1s 一整段 max 只有 -40.2dB 却含过限帧），用单帧判据
+        会认为「一直有声」，裁剪永不触发。min_run 默认 80ms ≈ 一个音节的下限。
+        """
+        a = int(round(t_floor * 200))
+        b = min(int(round(t * 200)), len(_rms))
+        if b <= a:
+            return None
+        v = _rms[a:b] > _gate
+        need = max(1, int(round(min_run * 200)))
+        end = None
+        run = 0
+        for i, x in enumerate(v):
+            if x:
+                run += 1
+                if run >= need:
+                    end = i + 1
+            else:
+                run = 0
+        return None if end is None else (a + end) / 200.0
+
+    for i in range(n):
+        ch = lyr[i]
+        st, en = ts[i][0] / 1000.0, ts[i][1] / 1000.0
+        nxt = ts[i + 1][0] / 1000.0 if i + 1 < n else None
+
+        # 字的实际发声结束：
+        #   - 旧逻辑（--no-energy-gate）：按时长 silence_gap 猜
+        #   - 新逻辑：能量门控——只要到下一个字起点之间还有声音，就 hold 过去
+        if args.no_energy_gate:
+            hold_end = en
+            if args.hold_to_next and nxt is not None:
+                gap = nxt - en
+                hold_end = nxt if gap <= args.silence_gap else en
+        else:
+            hold_end = en
+            if args.hold_to_next and nxt is not None:
+                # 把间隔分成两段：本字尾端到下一字头的中间点。
+                # 若中间点之前有声 → 拖腔，hold 到下一字起点。
+                # 若中间点之前无声 → 停顿，保持到 en（让 push 插 X）。
+                mid = en + (nxt - en) * 0.5
+                hold_end = nxt if is_voiced(en, mid) else en
+                # is_voiced 是「任意一帧」判据，够宽松才能接住拖腔，但也会被混响尾巴
+                # 或伴奏泄漏骗过去（实测 -40.2dB 擦过 -40 门限，把 3.5s 停顿判成拖腔，
+                # 嘴僵在半开 5.6s）。所以 hold 之后再回头砍掉尾部的连续静音。
+                if hold_end > en and args.max_hold_sil > 0:
+                    q = last_voiced_before(hold_end, en)
+                    if q is not None and hold_end - q > args.max_hold_sil:
+                        hold_end = q + args.max_hold_sil
+
+        shape, ini = shape_of(ch, pinyin, Style)
+
+        # Melodic accent（VOCAL 的 Ma）：短元音不给满开口。
+        # 论文指出语音模型用于唱歌时的典型失败是短元音 over-articulate ——
+        # "robotically opening/closing the jaw completely for each vowel"。
+        # 唱歌里一个一闪而过的 a 根本来不及把下巴放到底，视觉上却最扎眼，
+        # 所以短于 τ·(1+Ma) 的音按 DECAY_SHAPE 降一档。
+        vdur = hold_end - st
+        if args.melodic_accent > 0:
+            thresh = args.short_vowel_sec * (1.0 + args.melodic_accent)
+            if vdur < thresh:
+                # 只降「开口过大」的那一档，且不跨唇形族：
+                # 短促的 a 来不及把下巴放到底 -> C；其余元音本身开口就不大，
+                # 再降会丢掉元音辨识度（这是 B/H/F 泛滥的另一个来源）。
+                shape = SHORT_SHAPE.get(shape, shape)
+
+        chars.append({"ch": ch, "start": round(st, 3), "end": round(hold_end, 3),
+                      "shape": shape})
+
+        # 字前的间隔：若真的无声才插 X，否则保持上一个口型
+        if st - prev_end > 1e-3:
+            if not is_voiced(prev_end, st):
+                push(prev_end, st, "X")
+            else:
+                # 有声间隔：上一字口型 hold 到本字起点（已在上一轮 push 了 hold_end=nxt）
+                pass   # prev_end==hold_end of prev char already covers it
+        cl = INITIAL_SHAPE.get(ini)
+        if cl and hold_end - st > args.closure_sec * 2:
+            push(st, st + args.closure_sec, cl)
+            body_start = st + args.closure_sec
+            body_end = hold_end
+        else:
+            body_start = st
+            body_end = hold_end
+
+        # 拖腔处理：「枣核型」两段式，而不是按音量密集切分。
+        #
+        # 上一版把长音按 180ms 切成十几段、形状跟着 RMS 走，方向是错的：
+        #   1. 口型编码的是元音形状，与音量无关——轻声的「啊」嘴也该是大的；
+        #   2. 行业规范明确反对逐音节打点（Bristow 第 3 条 "Too many mouth shapes":
+        #      "It's a common mistake to try to hit every single phoneme with a key
+        #       mouth pose. Identify the important shapes that define the word, and
+        #       skip over the lesser ones."）。实测那样做 cue 密度到 3.8/s，
+        #      远超真实音节 1.37/s，看起来就是无意义嚅动。
+        #
+        # 正确做法：一个字只给「峰值 + 衰减」两个口型。汉语音节是枣核型——
+        # 中部开口最大、两端收拢，所以长音后半段降一档（DECAY_SHAPE）即可，
+        # 既避免长时间定格，又不会制造假动作。
+        body_dur = body_end - body_start
+        if args.melisma_sec > 0 and body_dur > args.melisma_sec and not args.no_decay:
+            # 峰值段占前 45%，其余为衰减段（枣核型的收拢尾）
+            peak_end = body_start + body_dur * 0.45
+            push(body_start, peak_end, shape)
+            push(peak_end, body_end, DECAY_SHAPE.get(shape, shape))
+        else:
+            push(body_start, body_end, shape)
+
+        prev_end = hold_end
+
+    info = sf.info(args.wav)
+    if info.duration > prev_end:
+        # 尾部：若有声则保持最后一个口型，无声才闭嘴
+        if not is_voiced(prev_end, info.duration):
+            push(prev_end, info.duration, "X")
+        else:
+            push(prev_end, info.duration, cues[-1]["value"] if cues else "X")
+
+    out = {"metadata": {"soundFile": os.path.abspath(args.wav),
+                        "duration": round(info.duration, 3),
+                        "lyricsSource": src, "chars": len(chars)},
+           "mouthCues": cues, "chars": chars}
+    json.dump(out, open(args.out, "w"), ensure_ascii=False, indent=1)
+    from collections import Counter
+    wt = Counter()
+    for c in cues:
+        wt[c["value"]] += c["end"] - c["start"]
+    tot = sum(wt.values())
+    print(f"{len(chars)} 字 → {len(cues)} cues，写入 {args.out}")
+    print("口型时长占比: " + "  ".join(
+        f"{k}={wt[k] / tot * 100:.0f}%" for k in "XABCDEFGH" if wt.get(k)))
+
+
+if __name__ == "__main__":
+    main()
