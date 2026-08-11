@@ -9,7 +9,8 @@
      → ext → svc → eval → mix                      ├─ 切片     align/audio
         ├─ vocal.wav  SVC 干声（口型用这个）        ├─ cues     make_cues.py
         └─ mix.wav    人声+伴奏（成片用这个）        ├─ beats    beat_grid.py
-                                                   └─ 渲染     a25rig/render.sh
+                                                   ├─ 渲染     a25rig/render.sh
+                                                   └─ 字幕     get_lyrics.py → make_ass.py
                                                         → data/video/*.mp4
 ```
 
@@ -93,7 +94,29 @@ GPT-SoVITS/.venv/bin/python listen_lipsync/make_cues.py \
     --gate-db -40
 ```
 
-不传 `--text` 就自动 ASR 转写（paraformer-large，已缓存）；有歌词文件时 `--text lyr.txt` 更准。
+### 优先用真歌词做强制对齐，不要用 ASR 转写
+
+不传 `--text` 会走 ASR 自动转写（paraformer-large）。**但只要 ⑦ 的歌词缓存已经存在，就一定要
+用 `--text`** —— ASR 在 SVC 转换后的人声上漏字很严重，实测全曲 ASR 只认出 103 字（还听错若干），
+喂真歌词能对齐 **347 字**：
+
+```bash
+D=/tmp/opencode/云烟成雨_full
+# 从缓存的增强 LRC 抽纯文本（只读本地，不联网）
+GPT-SoVITS/.venv/bin/python - <<'EOF'
+import sys; sys.path.insert(0, "listen_lipsync")
+from get_lyrics import read_enhanced
+lines, _ = read_enhanced("data/songs/云烟成雨.lrc")
+open("/tmp/opencode/云烟成雨_full/lyrics.txt", "w", encoding="utf-8").write(
+    "\n".join(l["text"] for l in lines) + "\n")
+EOF
+
+GPT-SoVITS/.venv/bin/python listen_lipsync/make_cues.py \
+    --wav $D/align.wav --text $D/lyrics.txt --out $D/cues.json --gate-db -40
+```
+
+这一步是**免费的**（歌词本来就为字幕抓过），全曲 347 字对齐只要 14.5s。所以顺序上建议先跑
+⑦ 的 `get_lyrics.py`，再回来做 ③。
 
 ### 只用 A/B/C/E 四种口型
 
@@ -143,9 +166,18 @@ voiced=rms>gate; open_=np.zeros(n,bool)
 for c in cs:
     if c["value"]!="X": open_[int(c["start"]/.01):min(n,int(c["end"]/.01))]=True
 print("唱着却闭嘴 %.1f%%  (应 <5%%)" % (100*(voiced&~open_).sum()/voiced.sum()))
-print("最长单 cue %.2fs  (>5s 要查是否误判拖腔)" % max(c["end"]-c["start"] for c in cs))
+# 只看张嘴的 cue：尾奏的 X 本来就可以很长（全曲版尾部静音 20s），一起统计会永远误报
+print("最长张嘴 cue %.2fs  (>7s 要查是否误判拖腔)" % max(c["end"]-c["start"] for c in cs if c["value"]!="X"))
+tail=[c for c in cs if c["value"]!="X"][-1]
+print("最后一个张嘴 cue 结束于 %.2fs / 全长 %.2fs" % (tail["end"], d["metadata"]["duration"]))
 EOF
 ```
+
+**「最后一个张嘴 cue」必须落在真正唱完处，不能顶到文件末尾。** 全曲版这里踩过一次：歌词
+220.6s 唱完、音频却有 240.8s，尾部 20.2s 是数字静音（−175dB），而嘴张着 `C` 型僵了 20 秒。
+根因是 `make_cues.py` 尾部分支用的是 `is_voiced()` 的**单帧**判据，淡出时的孤立过限帧就让它
+判成「还在唱」—— 与 `--max-hold-sil` 要解决的是同一个坑，只是换了位置复发。已改为复用
+`last_voiced_before()`（「持续 80ms 有声」）。修复后尾段实测 99 帧张嘴 **0%**。
 
 ## ④ 口型素材（一次性准备）
 
@@ -240,7 +272,141 @@ setsid a25rig/render.sh --psd data/pics/figure.psd \
 时长由 cues 的 `metadata.duration` 决定，音频由 ffmpeg `-shortest` 截齐。
 更多旗标与物理推导见 `a25rig/RENDER.md`。
 
-## ⑦ 验收
+---
+
+## ⑦ KTV 字幕（可选）
+
+烧在**已渲染好的视频**上，不参与 a25rig 渲染。这样改字幕只要重烧几秒，不用重渲整片。
+
+```bash
+# 1) 抓歌词 → 缓存成歌曲同名 .lrc（只联网一次，之后全走本地）
+GPT-SoVITS/.venv/bin/python listen_lipsync/get_lyrics.py data/songs/云烟成雨.flac
+
+# 2) 生成 ASS（--start/--end 必须与视频窗口一致）
+GPT-SoVITS/.venv/bin/python listen_lipsync/make_ass.py data/songs/云烟成雨.lrc \
+    -o /tmp/opencode/云烟成雨_100s/lyrics.ass \
+    --size 1920x1080 --start 0 --end 100 --pos bc
+
+# 3) 烧进视频（字体走 FONTCONFIG_FILE，不往系统装字体）
+export FONTCONFIG_FILE=/tmp/opencode/fonttest/fc/fonts.conf
+ffmpeg -v error -y -i data/video/mv_云烟成雨_100s.mp4 \
+    -vf "ass=/tmp/opencode/云烟成雨_100s/lyrics.ass" \
+    -c:v libx264 -crf 18 -preset medium -c:a copy \
+    data/video/mv_云烟成雨_100s_lyrics.mp4
+```
+
+画面上永远两行：**上行**是正在唱的句子（逐字扇光，唱过的字变色），**下行**是下一句预览
+（更小更淡）。唱完自动上滚。1080p 烧字实测：22s 片段 5.5s、全曲 241s 约 90s。
+
+整曲出片就把窗口开满（`--start 0 --end <全长>`，超出全长无害）：
+
+```bash
+GPT-SoVITS/.venv/bin/python listen_lipsync/make_ass.py data/songs/云烟成雨.lrc \
+    -o /tmp/opencode/云烟成雨_full/lyrics.ass --size 1920x1080 --start 0 --end 241 --pos bc
+# 全曲 42 行 → 83 个字幕事件（每行一个主行 + 一个预览行，末行无预览）
+```
+
+烧字**不要覆盖无字幕版**：留着它，下次调字幕只需重烧几秒，不必重渲 4.5 分钟。
+
+### 歌词来源与缓存
+
+`get_lyrics.py` 从**音频标签**（`title`/`artist`/`duration`）出发，三级回落：
+
+| 优先级 | 源 | 时间精度 | 鉴权 |
+|---|---|---|---|
+| 1 | 酷狗 KRC | **逐字** | 无 |
+| 2 | LRCLIB → 网易云 LRC | 行级 | 无 |
+| 3 | 写手工填写模板 | 乐句锚点 | — |
+
+命中即写 `data/songs/<name>.lrc`，**再次运行直接读本地**（`--force` 才重抓，`--offline` 强制
+只读缓存）。10 首实测：4 首逐字、5 首行级、1 首要手填，缓存总共 30KB。
+
+格式是标准**增强 LRC**（`[mm:ss.xx]<mm:ss.xx>字`），不是自造格式 —— 任何编辑器可改、任何
+播放器可验，只有行级时也能用。行首是整行起点，每个 `<>` 是该字起点，行尾补一个「唱完」时刻
+给扇光收尾。手填模板顶部带格式说明，下面是按人声能量自动切的乐句锚点，只需填字。
+
+**别用网易云 LRC 自带的时间做扇光。** 它是给 KTV 播放器留提示用的，系统性提前（实测中位
++0.78s，最坏 +3.76s，17 行里 4 行落在静音处）。逐字源用酷狗；只有行级时，要么让
+`make_ass.py` 按字数均分（`--even`，默认在无字级数据时自动生效），要么先跑
+`make_cues.py --text <歌词>` 做强制对齐拿真字级。
+
+**逐字源同时解决了「行内长静音」。** 强制对齐器不建模休止，会把间奏吞进行内（实测一行
+11.4s 里含 3.6s 静音，字幕僵在屏上）；酷狗 KRC 的行边界把休止留在行外，同窗口 17 行**零**
+行内长静音，最长行 7.95s。
+
+### 参数速查
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--pos` | `tr` | `tl/tc/tr/bl/bc/br`，常规视频用 **`bc`**（下方居中） |
+| `--start/--end` | 0 / ∞ | **必须与视频窗口一致**，脚本会把时间轴归零到 `--start` |
+| `--alpha` | `0x40` | 两行整体透明度，0=不透明、255=全透（减少遮挡角色） |
+| `--next-alpha` | `0x40` | 预览行在 `--alpha` 之上再淡多少 |
+| `--font` / `--font-size` | SimHei / 54 | 字体须 fontconfig 可见 |
+| `--next-scale` | 0.72 | 预览行字号比例 |
+| `--color-sung` | `#3BC8FF` | 已唱（扇光）色；`--color-pending` 未唱色 |
+| `--margin-x/-y` | 48 / 40 | 边距（px） |
+| `--lead` | 1.0 | 提前多少秒亮出当前行（未唱色） |
+| `--no-preview` | — | 只显示当前行 |
+| `--even` | — | 忽略字级时间，按字数均分 |
+
+### 中文字体
+
+**系统里没有中文字体**（`fc-list :lang=zh` 为 0，`fc-match` 回落到不含汉字的 DejaVu），
+直接烧会得到整屏豆腐块。不装系统字体的做法是让 fontconfig 指向 Windows 字体目录：
+
+```bash
+mkdir -p /tmp/opencode/fonttest/fc && cat > /tmp/opencode/fonttest/fc/fonts.conf <<'EOF'
+<?xml version="1.0"?><!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <dir>/mnt/c/Windows/Fonts</dir>
+  <cachedir>/tmp/opencode/fonttest/fc/cache</cachedir>
+  <include ignore_missing="yes">/etc/fonts/conf.d</include>
+</fontconfig>
+EOF
+export FONTCONFIG_FILE=/tmp/opencode/fonttest/fc/fonts.conf
+fc-match SimHei     # 期望 simhei.ttf: "SimHei" "Regular"
+```
+
+用 `simhei.ttf` 而不是 `msyh.ttc`：后者是字体集合，还得指定 face。
+
+### 验收
+
+字幕像素要用**与无字幕原片做差分**来隔离 —— 直接测颜色会把背景算进去（雨玻璃偏蓝，曾把
+背景当成「已唱」，得出「扇光 0.5s 冲到 99% 然后僵住」的假结论）。
+
+抽帧时刻要取**确实在唱**的位置 —— intro 是纯伴奏、屏上本来就没字（本例首句 18.0s 才起唱），
+在那里抽帧会得出「字幕没生效」的假结论。时刻直接从 `.lrc` 读：
+
+```bash
+cd /tmp/opencode && rm -rf lyrchk && mkdir lyrchk
+SUB=/home/rookie/voice/data/video/mv_云烟成雨_100s_lyrics.mp4
+CLN=/home/rookie/voice/data/video/mv_云烟成雨_100s.mp4
+# 取第 1 句起唱后 +1/+4/+7s（首句起点由 .lrc 第一行时间决定，这里是 18s）
+for t in 19 22 25; do
+  ffmpeg -v error -y -ss $t -i $SUB -frames:v 1 lyrchk/s$t.png
+  ffmpeg -v error -y -ss $t -i $CLN -frames:v 1 lyrchk/c$t.png
+done
+/home/rookie/voice/GPT-SoVITS/.venv/bin/python - <<'EOF'
+from PIL import Image, ImageChops
+for t in (19, 22, 25):
+    a=Image.open(f"lyrchk/s{t}.png").convert("RGB"); b=Image.open(f"lyrchk/c{t}.png").convert("RGB")
+    dp=ImageChops.difference(a,b).convert("L").load(); w,h=a.size
+    pts=[(x,y) for y in range(0,h,2) for x in range(0,w,4) if dp[x,y]>30]
+    if len(pts) < 200:                       # 少量散点是重编码噪声，不是文字
+        print(f"t={t}s  差分像素仅 {len(pts)} 个 → 该时刻无字幕"); continue
+    xs=[p[0] for p in pts]; ys=[p[1] for p in pts]
+    print(f"t={t}s  y={min(ys)}..{max(ys)}  x={min(xs)}..{max(xs)}  "
+          f"中心偏移 {abs((min(xs)+max(xs))//2 - w//2)}px  ({len(pts)} 采样点)")
+EOF
+```
+
+`--pos bc` 下实测：主行 y928-982、预览行 y1006-1036（中间有干净空隙，证明**上行是主行**），
+中心偏移 2px。透明度合格的判据是同一坐标「带字幕」与「原片」的 RGB 明显不同但非纯色覆盖。
+
+---
+
+## ⑧ 验收
 
 ```bash
 V=data/video/mv_云烟成雨_100s.mp4
@@ -275,10 +441,37 @@ print("面积最大 %.0f" % sig.max())
 EOF
 ```
 
-实测合格线：有 cue **98%** 张嘴、无 cue **1%**（113 帧里 1 帧）、面积最大 502。
+实测合格线（同一套素材/机位）：
+
+| | 100s 版（ASR 转写） | 全曲 241s（真歌词对齐） |
+|---|---|---|
+| cue 数 / 字数 | 83 / 103 字 | **284 / 347 字** |
+| 有 cue 张嘴 | 98%，面积均值 333 | 98%，面积均值 339 |
+| **无 cue 张嘴** | 1%（113 帧里 1 帧） | **2%**（324 帧里） |
+| 面积最大 | 502 | 516 |
+| 尾段（221s 后） | — | 张嘴 **0%**（99 帧） |
+| 渲染 | 26.6 fps / 113s | 27.2 fps / **265s**（7223 帧） |
+| 烧字 | 5.5s（22s 片段） | ~90s（全曲） |
 
 「无 cue 张嘴率」是这套流程唯一必查的回归项。面积最大值只能横向比同一套素材/机位 ——
 它随 `--char-scale` 和探针半径变化，不是绝对阈值；判断 D 是否在用，直接看 ③ 的口型集合。
+
+全曲版还要多查两项（100s 片段看不出来）：
+
+```bash
+V=data/video/mv_云烟成雨_full_lyrics.mp4
+# 1) 帧数 × fps 必须等于时长：7223 / 30 = 240.767s
+ffprobe -v error -count_frames -select_streams v -show_entries stream=nb_read_frames -of csv=p=0 $V
+# 2) 音频不能中途断流 —— 分段 RMS 应全程在 -12..-20dB，不能出现 -99
+ffmpeg -v error -i $V -ar 16000 -ac 1 -f wav - 2>/dev/null | GPT-SoVITS/.venv/bin/python -c "
+import sys, io, numpy as np, soundfile as sf
+y, sr = sf.read(io.BytesIO(sys.stdin.buffer.read()))
+for a in range(0, int(len(y)/sr), 40):
+    s = y[a*sr:(a+40)*sr]
+    print('  %3d-%3ds %+7.1fdB' % (a, min(a+40, int(len(y)/sr)), 20*np.log10(max(float((s**2).mean()**.5), 1e-9))))"
+```
+
+`--count_frames` 要遍历整个文件（全曲约 30s），但它是唯一能抓出「时长对、帧却丢了」的检查。
 
 ---
 
@@ -311,6 +504,23 @@ EOF
 - **`--out`（PNG 序列）比 `--video` 慢 2.6×**，且耗时取决于画面复杂度而非像素数。
   只在需要逐帧像素分析时用，用完即删（8 组 24s/1080p 曾占 21GB）。
 - 渲染日志第一行的 `404 (Not Found)` 是 favicon，无害（`rig:` 行正常打印即 OK）。
+- **字幕：两个同样式事件时间重叠会触发 libass 防碰撞位移。** 表现是换行时上行槽空了、字留在
+  预览槽里（看起来像「不滚动」）。`--lead` + `--hold` 超过句间空隙就会重叠，`make_ass.py` 的
+  `no_overlap()` 在两句之间取中点切开。
+- **字幕：`--start/--end` 必须与视频窗口一致。** ASS 时间轴按 `--start` 归零，配错窗口整体偏移。
+  用 `ffmpeg -ss` 剪过的片段，`-ss` 的值就是 `--start`。
+- **字幕：验字幕不能直接测颜色，要与无字幕原片做差分。** 与「验嘴动不能用色块探针」同一类错。
+  差分后还要设噪声门（`<200` 采样点判为无字幕）：h264 重编码会留个别孤立像素，全曲抽检时
+  它把包围盒从 y920-1039 撑成 y246-982，看起来像字幕跑到画面中间去了。判据要看**质量分布**
+  而不是 min/max。
+- **口型：ASR 转写在 SVC 人声上漏字约 30%**（全曲 347 字只认出 103 字）。⑦ 的歌词缓存存在时
+  一定要用 `make_cues.py --text`，这一步免费且顺带让口型变准。
+- **口型：尾奏静音会让最后一个口型撑到文件结尾。** 尾部判据必须是「持续有声」而非单帧，
+  否则淡出的孤立过限帧就让嘴张着僵 20 秒（已修，见 ③）。全曲版才暴露 —— 100s 窗口正好切在
+  歌声中间，没有尾奏。
+- **酷狗歌词接口会静默限流**：HTTP 200 + 空候选，长得和「这首歌没歌词」一样。实测连发 6 次得到
+  `10/10/10/0/10/10`，间隔 2s 则 6/6 命中。`get_lyrics.py` 已内置限速与重试 —— 不限速时测出的
+  命中率全是噪声（曾先后得出 1/10 与 4/10 两个矛盾结果）。
 
 ## 相关文档
 
@@ -318,3 +528,15 @@ EOF
 |---|---|
 | `AGENTS.md` | 工作区总览、`sing.py` 全部调优结论、各 SVC/移调引擎 A/B、硬件与内存陷阱 |
 | `a25rig/RENDER.md` | 渲染器全部旗标、雨层物理推导、确定性验收、实测性能 |
+
+脚本入口一览：
+
+| 脚本 | 阶段 | venv |
+|---|---|---|
+| `sing.py` | ⓿ 产声 | 系统 python3（内部各阶段自选 venv） |
+| `listen_lipsync/make_cues.py` | ③ 口型时间轴 | GPT-SoVITS |
+| `listen_lipsync/split_visemes.py` | ④ 口型 sprite | GPT-SoVITS |
+| `singing/beat_grid.py` | ⑤ 节拍网格 | GPT-SoVITS |
+| `a25rig/render.sh` | ⑥ 渲染 | node（自带 `driver/node_modules`） |
+| `listen_lipsync/get_lyrics.py` | ⑦ 抓词缓存 | GPT-SoVITS |
+| `listen_lipsync/make_ass.py` | ⑦ 生成 ASS | GPT-SoVITS（纯 stdlib） |

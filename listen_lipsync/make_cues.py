@@ -362,11 +362,19 @@ def main():
 
     info = sf.info(args.wav)
     if info.duration > prev_end:
-        # 尾部：若有声则保持最后一个口型，无声才闭嘴
-        if not is_voiced(prev_end, info.duration):
+        # 尾部：保持最后一个口型到「真正唱完」为止，之后闭嘴。
+        # 判据同 --max-hold-sil：必须是**持续**有声，不能用 is_voiced 的单帧判据 ——
+        # 尾奏/淡出的孤立过限帧会让最后一个口型一路撑到文件结尾（实测全曲版尾部
+        # 220.2s 后是数字静音，却被判成有声，嘴张着 C 型僵了 20.5s）。
+        tail = last_voiced_before(info.duration, prev_end)
+        if tail is None:
             push(prev_end, info.duration, "X")
         else:
-            push(prev_end, info.duration, cues[-1]["value"] if cues else "X")
+            tail = min(info.duration, tail + args.max_hold_sil)
+            if tail > prev_end:
+                push(prev_end, tail, cues[-1]["value"] if cues else "X")
+            if info.duration > tail:
+                push(tail, info.duration, "X")
 
     out = {"metadata": {"soundFile": os.path.abspath(args.wav),
                         "duration": round(info.duration, 3),
