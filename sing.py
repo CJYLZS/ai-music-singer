@@ -183,6 +183,11 @@ class Cfg:
     dp_lam: float = 0.0   # DP 边界一致性惩罚权重（0=朴素 argmax；听到明显跳变时才往上调）
     vocal_gain: float = 1.0
     acc_gain: float = 0.8
+    match_acc: bool = True   # 人声增益跟随伴奏 RMS 包络（高潮段伴奏变厚，固定增益会压住人声）
+    match_margin: float = 0.0   # 目标：人声 RMS 比伴奏高多少 dB
+    match_max_boost: float = 8.0   # 跟随增益上限 dB
+    limit_db: float = -0.5   # 软限幅上限 dBFS；0 = 关闭改用硬削波
+    mix_mono: bool = False   # 默认保留伴奏立体声，人声居中
     mix: bool = False
     no_sep_cache: bool = False
 
@@ -503,9 +508,17 @@ def stage_mix(cfg: Cfg) -> None:
     for p in (cfg.vocal_wav, cfg.acc_wav):
         if not os.path.exists(p):
             raise Fail(f"缺少 {p}")
-    run([VENVS["soulx"], os.path.join(WORKERS, "w_mix.py"),
-         "--vocal", cfg.vocal_wav, "--acc", cfg.acc_wav, "--out", cfg.mix_wav,
-         "--vocal-gain", str(cfg.vocal_gain), "--acc-gain", str(cfg.acc_gain)], stage="mix")
+    cmd = [VENVS["soulx"], os.path.join(WORKERS, "w_mix.py"),
+           "--vocal", cfg.vocal_wav, "--acc", cfg.acc_wav, "--out", cfg.mix_wav,
+           "--vocal-gain", str(cfg.vocal_gain), "--acc-gain", str(cfg.acc_gain),
+           "--match-margin", str(cfg.match_margin),
+           "--match-max-boost", str(cfg.match_max_boost),
+           "--limit-db", str(cfg.limit_db)]
+    if not cfg.match_acc:
+        cmd.append("--no-match-acc")
+    if cfg.mix_mono:
+        cmd.append("--mono")
+    run(cmd, stage="mix")
 
 
 STAGE_FN = {
@@ -625,6 +638,16 @@ def main() -> None:
     ap.add_argument("--mix", action="store_true", help="跑混音阶段（验收纯人声后）")
     ap.add_argument("--vocal-gain", type=float, default=1.0)
     ap.add_argument("--acc-gain", type=float, default=0.8)
+    ap.add_argument("--no-match-acc", dest="match_acc", action="store_false", default=True,
+                    help="关闭「人声增益跟随伴奏包络」，回到固定增益")
+    ap.add_argument("--match-margin", type=float, default=0.0,
+                    help="混音目标：人声 RMS 比伴奏高多少 dB（默认 0）")
+    ap.add_argument("--match-max-boost", type=float, default=8.0,
+                    help="跟随增益上限 dB（默认 8）")
+    ap.add_argument("--limit-db", type=float, default=-0.5,
+                    help="混音软限幅上限 dBFS；0 = 关闭改用硬削波（默认 -0.5）")
+    ap.add_argument("--mix-mono", action="store_true",
+                    help="混音输出单声道（默认保留伴奏立体声）")
     ap.add_argument("--no-sep-cache", action="store_true",
                     help="禁用分离缓存（sep/ref-sep 强制重新分离）")
     ap.add_argument("-v", "--verbose", action="store_true", help="打印子进程完整输出")
@@ -656,7 +679,10 @@ def main() -> None:
               n_steps=args.n_steps, cfg=args.cfg, rescale_cfg=args.rescale_cfg,
               pitch_shift=args.pitch_shift,
               seed=args.seed, n_seeds=args.n_seeds, dp_lam=args.dp_lam,
-              vocal_gain=args.vocal_gain, acc_gain=args.acc_gain, mix=args.mix,
+              vocal_gain=args.vocal_gain, acc_gain=args.acc_gain,
+              match_acc=args.match_acc, match_margin=args.match_margin,
+              match_max_boost=args.match_max_boost, limit_db=args.limit_db,
+              mix_mono=args.mix_mono, mix=args.mix,
               no_sep_cache=args.no_sep_cache)
 
     setup_logging(cfg.log_file, args.verbose)
