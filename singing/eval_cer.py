@@ -59,6 +59,13 @@ def main():
     ap.add_argument("--dump", help="把各 ASR 转写写到这个目录，便于人工核对")
     ap.add_argument("--allow-download", action="store_true",
                     help="允许联网下载模型（默认强制离线，只用已缓存的 paraformer-large）")
+    ap.add_argument("--win", type=float, default=10.0,
+                    help="分窗转写的窗长(秒)，0 = 整段一次转写。"
+                         "默认 10s：整段送 51s 连续歌声会让 ASR 整块丢内容"
+                         "（同一文件整段 CER 0.5625 vs 分窗 0.1094）")
+    ap.add_argument("--win-overlap", type=float, default=0.0,
+                    help="窗重叠(秒)。默认 0；设 1-2s 可减少切在字中间的损失，"
+                         "但会引入重复字（I 上升）")
     args = ap.parse_args()
 
     labels = args.labels or [os.path.basename(os.path.dirname(g)) for g in args.gen]
@@ -94,7 +101,7 @@ def main():
     m = AutoModel(model=asr_dir, vad_model=vad_dir,
                   device=args.device, disable_update=True, disable_pbar=True)
 
-    def asr(path: str) -> str:
+    def _reset_seed() -> None:
         # 种子必须在**每次** generate 前重置，不能只在进程启动时设一次。
         # FunASR 的 VAD 会消耗全局 RNG，所以顺序调用时第 k 个文件拿到的是被前
         # k-1 次调用推进过的 RNG 状态 —— 同一文件的转写因此取决于它在 --gen
@@ -102,8 +109,50 @@ def main():
         # 58/58/58 字（每次重置）。这个偏差足以让一个臂的 CER 凭排序变化 0.4+。
         _torch.manual_seed(0); _torch.cuda.manual_seed_all(0)
         _np.random.seed(0); random.seed(0)
+
+    def asr_whole(path: str) -> str:
+        _reset_seed()
         r = m.generate(input=path, batch_size_s=300)
         return norm("".join(seg.get("text", "") for seg in r))
+
+    def asr_windowed(path: str, win: float, overlap: float = 0.0) -> str:
+        """把长音频切成固定窗口分别转写再拼接。
+
+        为什么必须这样做（实测）: 对 51s 连续歌声，整段送进 paraformer+VAD 会
+        **整块丢内容** —— 同一个文件整段测 CER 0.5625（29 字），逐 10s 窗测只有
+        0.1094（字其实都唱出来了）。差 0.45 的 CER 完全来自 ASR 侧，不是合成质量。
+        长连续歌声没有语音那样的停顿，VAD 找不到切点，就把整段当一句喂给声学模型。
+
+        歌声本来就没有可靠的静音边界，所以这里用**固定窗**而不是 VAD 分段。
+        """
+        import soundfile as _sf
+        import librosa as _lb
+        import tempfile
+
+        y, sr = _lb.load(path, sr=16000, mono=True)
+        step = max(win - overlap, 0.1)
+        parts: list[str] = []
+        with tempfile.TemporaryDirectory() as td:
+            tmp = os.path.join(td, "w.wav")
+            pos = 0.0
+            while pos < len(y) / sr:
+                seg = y[int(pos * sr): int((pos + win) * sr)]
+                pos += step
+                if len(seg) < sr * 0.5:      # 末尾不足 0.5s 的碎片跳过
+                    continue
+                _sf.write(tmp, seg, sr)
+                _reset_seed()
+                try:
+                    r = m.generate(input=tmp, batch_size_s=300)
+                    parts.append("".join(s.get("text", "") for s in r))
+                except Exception:
+                    pass
+        return norm("".join(parts))
+
+    def asr(path: str) -> str:
+        if args.win and args.win > 0:
+            return asr_windowed(path, args.win, args.win_overlap)
+        return asr_whole(path)
 
     if args.ref_text:
         ref = norm(open(args.ref_text, encoding="utf-8").read())

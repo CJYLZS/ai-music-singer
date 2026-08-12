@@ -1,8 +1,9 @@
 #!/usr/bin/env python
 """零样本歌声合成 CLI：参考语音 -> 用参考音色唱给定歌曲。
 
-两段式流水线（无单一模型能做"语音参考 -> 唱出目标音色"）:
+两条流水线（可独立运行或级联）：
 
+(1) SVC 流水线（纯音色转换，保留原唱旋律细节）:
     song.flac
       ├─ BS-RoFormer          -> 人声(含和声) + 伴奏      (GPT-SoVITS venv)
       │    └─ karaoke 模型    -> 主唱 + 和声
@@ -10,14 +11,21 @@
       ├─ 主唱 -> RMVPE F0     (SoulX venv)
       ├─ 参考音频(通常带BGM/BGM含人声) 同样两步分离 -> 纯人声 lead
       ├─ 纯人声切片 -> F0 分析 -> 贪心选段 -> prompt.wav (SoulX venv)
-      ├─ PC-NSF-HiFiGAN 分层移调补齐高音区 -> prompt_ext.wav (tools/pcnsf venv,
-      │   可 --ext-method seedvc 换回 seed-vc 自转换)
+      ├─ PC-NSF-HiFiGAN 分层移调补齐高音区 -> prompt_ext.wav (tools/pcnsf venv)
       ├─ SoulX-Singer SVC: prompt_ext + 主唱 -> 目标音色人声 (SoulX venv)
-      ├─ ERes2NetV2 相似度评测（对照真实语音）  (GPT-SoVITS venv)
-      └─ [--mix] 人声 + 伴奏混音 -> 成品         (SoulX venv)
+      └─ ERes2NetV2 相似度评测（对照真实语音）  (GPT-SoVITS venv)
 
-最简用法:
+(2) SVS 流水线（score-control，MIDI+歌词直接合成，无原唱音色泄漏）:
+    song.flac -> 自动转录 MIDI + 歌词 -> SVS 合成（带参考音色）
+
+(3) Cascade 流水线（SVS → SVC，结合两者优势，实测音色最优）:
+    SVS 输出 -> 提取 F0 -> SVC 二次转换（复用 prompt_ext）-> vocal_cascade.wav
+
+最简用法（纯 SVC）:
     python3 sing.py --ref data/voices/ref.wav --song data/songs/song.flac --name exp1
+
+Cascade 流程（当前最优配置）:
+    python3 sing.py --ref ... --song ... --name exp1 --stages sep,ref-sep,f0-target,select,ext,svs,cascade
 
 先听后段纯人声再混伴奏（默认不含 mix 阶段）:
     python3 sing.py --ref ... --song ... --name exp1
@@ -45,7 +53,7 @@ from dataclasses import dataclass
 ROOT = os.path.dirname(os.path.abspath(__file__))
 log = logging.getLogger("sing")
 
-ALL_STAGES = ["sep", "stems4", "ref-sep", "f0-target", "select", "ext", "svc", "eval", "mix"]
+ALL_STAGES = ["sep", "stems4", "ref-sep", "f0-target", "select", "ext", "svc", "svs", "cascade", "eval", "mix"]
 OPT_IN_STAGES = {"mix"}  # 先验收纯人声，再 --mix
 
 VENVS = {
@@ -188,6 +196,7 @@ class Cfg:
     match_max_boost: float = 8.0   # 跟随增益上限 dB
     limit_db: float = -0.5   # 软限幅上限 dBFS；0 = 关闭改用硬削波
     mix_mono: bool = False   # 默认保留伴奏立体声，人声居中
+    mix_vocal: str | None = None   # 混音人声输入路径（None=自动选择，优先 cascade）
     mix: bool = False
     no_sep_cache: bool = False
 
@@ -264,6 +273,21 @@ class Cfg:
     def ext_shifted_dir(self) -> str:
         """ext 阶段的移调段输出目录（seedvc/ 或其他）。"""
         return self.p("seedvc")  # w_ext.py 写死这个名字
+
+    @property
+    def svs_vocal_wav(self) -> str:
+        """SVS 阶段产物（score-control 合成的歌声）。"""
+        return self.p("svs", "svs_vocal.wav")
+
+    @property
+    def svs_f0(self) -> str:
+        """SVS 输出的 F0（cascade 阶段需要）。"""
+        return self.p("svs", "svs_f0.npy")
+
+    @property
+    def vocal_cascade_wav(self) -> str:
+        """cascade 阶段产物（SVS → SVC 二次转换）。"""
+        return self.p("vocal_cascade.wav")
 
 
 def preflight(cfg: Cfg) -> None:
@@ -421,7 +445,7 @@ def _svc_cmd(cfg: Cfg, svc_dir: str, seed: int | None) -> list[str]:
     # kNN 检索池默认用完整参考人声（163s）而非 prompt_ext（28.9s）：检索池不进模型，
     # 不受 whisper 30s 硬顶约束，分块编码后匹配失败帧 9.8% -> 1.9%
     if cfg.knn_alpha > 0 and cfg.knn_full_pool and os.path.exists(cfg.ref_clean):
-        cmd += ["--knn_pool_wav", cfg.ref_clean]
+        cmd += ["--knn_pool_wav", os.path.abspath(cfg.ref_clean)]
     if seed is not None:
         cmd += ["--seed", str(seed)]
     return cmd + ["--fp16"]
@@ -491,6 +515,71 @@ def stage_svc(cfg: Cfg) -> None:
     log.info(f"  -> {cfg.vocal_wav}")
 
 
+def stage_svs(cfg: Cfg) -> None:
+    banner("Stage: SVS 合成 (score-control, MIDI+lyrics+ref)")
+    for p in (cfg.lead_wav, cfg.prompt_wav):
+        if not os.path.exists(p):
+            raise Fail(f"缺少前置产物: {p}")
+    # svs_song.py 默认用 prompt.wav（说话），可传 --prompt-wav 换成唱歌干声
+    # 这里保持与 SVC 一致：都用 prompt.wav（说话参考），方便直接对比
+    svs_dir = cfg.p("svs")
+    os.makedirs(svs_dir, exist_ok=True)
+    cmd = [VENVS["soulx"], os.path.join(WORKERS, "svs_song.py"),
+           "--song-dir", cfg.out_dir,
+           "--out-dir", svs_dir,
+           "--prompt-wav", cfg.prompt_wav,
+           "--device", cfg.device,
+           "--seed", str(cfg.seed) if cfg.seed is not None else "1234",
+           "--control", "score"]
+    run(cmd, stage="svs", cwd=SOULX_DIR, env={"PYTHONPATH": SOULX_DIR})
+    if not os.path.exists(cfg.svs_vocal_wav):
+        raise Fail(f"SVS 未产生输出: {cfg.svs_vocal_wav}")
+    log.info(f"  -> {cfg.svs_vocal_wav}")
+
+
+def stage_cascade(cfg: Cfg) -> None:
+    banner("Stage: Cascade (SVS → SVC 二次转换)")
+    for p in (cfg.svs_vocal_wav, cfg.prompt_ext_wav, cfg.prompt_ext_f0):
+        if not os.path.exists(p):
+            raise Fail(f"缺少前置产物: {p}（需先跑 svs 和 ext 阶段）")
+    # 1. 提取 SVS 输出的 F0（作为 SVC 的 target_f0）
+    log.info("  提取 SVS 输出 F0")
+    run([VENVS["soulx"], os.path.join(WORKERS, "w_f0.py"),
+         "--wav", cfg.svs_vocal_wav, "--out", cfg.svs_f0,
+         "--device", cfg.device, "--max-duration", "600"], stage="cascade")
+    # 2. 用 SVC 转换（source = SVS 输出，prompt = 同一套 prompt_ext）
+    log.info("  SVC 二次转换（source=SVS 输出，复用 prompt_ext）")
+    svc_dir = cfg.p("cascade_svc")
+    os.makedirs(svc_dir, exist_ok=True)
+    # 复用 _svc_cmd 但替换 target 路径，注意所有路径都要转绝对路径（CWD=SOULX_DIR）
+    cmd = [VENVS["soulx"], os.path.join(SOULX_DIR, "cli", "inference_svc.py"),
+           "--device", cfg.device,
+           "--model_path", SVC_MODEL, "--config", SVC_CONFIG,
+           "--prompt_wav_path", os.path.abspath(cfg.prompt_ext_wav),
+           "--target_wav_path", os.path.abspath(cfg.svs_vocal_wav),  # 关键：source 换成 SVS 输出
+           "--prompt_f0_path", os.path.abspath(cfg.prompt_ext_f0),
+           "--target_f0_path", os.path.abspath(cfg.svs_f0),           # F0 也是 SVS 的
+           "--save_dir", os.path.abspath(svc_dir),
+           "--pitch_shift", str(cfg.pitch_shift),
+           "--n_steps", str(cfg.n_steps), "--cfg", str(cfg.cfg),
+           "--rescale_cfg", str(cfg.rescale_cfg),
+           "--max_seg_sec", str(cfg.max_seg_sec),
+           "--num_overlaps", str(cfg.num_overlaps),
+           "--knn_alpha", str(cfg.knn_alpha),
+           "--knn_k", str(cfg.knn_k)]
+    if cfg.knn_alpha > 0 and cfg.knn_full_pool and os.path.exists(cfg.ref_clean):
+        cmd += ["--knn_pool_wav", os.path.abspath(cfg.ref_clean)]
+    if cfg.seed is not None:
+        cmd += ["--seed", str(cfg.seed)]
+    cmd += ["--fp16"]
+    run(cmd, stage="cascade", cwd=SOULX_DIR, env={"PYTHONPATH": SOULX_DIR})
+    gen = os.path.join(svc_dir, "generated.wav")
+    if not os.path.exists(gen):
+        raise Fail(f"cascade SVC 未产生输出: {gen}")
+    shutil.copy(gen, cfg.vocal_cascade_wav)
+    log.info(f"  -> {cfg.vocal_cascade_wav}")
+
+
 def stage_eval(cfg: Cfg) -> None:
     banner("Stage: 相似度评测 (ERes2NetV2, 对照真实语音)")
     out = run([VENVS["gsv"], os.path.join(ROOT, "eval_sim.py"),
@@ -505,11 +594,25 @@ def stage_eval(cfg: Cfg) -> None:
 
 def stage_mix(cfg: Cfg) -> None:
     banner("Stage: 混音 (人声 + 伴奏)")
-    for p in (cfg.vocal_wav, cfg.acc_wav):
-        if not os.path.exists(p):
-            raise Fail(f"缺少 {p}")
+    # 用户指定 > cascade 产物 > vocal.wav
+    if cfg.mix_vocal:
+        # 支持绝对路径或相对于歌曲目录的文件名
+        if os.path.isabs(cfg.mix_vocal):
+            vocal_input = cfg.mix_vocal
+        else:
+            vocal_input = cfg.p(cfg.mix_vocal)
+    elif os.path.exists(cfg.vocal_cascade_wav):
+        vocal_input = cfg.vocal_cascade_wav
+    else:
+        vocal_input = cfg.vocal_wav
+    
+    if not os.path.exists(vocal_input):
+        raise Fail(f"缺少人声输入: {vocal_input}")
+    if not os.path.exists(cfg.acc_wav):
+        raise Fail(f"缺少 {cfg.acc_wav}")
+    log.info(f"  人声输入: {vocal_input}")
     cmd = [VENVS["soulx"], os.path.join(WORKERS, "w_mix.py"),
-           "--vocal", cfg.vocal_wav, "--acc", cfg.acc_wav, "--out", cfg.mix_wav,
+           "--vocal", vocal_input, "--acc", cfg.acc_wav, "--out", cfg.mix_wav,
            "--vocal-gain", str(cfg.vocal_gain), "--acc-gain", str(cfg.acc_gain),
            "--match-margin", str(cfg.match_margin),
            "--match-max-boost", str(cfg.match_max_boost),
@@ -529,6 +632,8 @@ STAGE_FN = {
     "select": stage_select,
     "ext": stage_ext,
     "svc": stage_svc,
+    "svs": stage_svs,
+    "cascade": stage_cascade,
     "eval": stage_eval,
     "mix": stage_mix,
 }
@@ -648,6 +753,9 @@ def main() -> None:
                     help="混音软限幅上限 dBFS；0 = 关闭改用硬削波（默认 -0.5）")
     ap.add_argument("--mix-mono", action="store_true",
                     help="混音输出单声道（默认保留伴奏立体声）")
+    ap.add_argument("--mix-vocal", default=None,
+                    help="混音人声输入路径。默认自动选择：优先 vocal_cascade.wav，"
+                         "不存在则回退到 vocal.wav。可指定绝对路径或相对于 data/songs/<name>/ 的文件名")
     ap.add_argument("--no-sep-cache", action="store_true",
                     help="禁用分离缓存（sep/ref-sep 强制重新分离）")
     ap.add_argument("-v", "--verbose", action="store_true", help="打印子进程完整输出")
@@ -682,7 +790,7 @@ def main() -> None:
               vocal_gain=args.vocal_gain, acc_gain=args.acc_gain,
               match_acc=args.match_acc, match_margin=args.match_margin,
               match_max_boost=args.match_max_boost, limit_db=args.limit_db,
-              mix_mono=args.mix_mono, mix=args.mix,
+              mix_mono=args.mix_mono, mix_vocal=args.mix_vocal, mix=args.mix,
               no_sep_cache=args.no_sep_cache)
 
     setup_logging(cfg.log_file, args.verbose)
@@ -702,12 +810,20 @@ def main() -> None:
             log.info(f"  [{s}] 耗时 {time.time() - ts:.1f}s")
         log.info("")
         log.info(f"完成，用时 {(time.time() - t0) / 60:.1f} 分钟")
-        log.info(f"  纯人声 : {cfg.vocal_wav}")
-        log.info(f"  评测   : {cfg.p('eval.txt')}")
+        
+        # 根据跑过的阶段输出产物路径
+        if "svc" in stages and os.path.exists(cfg.vocal_wav):
+            log.info(f"  SVC 人声 : {cfg.vocal_wav}")
+        if "svs" in stages and os.path.exists(cfg.svs_vocal_wav):
+            log.info(f"  SVS 人声 : {cfg.svs_vocal_wav}")
+        if "cascade" in stages and os.path.exists(cfg.vocal_cascade_wav):
+            log.info(f"  级联人声 : {cfg.vocal_cascade_wav}")
+        if "eval" in stages and os.path.exists(cfg.p("eval.txt")):
+            log.info(f"  评测     : {cfg.p('eval.txt')}")
         if cfg.mix_wav in [cfg.p("mix.wav")] and os.path.exists(cfg.mix_wav):
-            log.info(f"  成品   : {cfg.mix_wav}")
-        else:
-            log.info("  混音   : 先验收纯人声，再 --stages mix（可调 --acc-gain）")
+            log.info(f"  成品     : {cfg.mix_wav}")
+        elif "mix" not in stages:
+            log.info("  混音     : 先验收纯人声，再 --stages mix（可调 --acc-gain）")
     except Fail as e:
         log.error("")
         log.error(f"失败: {e}")

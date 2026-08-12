@@ -22,25 +22,50 @@
 ## ⓿ 前置：拿到 vocal.wav 和 mix.wav
 
 ```bash
-# 完整流水线（默认不含 mix，先验收纯人声）
-python3 sing.py --ref data/voices/ref.wav --song data/songs/云烟成雨.flac --name 云烟成雨
+# 推荐：完整级联流程（SVS → SVC，最优音色 + 最低泄漏）
+python3 sing.py --ref data/voices/ref.wav --song data/songs/云烟成雨.flac \
+    --name 云烟成雨 --stages sep,ref-sep,f0-target,select,ext,svs,cascade \
+    --seed 1234
 
-# 验收 vocal.wav 后再混伴奏
-python3 sing.py --ref data/voices/ref.wav --song data/songs/云烟成雨.flac --name 云烟成雨 \
-    --stages mix --acc-gain 0.8
+# 快速预览：只跑 SVC（约 2 分钟，适合快速测试）
+python3 sing.py --ref data/voices/ref.wav --song data/songs/云烟成雨.flac \
+    --name 云烟成雨 --stages sep,ref-sep,f0-target,select,ext,svc \
+    --seed 1234
+
+# 验收后再混伴奏（cascade 产物是 vocal_cascade.wav）
+python3 sing.py --ref data/voices/ref.wav --song data/songs/云烟成雨.flac \
+    --name 云烟成雨 --stages mix --acc-gain 0.8
 ```
 
 产物都在 `data/songs/<name>/`：
 
 | 文件 | 用途 |
 |---|---|
-| `vocal.wav` | SVC 干声。**cues 转写必须用它** —— 伴奏会干扰 ASR 与能量门控 |
+| `vocal_cascade.wav` | **Cascade 干声（推荐）**。音色最优、泄漏最低，**成片优先用它** |
+| `vocal.wav` | SVC 干声。快速预览可用，但音色略逊于 cascade |
 | `mix.wav` | 人声 + 伴奏。**成片 `--audio` 用它**，否则 MV 没有伴奏 |
-| `eval.txt` | 音色相似度，先看这个决定要不要重跑 SVC |
+| `eval.txt` | 音色相似度，先看这个决定要不要重跑 |
+
+**为什么推荐 Cascade**：级联流程（SVS→SVC）在绿色全曲上验证，音色相似度 0.6525（比纯 SVC 高 +0.018），
+原唱泄漏 0.037（SVC 的 65%），A-C margin 0.141（SVC 的 3 倍）。机制：SVS 消除 whisper 内容特征中的
+原唱残留，SVC 二次转换时该残留变成参考音色的真实特征，不再是污染源。详见 `AGENTS.md` Cascade 章节。
 
 **两者时长严格一致**（同源，实测都是 240.782s），所以同一时间窗切出来的片段天然对齐 —— 
 口型在干声上算、成片用混音出，是安全的。这一点已量化验证过：SoulX-SVC 保留源时间轴，
 `vocal.wav` 与 `sep2/lead.wav` 逐 10s 窗互相关最大位移只有 10ms（0.3 帧 @30fps）。
+
+**Mix 阶段自动选择产物**：如果存在 `vocal_cascade.wav`，自动用它混伴奏；否则回退到 `vocal.wav`。
+也可以用 `--mix-vocal` 手动指定（支持绝对路径或相对于 `data/songs/<name>/` 的文件名）：
+
+```bash
+# 强制使用 SVC 干声混音（而不是 cascade）
+python3 sing.py --ref data/voices/ref.wav --song data/songs/云烟成雨.flac \
+    --name 云烟成雨 --stages mix --mix-vocal vocal.wav
+
+# 或使用绝对路径
+python3 sing.py --ref data/voices/ref.wav --song data/songs/云烟成雨.flac \
+    --name 云烟成雨 --stages mix --mix-vocal /path/to/custom_vocal.wav
+```
 
 `--acc-gain` 是伴奏音量（默认 0.8）；人声侧是 `--vocal-gain`（默认 1.0）。
 

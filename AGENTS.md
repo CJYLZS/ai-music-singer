@@ -782,6 +782,326 @@ architectural limit in a full-song zero-shot SVC use case. Changing the encoder 
 invalidate the pretrained tokenizer (needs retraining with 101k hours of data). Manual segmentation trades
 音色一致性 for覆盖, and you'd still lose to SoulX which already has the segmentation + global timbre anchor.
 
+### Score-control SVS (2026-08): MIDI + 歌词直接合成，不用原唱音频 —— 首跑成功，泄漏归零
+
+我们一直只用了 SoulX-Singer 的一半。仓库里的 `cli/inference.py --control score` 走的是**另一个
+checkpoint**（`model.pt` 2.82GB，SVS；`sing.py` 用的是 `model-svc.pt`），输入是**音符 + 歌词**，
+`soulxsinger.py:121-125` 在 score 模式下把 `gt_f0 = None`，**原唱音频完全不进模型**。上游在
+issue #5 里确认："the model takes notes + lyrics and directly generates a full singing
+performance. No source vocal is required."
+
+首跑（`singing/w_svs.py`，绿色的 24.9s 语音 prompt + 上游 `example/audio/music.json` 的人工校对
+乐谱，`--control score --pitch-shift 0`，fp16）：**51.24s / 18.65s 推理 / 704M 参数**。
+
+**结果的关键在于它把本文件反复记录的那条主线瓶颈直接绕掉了。** `eval_triad`（3s 窗，同 `eval_sim`
+协议，4 位 impostor）：
+
+| | B(难度基线) | A(out vs ref) | C(out vs target) | excess | progress | A−C win% |
+|---|---|---|---|---|---|---|
+| **score SVS** | 0.2715 | **0.6156** | 0.3941 | **−0.1959** | 0.472 | **100%** |
+| SVC 历史最好（绿色） | 0.4046-0.4295 | 0.6034-0.6487 | 0.6090-0.6604 | −0.07…+0.14 | 0.22-0.36 | 25-80% |
+
+三个数字要分开读：
+- **`excess = −0.1959`，泄漏是负的** —— 输出比"随便另一个歌手"更不像原唱。SVC 路线上 6/9 首歌
+  有真实泄漏（song_6 高达 +0.1414），根因是 whisper 内容特征里的原唱残留（也是 `--cfg` 必须从
+  上游 3.0 降到 0.5 的原因）。score 模式不读原唱，这类泄漏在原理上不存在，实测确认。
+- **`A−C win% = 100%`**（全部 16 个窗都更像参考）。SVC 路线上这个数字跨越 10%-80%，
+  kNN 调到最好才刚过 50%，本文件当时把"crossing 50% 是 first for this workspace"单独记了一笔。
+- **`progress = 0.472`，是本工作区最高**（SVC 最好 0.355，均值 0.279）。注意 B 只有 0.2715
+  ——这首 demo 歌的原唱离我们的参考更远，所以 A=0.6156 的绝对值不能和 SVC 的 A 直接比，
+  **progress 才是可比的量**，而它高出 33%。
+
+**音高完全跟谱**：输出 F0 中位 329.0Hz = MIDI 64.0，乐谱中位 MIDI 64.0，误差 0.0。
+**吐字可用**：`eval_cer` 0.2542（S=7 D=2 I=6，63 字），D 只有 2 说明没有吞字/内容塌陷 ——
+对照 kNN α=0.4 那次是"3 首全负、CER +5.9 点"的量级，这里不是那个性质。
+
+**步骤 1（先做的 go/no-go 门）：语音参考能产出可用的 note 标注。** score 模式对 **prompt 侧也要**
+`note_pitch`（`soulxsinger.py:123`），而我们的素材是说话、说话没有音符 —— 这是整条路唯一可能
+直接死掉的地方，所以先单独验（`singing/probe_svs_prompt.py`，不需要 SVS 权重，可在下载期间跑）。
+绿色的 24.9s `prompt.wav`：
+
+| 指标 | 实测 | 判据 |
+|---|---|---|
+| `|note − F0|` | **median 0.37 st**（mean 0.65，>1st 仅 14/97） | <0.5 为好 → 音符确实在描述这段音频 |
+| note 时长 | median **0.180s**，<0.1s 仅 9/99 | 无碎片化 |
+| pitch median | MIDI **61.0** | 与 F0 推出的 60.8 吻合 |
+| notes/sec | 5.23 | 看着高于"唱歌 2-4"，但**与 97 个 ASR 字 1:1 对应**（中文语速 ~5 音节/秒），是字级对齐不是切碎 |
+
+**`notes/sec` 那一行是本轮唯一差点误判的地方**：单看它会以为 ROSVOT 把语音语调切成了碎片，
+实际对照字数就知道是正常的。判据要用 `|note − F0|` + 中位时长，不要用 notes/sec 单独下结论。
+
+坑与实现要点：
+- **`phoneme` 是音节级不是音素级**（`zh_tui1` 整个是一个 token，phone_set 2820 项里中文 1201、
+  粤语 1529、英文 70）。所以歌词→phoneme 只要 `g2pM`/`ToJyutping`，**不需要 MFA 强制对齐**；
+  `duration` 直接等于音符时长（`preprocess/utils.py:155`），时间信息全部来自 MIDI。
+  这意味着可以纯手写 metadata.json，完全不碰音频。
+- **prompt 只用 `prompt_meta_list[0]`**（`cli/inference.py:82`），后面的段全部丢弃。所以
+  `--max-merge-ms` 才是决定"参考用了多少"的旋钮；`w_svs.py` 把首段单独写成 `prompt_first.json`
+  让这件事在产物里显式可见。
+- **传给推理的 prompt wav 必须是 metadata 所描述的那个文件**（`time` 字段是它的索引），
+  即 pipeline 自己写出的 `long_cut_wavs/<index>.wav`，**不能传原始 `prompt.wav`**。
+- **`preprocess/tools/__init__.py` 把 import 失败吞成 `= None`**，于是缺依赖的表现是
+  `TypeError: 'NoneType' object is not callable`，而不是 ImportError。排查要逐个手动 import。
+- **不要用"缺什么模块就 pip 装同名包"的循环**：`funasr` 缺的 `hydra` 对应的是 `hydra-core`，
+  而 PyPI 上真有一个叫 `hydra` 的无关 C 扩展，会编译失败并让循环空转。正确做法是
+  `importlib.metadata.requires('funasr')` 拿到真实依赖名单。
+- SoulX venv 补装（**全部 `--no-deps`，保住 torch 2.6+cu124 / numpy 1.26**，实测补装后
+  SVC 路线的 import 与 CUDA 均正常）：`funasr==1.3.0 matplotlib==3.10.8` + funasr 的核心依赖
+  （jamo jieba pytorch-wpe oss2 umap-learn jaconv hydra-core tensorboardX modelscope
+  sentencepiece kaldiio torch_complex editdistance pynndescent）+ matplotlib 的
+  （pyparsing cycler python-dateutil kiwisolver fonttools contourpy six pillow）+ note 转录的
+  （pretty_midi==0.2.11 mido webrtcvad ml_collections pyworld importlib_resources
+  **setuptools==80.9.0** —— pyworld 用 `pkg_resources`，81+ 会失败）+ g2p 的
+  （ToJyutping==3.2.0 g2p_en g2pM nltk）。
+- 权重 `singing/download_svs.py`（固定 `.part` + `curl -C -` + LFS sha256 校验，幂等）。
+  **故意不下 3.42GB**：karaoke 1.72GB + dereverb 0.91GB（只有 `vocal_sep=True` 用，我们自己的
+  `sep`/`ref-sep` 已产干声，且 karaoke ckpt 与 GPT-SoVITS 里那份同一个文件）、
+  parakeet 2.47GB（纯英文 ASR）。实下 13 个文件；注意 `rosvot/rmvpe/model.pt` 与顶层
+  `rmvpe/rmvpe.pt` 是**两个不同文件**，前者由 `note_transcription/model.py:294` 按
+  `<ckpt>/../../rmvpe/model.pt` 推导，漏了会报路径错。
+
+#### 听感反馈「转音转得过快，短时间转了好多个音」—— 真因不是音高，是 slur 处重新起音
+
+用户听感一次就指对了问题存在，但**指向的原因是错的，而且三个显而易见的音高假设全部被实测否掉**。
+这一节值得完整保留，因为"照着听感描述去改音高"会完全走空。
+
+先量谱子，它不碎：86 音符 / 51.0s，**sounding 1.51 音符/秒**，中位时长 0.38s，<0.2s 只有 5/77。
+再量三路 F0（RMVPE，50Hz 栅格，与 `target_f0.npy` 同协议）：
+
+| | 相邻帧跳变 mean(st/20ms) | >0.5st 帧 | 稳定音段占比 | 可分辨音高台阶 |
+|---|---|---|---|---|
+| 真实歌手 | 0.2574 | 14.85% | 31.4% | 62 |
+| **我们的输出** | **0.1732** | **6.62%** | **59.4%** | **49** |
+| 音符阶梯（谱面） | 0.0648 | 2.51% | 90.4% | 45 |
+
+**我们的输出比真实歌手更平滑，不是更抖** —— 跳变只有真人的 67%，稳定音占比几乎翻倍，
+可分辨台阶 49 个还少于真人的 62 个（台阶/谱面音符 = 0.64，真人 0.81）。滑音时长也更长
+（median 50ms vs 真人 40ms）。slur 处最大单帧跳变更是只有真人的 **0.54×**。
+所以"转太快/转了好多音"在音高维度上**全部指标反向**，四个角度一致，不是噪声。
+
+真因在**能量/发音**维度。测 slur 边界（`note_type=3`，同一个字跨多个音符）处的能量凹陷
+（0=完全连贯，1=完全断开，取边界前后 6 帧的 max 与中心 5 帧的 min 之比）：
+
+| | mean dip | 硬断开 >0.5 |
+|---|---|---|
+| 真实歌手 | **0.196** | **0/13** |
+| baseline（score 模式） | **0.434**（4 次 std 0.012） | **5/13** |
+
+**同一个字被重新起音了** —— 辅音在元音中途重新发一次，耳朵把它听成一个新的、赶出来的音，
+于是描述成"转音太快"。机制是确定的两条叠加：(1) metadata 在每个 slur 音符上**重复整个音节**
+（`为/zh_wei4` 后面又是 `为/zh_wei2`，`群/zh_qun2` 后面又是 `群/zh_qun2`）；
+(2) `DataProcessor.preprocess`（`data_processor.py:94-105`）给**每个音符**都套
+`<BOW> … <EOW>` 词边界 token，slur 音符也不例外，于是模型在元音中间收到一个全新的词起始信号。
+
+**"把 slur 的 phoneme 换成延音符号"这个最自然的修法是错的，两点各自独立地否掉它：**
+phone_set 2820 项里**没有延音 token**（`<SP>` 是静音，特殊符号只有 PAD/SP/AP/UNK/BOW/EOW/BOS/
+EOS/MASK/SEP + 10 个占位），而且**重复音节正是上游自己的惯例** —— zh/en/yue 三个 demo
+metadata 全都这么写（`懦/懦`、`you're/you're`、`睬/睬`），即模型就是在这种标注上训练的，
+换成别的写法是 OOD。
+
+四臂实验（`singing/fix_slur.py` 只改 metadata，不碰音频不重训；`--seed` 配对）：
+
+| 臂 | slur dip | 硬断 | A (out vs ref) | 说明 |
+|---|---|---|---|---|
+| baseline (score) | 0.407 | 5/13 | **0.5986** | |
+| A: merge slur (score) | 0.514 | 7/13 | 0.5762 | **反而更差** |
+| B2: melody + 真实 F0 | 0.403 | 5/13 | 0.5385 | 对照臂 |
+| **B3: melody + 合成平滑曲线 + 颤音** | **0.244** | **2/13** | 0.4666 | 唯一修好发音的 |
+| 真实歌手 | 0.196 | 0/13 | — | |
+
+两个反直觉结论：
+- **合并 slur 音符（A 臂）不但没用，还更糟**（dip 0.514）。所以"音符太多"从来不是原因 ——
+  这也和上面音高侧的四个指标一致。
+- **B2（喂真实 F0）也没修好**（0.403）。所以修好发音的不是"换成 melody 模式"，而是
+  **连续 F0 条件本身要足够平滑**：合成曲线（raised-cosine 过渡，glide 70-90ms）的
+  相邻帧跳变是 0.0649，真实 F0 是 0.2574，前者才把 dip 压到 0.24。
+
+**代价很大，所以目前不作为默认**：B3 的 A 从 0.5986 掉到 0.4666（**−0.132**，是噪声底的 20 倍），
+`progress` 0.449 → 0.268。方向在 2 个 seed 上一致（−0.132 / −0.139）。推测是曲线过于机械
+（即使加了 45 cents 颤音，跳变 0.219 仍低于真人 0.257），音色通道被这条"非人类"的 F0 拖累。
+未测的下一步：把合成曲线的随机微扰进一步做到真人统计量（drift + 音头微升 + 句末下滑），
+或只在 slur 局部用 melody 条件、其余仍走 score。
+
+**这一轮暴露了一个必须先修的测量缺陷：SVS 路线之前完全没有播种。**
+`cli/inference.py` 从不调 `manual_seed`，CFM 初始噪声（`flow_matching.py:282`）走全局 RNG，
+所以**同配置 4 次 md5 全不同**，A 的 std = **0.0065**（range 0.017），slur dip 的 std = 0.012。
+本节最初的四臂对比是 4 次单抽，其中 A_merge 的 −0.039 就在 2σ 边缘、不可信；结论重跑成配对后才成立。
+已打本地补丁（与 SVC 那份同构）：`soulxsinger.py:infer(seed=, rescale_cfg=)` →
+`CFMDecoder.reverse_diffusion(seed=)`（这层早就有了）+ `cli/inference.py --seed/--rescale_cfg`，
+segment *i* 用 `seed + i`。验证：同 seed 两次 **md5 完全一致**。`w_svs.py` 默认 `--seed 1234`。
+
+#### 补上业界标准指标: FFE/GPE/VDE + MCD，并推翻上一节的"修好了"结论
+
+用户听感复核 B3（melody+合成曲线）："**吐字变得更不清晰，音准也变得更差**"，要求回到 baseline。
+这与上一节仅凭 slur dip 得出的"唯一修好发音的臂"直接冲突。补齐 SVS 领域标准指标后，
+**用户是对的，上一节的结论是错的** —— dip 是个太窄的指标，它只看 slur 边界那 12 帧的能量，
+既不测音准也不测吐字。
+
+新增两个工具（业界通用，对齐 SoulX-Singer-Eval / TCSinger2 / DiTSinger 的口径）：
+- `singing/eval_pitch.py` — **FFE / GPE / VDE**（pyworld DIO+Stonemask，10ms hop）
+- `singing/eval_mcd.py` — **MCD**（pymcd，`dtw_sl` 模式，与 SoulX-Singer-Eval 同一个库）
+
+四臂全指标（参考 = `music.json` 的 `f0` 字段，即真实歌手干声；seed 固定 1234）：
+
+| 臂 | FFE(cents)↓ | GPE%↓ | VDE%↓ | CER↓ | slur dip↓ | A(SIM)↑ |
+|---|---|---|---|---|---|---|
+| **score baseline** | **61.6** | 35.9 | 14.6 | 0.407 | 0.407 | **0.599** |
+| merge only (score) | 100.6 | 47.4 | 15.7 | **0.271** | 0.514 | 0.576 |
+| **B3 melody+合成曲线** | 57.6 | 37.5 | 14.6 | 0.322 | **0.244** | 0.467 |
+| melody + 真实 F0（对照） | **14.6** | **4.0** | **9.6** | 0.475 | 0.403 | 0.539 |
+
+**为什么用户听到"音准更差"而 FFE 说 B3 更好（57.6 vs 61.6）**：这 4 cents 差异只有 6%，
+而 **GPE 反而升高**（37.5% vs 35.9%）—— GPE 数的是 >50 cents 的**粗大错误**，也就是耳朵
+真正听成"跑调"的那种错。FFE 是平均值，会被大量微小改善摊平；**听感对应的是 GPE 而非 FFE**。
+B3 的合成曲线让平均偏差略降、但明显跑调的地方变多了。
+
+**"吐字更不清晰"也被证实**：B3 的 CER 0.322，S（咬字变形）**从 8 升到 10**。虽然总 CER 比
+baseline 低（因为 baseline 的 D=15 吞字更多），但**用户感知的"不清晰"是 S 而不是 D** ——
+吞掉的字听不见，唱错的字才刺耳。
+
+**决定：回退到 score baseline（B1）**，按用户要求。`w_svs.py` 默认就是 `--control score`，
+不需要改代码；`fix_slur.py` 保留但不进默认流程。
+
+**两个必须记住的测量陷阱（都在本轮踩到并修掉）：**
+1. **`music.mp3` 是带伴奏的整首混音，不是干声。** 拿它当音高参考，pyworld 会把贝斯/伴奏
+   当基频（中位仅 **111Hz**，而真实人声是 **326.7Hz**），FFE 直接虚高到 **1260 cents**（>1 个八度）
+   且四臂排序全乱。正解是用 metadata 的 `f0` 字段（预处理时从分离人声提的），
+   `eval_pitch.py` 因此支持 `--ref-meta`/`--ref-f0`，并在中位基频 <160Hz 时主动告警。
+   **同理 MCD 在这里不可用**：14.7 vs 论文 SOTA 3-4，差距全部来自"混音 vs 干声"这个域差，
+   不是质量差异。MCD 是成对指标，零样本换音色（ref 与 gen 说话人不同）本就不该解释。
+2. **SoulX metadata 的 `time` 偏移必须补偿。** `music.json` 的 `time = [240, 51240]` ms，
+   `cli/inference.py` 把内容放在 240ms 处，而参考 F0 从 0 开始。不补这 240ms，
+   FFE 从 **62 虚高到 131 cents**（2 倍）。`eval_pitch.py` 默认做 ±600ms 整帧搜索，
+   实测最优偏移落在 **240-260ms**，与 metadata 完全吻合 —— 这也反向验证了搜索是对的。
+   验证链的另一端：喂真实 F0 那一臂 FFE = **14.6 cents / GPE 4.0%**，说明工具本身可信。
+
+**与 SOTA 的差距（同口径对比，论文数据见下）：**
+
+| 指标 | 我们 (score baseline) | SOTA | 差距 |
+|---|---|---|---|
+| SIM | 0.599（ERes2NetV2 协议） | 0.89-0.93（WavLM） | 协议不同不可直接比，但趋势上差 0.3 |
+| FFE | 61.6 cents ≈ 0.36 (>50c 帧率 35.9%) | 0.15-0.24 | **约 1.5-2 倍差** |
+| CER | 0.407 | 0.11（SoulX 论文 score 模式） | **约 3.7 倍差** |
+
+注意 SoulX 论文的 FFE 定义是"偏差 >20% 的帧比例"，与我们的 GPE（>50 cents ≈ 3%）口径不同，
+上表按可比项做了换算说明。**最大的短板是 CER 0.407 vs 论文 0.11** —— 但论文用的是人工精校
+乐谱 + 干净单段，我们这轮也是人工乐谱，所以差距不能全归给转录；下一步应先查是不是
+prompt 用了 25s 说话（论文 prompt 是唱歌）导致的域不匹配。
+
+#### 验证「CER 高是因为 prompt 用了说话而非唱歌」—— 假设被推翻，但挖出两个更严重的度量缺陷
+
+上一节推测 CER 0.407 vs 论文 0.11 的主因是"prompt 用 25s 说话、论文用唱歌"的域不匹配。
+**做了 6 seed 配对实验，这个假设不成立**（p=0.415）。过程里发现的两个度量缺陷比原假设重要得多。
+
+**缺陷 1：CER 的参考文本本身是错的。** 之前拿 `music.mp3`（带伴奏混音）的 ASR 当参考，
+它把「容颜」听成「双颜」、漏掉「从此我开始」。而 `music.json` 的 `text` 字段就是**真值歌词**
+（去掉 `<SP>/<AP>` 和 `note_type=3` 的重复字后 64 字）。用真值重测，baseline 的分解从
+「S=2 D=19」变成一眼可辨的问题：**几乎没有咬字错误，全是"漏字"**。
+
+**缺陷 2（关键）：`eval_cer` 对 51s 连续歌声整段转写会成块丢内容。**
+最差那个 seed 整段测 CER **0.5625**（只转出 29 字），把同一个文件切成 10s 窗逐段转写，
+CER 只有 **0.1094** —— **字其实全都唱出来了，0.45 的 CER 差异完全来自 ASR 侧**。
+原因是歌声没有语音那样的停顿，VAD 找不到切点，就把整段当一句喂给声学模型。
+逐窗转写可见内容是完整的：
+
+```
+sp6234 整段:  只是因为在人群中多看了你一一眼想你时你在眼前想你时你在脑海   (29字, CER 0.5625)
+sp6234 逐窗:  0-10s 只是因为在人群中多看了你一眼再也没能忘掉
+              10-20s 梦的梦想着偶然有一天      20-30s 再相见从此我开始孤单思念
+              30-40s 我想你时你在天边          40-50s 你在眼前想你时你在脑海
+```
+
+**用已知上限标定窗参数**（原唱混音跑自己，CER 越低说明协议损失越小）：
+
+| win/overlap | 0(整段) | 10/0 | 15/0 | 20/0 | 15/2 | **20/2** | 25/2 | 30/2 |
+|---|---|---|---|---|---|---|---|---|
+| CER | 0.125 | 0.328 | 0.156 | 0.141 | 0.203 | **0.078** | 0.094 | 0.125 |
+| D | 6 | 8 | 5 | 3 | 6 | **0** | 0 | 4 |
+
+`--win 20 --win-overlap 2` 成为新默认（**D=0**，比整段协议还低）。注意 `win=10` 反而最差
+（0.328）—— 窗太短会切在字中间，所以"分窗"不是越碎越好，必须标定。
+
+**修好协议后，噪声降到原来的 16%，原假设随即被推翻：**
+
+| | CER 均值 | std | range | 唱歌更好的 seed |
+|---|---|---|---|---|
+| 语音 prompt (25s) | 0.2031 | **0.0221** | 0.172-0.234 | — |
+| 唱歌 prompt (10.4s) | 0.1875 | 0.0328 | 0.156-0.234 | **3/6** |
+
+配对差 −0.0156，**t=−0.888 p=0.415，不显著**。修复前语音臂的 std 是 **0.1407**（range 0.141-0.563，
+同配置只换 seed 差 4 倍），那个方差几乎全是 ASR 协议噪声，不是模型行为。
+**上一节"CER 0.407"这个数字本身也是协议产物**，真值约 **0.20**。
+
+**但唱歌 prompt 确实有一个显著收益，在另一个指标上：**
+
+| 指标 | 语音 prompt | 唱歌 prompt | Δ | p |
+|---|---|---|---|---|
+| **VDE%**（有声/无声判断错误率） | 14.88 | **6.95** | **−7.93** | **0.010** |
+| FFE cents | 56.72 | 54.22 | −2.50 | 0.143 |
+| GPE% | 35.04 | 35.93 | +0.89 | 0.475 |
+
+**VDE 直接减半，3/3 seed 一致。** 说话有大量停顿和不发声段，唱歌是连续发声；用说话当 prompt
+让模型对"哪里该发声"不确定。这是听感上"发虚/含混"的真实来源，而 **CER 完全测不到它**
+（漏字和"该发声却没发声"是两件事）。音高准确度（FFE/GPE）则无显著变化 —— 与预期一致，
+score 模式的音高来自 MIDI，不依赖 prompt。
+
+**因此结论要分两半说**：想改 CER，换唱歌 prompt 没用（p=0.415）；但想改"发虚"，
+换唱歌 prompt 有效（VDE 减半，p=0.010）。**两者不能混为一谈**，这也是上一节把
+"用户说吐字变差"直接对应到 CER 时犯的同类错误。
+
+**尚未做**：唱歌臂用的是上游 `zh_prompt.mp3`（另一个说话人，10.4s 单段），所以
+SIM 不能与语音臂直接比（B 基线不同：0.5167 vs 0.2715）。要干净验证 VDE 收益能否用在
+我们自己的音色上，需要拿**绿色这位参考人的唱歌干声**当 prompt 重跑 —— 素材是有的
+（`data/songs/绿色/refsep2/lead.wav`），但那需要先给它做 note 标注。
+
+**尚未验证的（这一轮只证明了"能跑且泄漏归零"，没证明"整首歌更好听"）：**
+乐谱是上游人工校对过的，**没有测 MIDI 自动转录的误差如何传导**（上游 README 加粗警告转录误差
+影响很大）；只跑了 51s 单段，没跑整首；没做与 SVC 的同歌同参考配对 A/B（要用
+`singing/paired_eval.py`，`eval_sim` 的 RMS 门在两臂独立生效会导致窗口集不同）；
+没听感验收演唱细节（score 模式丢掉原唱的颤音/气声/转音强弱，可能偏平淡）。
+
+### Cascade pipeline (2026-08): SVS → SVC 级联，最优音色 + 最低泄漏
+
+**级联流程已集成到 `sing.py`**。动机：SVS (score-control) 消除了 whisper 内容特征中的原唱残留，
+SVC 二次转换时该残留变成**参考音色的真实特征**，不再是污染源。验证（绿色全曲 268.8s，seed=1234）：
+
+| 方法 | A (音色) | progress | excess (泄漏) | A-C margin | 更像参考 |
+|---|---|---|---|---|---|
+| **SVC** (melody-control) | 0.6347 | 0.360 | 0.0569 | 0.0473 | 65% |
+| **SVS** (score-control) | 0.5998 | 0.299 | 0.0435 | 0.0687 | 72% |
+| **Cascade** (SVS→SVC) | **0.6525** | **0.391** | **0.0370** | **0.1408** | **75%** |
+
+- **Cascade 最优**：音色 A=0.6525（比 SVC +0.0178，比 SVS +0.0527），progress 最高 0.391
+- **泄漏最低**：excess=0.0370（SVC 的 65%，SVS 的 85%），A-C margin 翻倍（0.1408 vs SVC 0.0473）
+- **机制验证**：SVS 输出已带参考音色，SVC 的 whisper 内容特征不再携带原唱残留
+
+#### 使用方法
+
+```bash
+# 完整级联流程（推荐用于最终成片）
+python3 sing.py --ref data/voices/ref.wav --song data/songs/song.flac \
+  --name song_cascade --stages sep,ref-sep,f0-target,select,ext,svs,cascade \
+  --seed 1234
+
+# 只跑 SVC（快速预览，约 2 分钟）
+python3 sing.py --ref data/voices/ref.wav --song data/songs/song.flac \
+  --name song_svc --stages sep,ref-sep,f0-target,select,ext,svc \
+  --seed 1234
+```
+
+#### 产物路径
+
+- SVC：`data/songs/<name>/vocal.wav`
+- SVS：`data/songs/<name>/svs/svs_vocal.wav`
+- **Cascade**：`data/songs/<name>/vocal_cascade.wav` ← **最终成片用这个**
+
+#### 实现细节
+
+- **SVS 阶段** (`singing/svs_song.py`)：MIDI 转录用 ROSVOT，歌词从 LRC 缓存读取，生成 metadata 后调用 `cli/inference.py --control score`
+- **Cascade 阶段**：提取 SVS 输出的 F0（`svs/svs_f0.npy`），复用同一套 `prompt_ext`，把 SVS 输出当作 SVC 的 source
+- **kNN 保持开启**：虽然 SVS 输出已是参考音色，kNN 在级联里仍贡献 +0.0116 音色（绿色），因为它替换的是内容特征分布而非音色通道
+- **所有路径转绝对路径**：SVC 以 `SOULX_DIR` 为 CWD，相对路径会找不到文件
+
 ### SVC engine A/B #3 (2026-08): HQ-SVC (AAAI'26 low-resource zero-shot)
 
 HQ-SVC = 解耦 codec + EVA 模块 + DDSP/diffusion 渐进生成，主打低资源零样本。Same 257s song, same ref; here we compared on the full song with the real `prompt_ext` as target (SoulX via `sing.py` full pipeline, HQ-SVC via `tools/HQ-SVC/cli_infer.py --shift 0`):
@@ -1185,6 +1505,11 @@ PC-NSF-HiFiGAN 默认 `--ext-method nsf`，seed-vc 可选。**默认走 MILP：`
 `eval` (eval_sim.py 对照真实语音) → `mix` (opt-in, `--mix`；人声增益默认跟随伴奏包络
 `--no-match-acc` 关，软限幅 `--limit-db -0.5`，保留伴奏立体声 `--mix-mono` 关，见下)。
 Worker 脚本在 `singing/w_*.py`，每个阶段用对应项目的 venv 跑。
+
+**`sing.py` 之外的另一条路（未接入 CLI）：score-control SVS**，不用原唱音频，只吃 MIDI + 歌词。
+`singing/download_svs.py` 拉权重、`singing/probe_svs_prompt.py` 验语音参考能否产 note 标注、
+`singing/w_svs.py` 端到端合成。首跑泄漏 `excess = −0.196`、`progress = 0.472`（本工作区最高），
+详见「Score-control SVS」一节。
 
 ### Gotchas (all hit in practice)
 
