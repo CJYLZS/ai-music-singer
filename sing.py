@@ -228,6 +228,7 @@ class Cfg:
     knn_alpha: float = 0.2   # kNN 内容特征替换强度（0.1-0.2 是 CER/SIM 双赢区，≥0.3 起吐字退化）
     knn_k: int = 4   # kNN 近邻数（默认 4，同 kNN-VC）
     knn_full_pool: bool = True   # kNN 检索池用完整参考人声而非 28.9s prompt_ext（绕开 whisper 30s）
+    knn_pool_wav: str = ""   # 显式指定 kNN 检索池（覆盖 knn_full_pool）；可用相对 out_dir 的路径
     n_steps: int = 32
     cfg: float = 0.5   # 上游默认 3.0，实测偏高（见 AGENTS.md「cfg 扫点」）
     rescale_cfg: float = 0.75   # CFG 外推的 std 归一化混合比（上游默认，0=关闭归一化）
@@ -237,6 +238,11 @@ class Cfg:
     dp_lam: float = 0.0   # DP 边界一致性惩罚权重（0=朴素 argmax；听到明显跳变时才往上调）
     vocal_gain: float = 1.0
     acc_gain: float = 0.8
+    # 治本一级：SVC 输出的电平包络在乐句内会有 3-5dB 下陷，match_acc 的 5s 窗跟不上，
+    # 于是混音后那些位置人声比原曲弱。用 sep2/lead.wav 逐帧校正包络（见 w_mix.py 文档）。
+    match_lead: bool = True
+    lead_smooth: float = 0.2   # 对齐平滑秒；实测 0.2 最优，1s/2s 跟不上乐句内下陷
+    lead_clip: float = 12.0   # 对齐增益双向限幅 dB（不限幅会放大静音帧底噪）
     match_acc: bool = True   # 人声增益跟随伴奏 RMS 包络（高潮段伴奏变厚，固定增益会压住人声）
     match_margin: float = 0.0   # 目标：人声 RMS 比伴奏高多少 dB
     match_max_boost: float = 8.0   # 跟随增益上限 dB
@@ -544,9 +550,11 @@ def stage_select_svs(cfg: Cfg) -> None:
         if not os.path.exists(p):
             raise Fail(f"缺少前置产物: {p}（先跑 svs 阶段）")
     out_wav = cfg.prompt_svs_mix_wav if mix else cfg.prompt_svs_wav
-    out_f0 = cfg.prompt_svs_mix_f0 if mix else cfg.prompt_svs_f0
+    out_f0  = cfg.prompt_svs_mix_f0  if mix else cfg.prompt_svs_f0
     log.info(f"  素材: {cfg.svs_vocal_wav}（SVS 输出，音域覆盖到歌曲全域）")
     extra: list[str] = []
+
+    # 干净素材（prompt.wav）**只在 mix 模式传**。
     if mix:
         # 干净素材必须是 prompt.wav（纯选段，未过 vocoder），**不能用 prompt_ext.wav**：
         # 后者 45% 是 PC-NSF 重合成的移调段，本身就带 vocoder 损失（实测 vs 真实参考
@@ -556,6 +564,7 @@ def stage_select_svs(cfg: Cfg) -> None:
             raise Fail(f"缺少干净素材: {cfg.prompt_wav}（先跑 select 阶段）")
         log.info(f"  干净素材: {cfg.prompt_wav}（纯选段，未过 vocoder；SVS 只补它到不了的频段）")
         extra = ["--clean", cfg.prompt_wav, "--clean-f0", cfg.prompt_f0]
+
     # svs_f0 由 cascade 阶段产出；单独跑 select-svs 时它可能还不存在
     if not os.path.exists(cfg.svs_f0):
         log.info("  先提 SVS 输出 F0")
@@ -577,6 +586,27 @@ def stage_select_svs(cfg: Cfg) -> None:
     log.info(f"  -> {out_wav}")
 
 
+def _knn_pool_path(cfg: Cfg) -> str | None:
+    """kNN 检索池的绝对路径，None = 不传（回退到 30s 截断的 prompt）。
+
+    显式 --knn-pool-wav 指向不存在的文件时直接 raise：静默回退到参考人声会让 A/B
+    看起来像"改了没效果"，而实际上根本没生效。
+    """
+    if cfg.knn_alpha <= 0:
+        return None
+    if cfg.knn_pool_wav:
+        p = cfg.knn_pool_wav
+        if not os.path.isabs(p):
+            cand = os.path.join(cfg.out_dir, p)
+            p = cand if os.path.exists(cand) else p
+        if not os.path.exists(p):
+            raise SystemExit(f"--knn-pool-wav 不存在: {cfg.knn_pool_wav}")
+        return os.path.abspath(p)
+    if cfg.knn_full_pool and os.path.exists(cfg.ref_clean):
+        return os.path.abspath(cfg.ref_clean)
+    return None
+
+
 def _svc_cmd(cfg: Cfg, svc_dir: str, seed: int | None) -> list[str]:
     """构建单次 SVC 推理命令。"""
     cmd = [VENVS["soulx"], os.path.join(SOULX_DIR, "cli", "inference_svc.py"),
@@ -596,8 +626,9 @@ def _svc_cmd(cfg: Cfg, svc_dir: str, seed: int | None) -> list[str]:
            "--knn_k", str(cfg.knn_k)]
     # kNN 检索池默认用完整参考人声（163s）而非 prompt_ext（28.9s）：检索池不进模型，
     # 不受 whisper 30s 硬顶约束，分块编码后匹配失败帧 9.8% -> 1.9%
-    if cfg.knn_alpha > 0 and cfg.knn_full_pool and os.path.exists(cfg.ref_clean):
-        cmd += ["--knn_pool_wav", os.path.abspath(cfg.ref_clean)]
+    pool = _knn_pool_path(cfg)
+    if pool:
+        cmd += ["--knn_pool_wav", pool]
     if seed is not None:
         cmd += ["--seed", str(seed)]
     return cmd + ["--fp16"]
@@ -724,8 +755,9 @@ def stage_cascade(cfg: Cfg) -> None:
            "--num_overlaps", str(cfg.num_overlaps),
            "--knn_alpha", str(cfg.knn_alpha),
            "--knn_k", str(cfg.knn_k)]
-    if cfg.knn_alpha > 0 and cfg.knn_full_pool and os.path.exists(cfg.ref_clean):
-        cmd += ["--knn_pool_wav", os.path.abspath(cfg.ref_clean)]
+    pool = _knn_pool_path(cfg)
+    if pool:
+        cmd += ["--knn_pool_wav", pool]
     if cfg.seed is not None:
         cmd += ["--seed", str(cfg.seed)]
     cmd += ["--fp16"]
@@ -793,7 +825,13 @@ def stage_mix(cfg: Cfg) -> None:
            "--vocal-gain", str(cfg.vocal_gain), "--acc-gain", str(cfg.acc_gain),
            "--match-margin", str(cfg.match_margin),
            "--match-max-boost", str(cfg.match_max_boost),
+           "--lead-smooth", str(cfg.lead_smooth),
+           "--lead-clip", str(cfg.lead_clip),
            "--limit-db", str(cfg.limit_db)]
+    if cfg.match_lead and os.path.exists(cfg.lead_wav):
+        cmd += ["--lead", cfg.lead_wav]
+    elif cfg.match_lead:
+        log.info(f"  跳过对齐原唱包络（缺少 {cfg.lead_wav}）")
     if not cfg.match_acc:
         cmd.append("--no-match-acc")
     if cfg.mix_mono:
@@ -893,6 +931,9 @@ def main() -> None:
                          "0=关闭")
     ap.add_argument("--knn-k", type=int, default=4,
                     help="kNN 近邻数（默认 4，同 kNN-VC）")
+    ap.add_argument("--knn-pool-wav", default="",
+                    help="显式指定 kNN 检索池 wav（覆盖 --knn-full-pool）。"
+                         "可用相对 data/songs/<name>/ 的路径，如 svs/svs_vocal.wav")
     ap.add_argument("--knn-full-pool", action="store_true", default=True,
                     help="kNN 检索池用完整参考人声(默认开启)，分块编码绕开 whisper 30s 截断；"
                          "匹配失败帧 9.8%%->1.9%%. --no-knn-full-pool 回退到 prompt_ext")
@@ -946,6 +987,13 @@ def main() -> None:
     ap.add_argument("--mix", action="store_true", help="跑混音阶段（验收纯人声后）")
     ap.add_argument("--vocal-gain", type=float, default=1.0)
     ap.add_argument("--acc-gain", type=float, default=0.8)
+    ap.add_argument("--no-match-lead", dest="match_lead", action="store_false", default=True,
+                    help="关闭「人声逐帧 RMS 对齐原曲主唱」。默认开：SVC 输出乐句内会有 "
+                         "3-5dB 电平下陷，不校正则混音后那些位置人声比原曲弱")
+    ap.add_argument("--lead-smooth", type=float, default=0.2,
+                    help="对齐原唱包络的平滑时长秒（默认 0.2；调大跟不上乐句内下陷）")
+    ap.add_argument("--lead-clip", type=float, default=12.0,
+                    help="对齐原唱包络的增益双向限幅 dB（默认 12）")
     ap.add_argument("--no-match-acc", dest="match_acc", action="store_false", default=True,
                     help="关闭「人声增益跟随伴奏包络」，回到固定增益")
     ap.add_argument("--match-margin", type=float, default=0.0,
@@ -987,10 +1035,13 @@ def main() -> None:
               max_seg_sec=args.max_seg_sec, num_overlaps=args.num_overlaps,
               knn_alpha=args.knn_alpha, knn_k=args.knn_k,
               knn_full_pool=args.knn_full_pool,
+              knn_pool_wav=args.knn_pool_wav,
               n_steps=args.n_steps, cfg=args.cfg, rescale_cfg=args.rescale_cfg,
               pitch_shift=args.pitch_shift,
               seed=args.seed, n_seeds=args.n_seeds, dp_lam=args.dp_lam,
               vocal_gain=args.vocal_gain, acc_gain=args.acc_gain,
+              match_lead=args.match_lead, lead_smooth=args.lead_smooth,
+              lead_clip=args.lead_clip,
               match_acc=args.match_acc, match_margin=args.match_margin,
               match_max_boost=args.match_max_boost, limit_db=args.limit_db,
               mix_mono=args.mix_mono, mix_vocal=args.mix_vocal,

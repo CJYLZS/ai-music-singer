@@ -2,15 +2,22 @@
 
 SVC 输出 24kHz 单声道，伴奏 44.1kHz 立体声：重采样人声、对齐长度、混音、写 PCM16。
 
-三个默认行为，都可关：
+四个默认行为，都可关：
 
-1. **`--match-acc`（默认开）人声增益跟随伴奏 RMS 包络。** 歌曲高潮段伴奏通常比主歌
+1. **`--match-lead`（默认开）人声逐帧 RMS 对齐原曲主唱。** SVC 输出的电平包络与原唱
+   不一致：乐句内会有 3-5dB 的下陷，而 `--match-acc` 的 5s 窗跟不上这种快速抖动，于是
+   混音后这些位置人声比原曲更弱。用 `sep2/lead.wav` 做逐帧参照（200ms 平滑）把包络
+   校正回原唱的走向。实测云烟成雨：3s 窗「比原曲弱」的窗从 55.9% → 3.2%，最差
+   −5.67dB → −0.39dB，且动态范围与包络相关都**更接近**原曲（22.5→20.4dB / r 0.86→0.94）
+   —— 它是在恢复原唱动态，不是压扁。`--no-match-lead` 关闭。
+2. **`--match-acc`（默认开）人声增益跟随伴奏 RMS 包络。** 歌曲高潮段伴奏通常比主歌
    响 10-15dB（编曲加厚），而 SVC 人声全程电平平稳 —— 固定增益必然导致后半段人声被
    伴奏压过。原曲不这样是因为母带做过压缩，而分离出的 acc 保留了那层压缩、vocal 没有。
-   `--no-match-acc` 回到固定增益。
-2. **`--limit-db`（默认 -0.5）软限幅代替硬削波。** 人声抬升后原始和峰值会超过 0dBFS，
+   `--no-match-acc` 回到固定增益。**与 1 是两级不同时间尺度**：这一级管慢变的段落平衡，
+   上一级管乐句内的快速抖动。
+3. **`--limit-db`（默认 -0.5）软限幅代替硬削波。** 人声抬升后原始和峰值会超过 0dBFS，
    `np.clip` 会把增益换成可听失真。传 0 关闭。
-3. **保留伴奏立体声，人声居中。** 旧版把伴奏 `mean(axis=0)` 压成单声道再复制成假立体声
+4. **保留伴奏立体声，人声居中。** 旧版把伴奏 `mean(axis=0)` 压成单声道再复制成假立体声
    （L/R 相关 1.000000），丢掉了伴奏的空间信息。`--mono` 输出真单声道。
 """
 
@@ -29,6 +36,67 @@ def _frame_rms(x: np.ndarray, hop: int) -> np.ndarray:
         return np.zeros(0, dtype=np.float64)
     f = x[:n].astype(np.float64).reshape(-1, hop)
     return np.sqrt(np.mean(f * f, axis=1))
+
+
+def lead_norm_curve(
+    voc: np.ndarray,
+    lead: np.ndarray,
+    sr: int,
+    *,
+    smooth_sec: float,
+    clip_db: float,
+    gate_db: float,
+) -> tuple[np.ndarray, dict]:
+    """把人声的逐帧 RMS 包络对齐到原曲主唱，返回（采样级增益曲线, 诊断）。
+
+    这是「治本」的一级：SVC 输出的电平抖动在源头就被校正，不依赖后面 `match_gain_curve`
+    那个 5s 窗去追。三个设计要点：
+
+    - **只在两者都有声的帧上算比例。** 单侧有声的帧（SVC 多吐了气声 / 原唱有和声尾音）
+      比例无意义；静音段用最近的有声值插值填充，避免边界处增益跳变。
+    - **`clip_db` 双向限幅（默认 ±12dB）。** 不限幅时静音帧的比例会炸到几百倍，把
+      SVC 的底噪连同抖动一起放大 —— 第一版就是这么错的（gain 撞到上限 5.0、峰值 +2.6dBFS）。
+    - **`smooth_sec` 决定时间尺度，200ms 是实测最优。** 更慢（1s/2s）跟不上乐句内的下陷，
+      std 从 0.43 退化到 0.81/1.03；更快会开始跟踪单个音素的自然起伏。
+    """
+    hop = max(1, int(sr * 0.02))  # 20ms 分析帧
+    fv = _frame_rms(voc, hop)
+    fl = _frame_rms(lead, hop)
+    m = min(len(fv), len(fl))
+    fv, fl = fv[:m], fl[:m]
+    if m == 0:
+        return np.ones(len(voc), dtype=np.float64), {}
+
+    thr = 10 ** (gate_db / 20)
+    both = (fv > fv.max() * thr) & (fl > fl.max() * thr)
+    if not both.any():
+        return np.ones(len(voc), dtype=np.float64), {}
+
+    lim = 10 ** (clip_db / 20)
+    r = np.ones(m, dtype=np.float64)
+    r[both] = np.clip(fl[both] / np.maximum(fv[both], 1e-12), 1.0 / lim, lim)
+    idx = np.where(both)[0]
+    r = np.interp(np.arange(m), idx, r[idx])  # 静音段沿用最近的有声比例
+
+    wl = max(3, int(round(smooth_sec / 0.02)))
+    wl = wl if wl % 2 else wl + 1
+    wl = min(wl, m if m % 2 else m - 1)
+    if wl >= 3:
+        from scipy.signal import savgol_filter
+
+        r = np.clip(savgol_filter(r, wl, 1), 1.0 / lim, lim)
+
+    curve = np.interp(
+        np.arange(len(voc), dtype=np.float64), np.arange(m) * hop + hop // 2, r
+    )
+    d = 20 * np.log10(np.maximum(r[both], 1e-12))
+    return curve, {
+        "frames": int(both.sum()),
+        "total": m,
+        "min_db": float(d.min()),
+        "max_db": float(d.max()),
+        "mean_db": float(d.mean()),
+    }
 
 
 def match_gain_curve(
@@ -142,6 +210,15 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     ap.add_argument("--vocal-gain", type=float, default=1.0)
     ap.add_argument("--acc-gain", type=float, default=0.8)
+    ap.add_argument("--lead", default=None,
+                    help="原曲主唱（sep2/lead.wav），用于逐帧 RMS 对齐；缺省则跳过该级")
+    ap.add_argument("--match-lead", dest="match_lead", action="store_true", default=True,
+                    help="人声逐帧 RMS 对齐原曲主唱（默认开，需 --lead）")
+    ap.add_argument("--no-match-lead", dest="match_lead", action="store_false")
+    ap.add_argument("--lead-smooth", type=float, default=0.2,
+                    help="对齐平滑时长秒（默认 0.2；调大跟不上乐句内下陷）")
+    ap.add_argument("--lead-clip", type=float, default=12.0,
+                    help="对齐增益双向限幅 dB（默认 12）")
     ap.add_argument("--match-acc", dest="match_acc", action="store_true", default=True,
                     help="人声增益跟随伴奏包络（默认开）")
     ap.add_argument("--no-match-acc", dest="match_acc", action="store_false")
@@ -173,6 +250,26 @@ def main() -> None:
     v = np.pad(v, (0, max(0, n - len(v))))[:n].astype(np.float64)
     a = a[:, :n].astype(np.float64)
     a_mono = a.mean(axis=0)
+
+    # 第一级（治本）：把 SVC 的电平包络校正到原唱，必须在 match_acc 之前 ——
+    # 后者的分析要读校正后的人声，否则它会去补偿一个已经被修掉的下陷。
+    if args.match_lead and args.lead:
+        ld, sr_l = librosa.load(args.lead, sr=None, mono=True)
+        if sr_l != sr_a:
+            ld = librosa.resample(ld, orig_sr=sr_l, target_sr=sr_a)
+        ld = np.pad(ld, (0, max(0, n - len(ld))))[:n].astype(np.float64)
+        lcurve, st = lead_norm_curve(
+            v, ld, sr_a, smooth_sec=args.lead_smooth,
+            clip_db=args.lead_clip, gate_db=args.match_gate,
+        )
+        if st:
+            v = v * lcurve
+            print(f"对齐原唱包络: {st['frames']}/{st['total']} 帧有声, "
+                  f"增益 {st['min_db']:+.1f} ~ {st['max_db']:+.1f} dB "
+                  f"(均值 {st['mean_db']:+.1f}), 限幅 ±{args.lead_clip:.0f}, "
+                  f"平滑 {args.lead_smooth * 1000:.0f}ms")
+        else:
+            print("对齐原唱包络: 跳过（无共同有声帧）")
 
     gain = np.ones(n)
     if args.match_acc:

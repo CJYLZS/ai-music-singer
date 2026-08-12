@@ -148,6 +148,8 @@ def main() -> None:
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--control", default="score", choices=["score", "melody"])
+    ap.add_argument("--cfg", type=float, default=None,
+                    help="CFM 的 CFG 引导强度。不给则用 config.infer.cfg（上游 3.0）")
     ap.add_argument("--max-merge-ms", type=int, default=20000)
     ap.add_argument("--limit-segments", type=int, default=0,
                     help=">0 只跑前 N 段（先验证流程再跑整首）")
@@ -240,7 +242,10 @@ def main() -> None:
             "--seed", str(args.seed),
             "--fp16",
         ]
-        print(f"[svs] 合成 {len(tmetas)} 段（control={args.control}, seed={args.seed}）")
+        if args.cfg is not None:
+            cmd += ["--cfg", str(args.cfg)]
+        print(f"[svs] 合成 {len(tmetas)} 段（control={args.control}, seed={args.seed}"
+              f"{'' if args.cfg is None else f', cfg={args.cfg}'}）")
         r = subprocess.run(cmd, env=dict(os.environ, PYTHONPATH=os.getcwd()))
         if r.returncode != 0 or not os.path.exists(gen):
             sys.exit(f"! 合成失败 (exit {r.returncode})")
