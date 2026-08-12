@@ -1,9 +1,7 @@
 #!/usr/bin/env python
 """零样本歌声合成 CLI：参考语音 -> 用参考音色唱给定歌曲。
 
-两条流水线（可独立运行或级联）：
-
-(1) SVC 流水线（纯音色转换，保留原唱旋律细节）:
+默认流水线（2026-08 起，成片 = vocal_psvs.wav）:
     song.flac
       ├─ BS-RoFormer          -> 人声(含和声) + 伴奏      (GPT-SoVITS venv)
       │    └─ karaoke 模型    -> 主唱 + 和声
@@ -12,20 +10,33 @@
       ├─ 参考音频(通常带BGM/BGM含人声) 同样两步分离 -> 纯人声 lead
       ├─ 纯人声切片 -> F0 分析 -> 贪心选段 -> prompt.wav (SoulX venv)
       ├─ PC-NSF-HiFiGAN 分层移调补齐高音区 -> prompt_ext.wav (tools/pcnsf venv)
-      ├─ SoulX-Singer SVC: prompt_ext + 主唱 -> 目标音色人声 (SoulX venv)
-      └─ ERes2NetV2 相似度评测（对照真实语音）  (GPT-SoVITS venv)
+      ├─ SVS (score-control): MIDI+歌词+prompt_ext -> svs_vocal.wav（音域覆盖全曲，
+      │    但音准差：>50cents 帧 ~38%）
+      ├─ select-svs: 从 svs_vocal 选段 -> prompt_svs.wav（音域到 624Hz，PC-NSF 到不了）
+      ├─ SoulX-Singer SVC: prompt_svs + 主唱 -> vocal_psvs.wav（音准修回 ~5%）
+      └─ 双锚点评测：主指标 = SIM vs svs_vocal，参考 = SIM vs 真实语音
 
-(2) SVS 流水线（score-control，MIDI+歌词直接合成，无原唱音色泄漏）:
-    song.flac -> 自动转录 MIDI + 歌词 -> SVS 合成（带参考音色）
+为什么分两段：SVS 负责"用参考音色覆盖全音域"，SVC 负责"用原唱主唱修回音准"。
+实测（爱笑的眼睛 75 窗配对）主指标 0.7432 -> 0.7881（+0.0449, p<1e-4），
+音准 5.4% -> 4.8%，CER 0.2793 -> 0.2500。详见 AGENTS.md「SVS prompt extraction」。
 
-(3) Cascade 流水线（SVS → SVC，结合两者优势，实测音色最优）:
+其他 prompt 变体（--svc-prompt）:
+    ext       旧默认，直接用 prompt_ext        -> vocal.wav（SIM vs 真实参考最高）
+    psvs_mix  干净素材优先 + SVS 补高音格      -> vocal_psvs_mix.wav（任何权重下都不最优）
+
+Cascade（另一条支线，opt-in）：把 SVS 输出当 SVC 的 *source* 而不是 prompt 来源
     SVS 输出 -> 提取 F0 -> SVC 二次转换（复用 prompt_ext）-> vocal_cascade.wav
 
-最简用法（纯 SVC）:
+最简用法（走默认流程）:
     python3 sing.py --ref data/voices/ref.wav --song data/songs/song.flac --name exp1
 
-Cascade 流程（当前最优配置）:
-    python3 sing.py --ref ... --song ... --name exp1 --stages sep,ref-sep,f0-target,select,ext,svs,cascade
+旧的纯 SVC 流程（不跑 SVS，快 ~1.5min）:
+    python3 sing.py --ref ... --song ... --name exp1 --svc-prompt ext \
+        --stages sep,ref-sep,f0-target,select,ext,svc,eval
+
+Cascade 流程:
+    python3 sing.py --ref ... --song ... --name exp1 \
+        --stages sep,ref-sep,f0-target,select,ext,svs,cascade
 
 先听后段纯人声再混伴奏（默认不含 mix 阶段）:
     python3 sing.py --ref ... --song ... --name exp1
@@ -53,8 +64,13 @@ from dataclasses import dataclass
 ROOT = os.path.dirname(os.path.abspath(__file__))
 log = logging.getLogger("sing")
 
-ALL_STAGES = ["sep", "stems4", "ref-sep", "f0-target", "select", "ext", "svc", "svs", "cascade", "eval", "mix"]
-OPT_IN_STAGES = {"mix"}  # 先验收纯人声，再 --mix
+# 阶段顺序即 --stages all 的执行顺序。**svc 必须排在 svs / select-svs 之后**：
+# 默认 --svc-prompt svs 要用 select-svs 产出的 prompt_svs.wav（见 Cfg.svc_prompt）。
+# cascade 是另一条支线（source 换成 SVS 输出），仍排在 svc 之后。
+ALL_STAGES = ["sep", "stems4", "ref-sep", "f0-target", "select", "ext",
+              "svs", "select-svs", "svc", "cascade", "eval", "mix"]
+# cascade 默认不跑：它与默认的 prompt_svs 路线是两条独立支线，同时跑只是浪费一次推理。
+OPT_IN_STAGES = {"mix", "cascade"}  # 先验收纯人声，再 --mix
 
 VENVS = {
     "gsv": os.path.join(ROOT, "GPT-SoVITS", ".venv", "bin", "python"),
@@ -76,6 +92,36 @@ RMVPE = os.path.join(ROOT, "SoulX-Singer", "pretrained_models",
                      "SoulX-Singer-Preprocess", "rmvpe", "rmvpe.pt")
 SVC_MODEL = os.path.join(ROOT, "SoulX-Singer", "pretrained_models", "SoulX-Singer", "model-svc.pt")
 SVC_CONFIG = os.path.join(ROOT, "SoulX-Singer", "soulxsinger", "config", "soulxsinger.yaml")
+
+# --- SVS (score-control) 侧，只在 --stages 含 svs 时才检查（见 preflight）---
+# 权威下载清单是 singing/download_svs.py 的 TARGETS（13 个文件），但这里**只列运行时
+# 真正被读取的**：preflight 误报「缺失」会 raise、把本来能跑的流程直接挡死，假阴性比
+# 漏检更糟。刻意不检查下载下来的 SoulX-Singer/config.yaml —— svs_song.py:232 传的是
+# repo 里的 soulxsinger/config/soulxsinger.yaml，即上面的 SVC_CONFIG，那份没人读。
+SVS_MODEL = os.path.join(ROOT, "SoulX-Singer", "pretrained_models", "SoulX-Singer", "model.pt")
+SVS_PHONESET = os.path.join(ROOT, "SoulX-Singer", "soulxsinger", "utils", "phoneme", "phone_set.json")
+PREPROC_ROOT = os.path.join(ROOT, "SoulX-Singer", "pretrained_models", "SoulX-Singer-Preprocess")
+# preprocess/pipeline.py:50-53 硬编码前两个（相对 SOULX_DIR）。第三个由
+# note_transcription/model.py 按 <rosvot_ckpt>/../../rmvpe/model.pt 推导，且与顶层
+# RMVPE(SoulX-Singer-Preprocess/rmvpe/rmvpe.pt) 是**两个不同文件**，漏了会报路径错。
+ROSVOT_CKPT = os.path.join(PREPROC_ROOT, "rosvot", "rosvot", "model.pt")
+RWBD_CKPT = os.path.join(PREPROC_ROOT, "rosvot", "rwbd", "model.pt")
+ROSVOT_RMVPE = os.path.join(PREPROC_ROOT, "rosvot", "rmvpe", "model.pt")
+# 歌词转写。pipeline.py:46 传的是**目录**，funasr 在其中读 model.pt / config.yaml /
+# tokens.json / am.mvn / seg_dict；这里只查主权重，其余文件的完整性由 download_svs.py
+# 的 size + sha256 校验保证。英文 parakeet(2.47GB) 故意没下：LyricTranscriber 虽然在
+# 构造时就收下 en 路径，但按语言懒加载，中文只走 seaco —— 已由两次跑通实证。
+SEACO_DIR = os.path.join(
+    PREPROC_ROOT, "speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch")
+SEACO_CKPT = os.path.join(SEACO_DIR, "model.pt")
+SVS_REQUIRED = [
+    ("SVS 模型", SVS_MODEL),
+    ("SVS phone_set", SVS_PHONESET),
+    ("ROSVOT 音符", ROSVOT_CKPT),
+    ("ROSVOT 词边界", RWBD_CKPT),
+    ("ROSVOT RMVPE", ROSVOT_RMVPE),
+    ("歌词 ASR seaco", SEACO_CKPT),
+]
 
 PCNSF_VENV = os.path.join(ROOT, "tools", "pcnsf", ".venv", "bin", "python")
 NSF_CONFIG = os.path.join(ROOT, "tools", "pcnsf_hifigan",
@@ -197,6 +243,32 @@ class Cfg:
     limit_db: float = -0.5   # 软限幅上限 dBFS；0 = 关闭改用硬削波
     mix_mono: bool = False   # 默认保留伴奏立体声，人声居中
     mix_vocal: str | None = None   # 混音人声输入路径（None=自动选择，优先 cascade）
+    # SVS 控制模式。**默认 score，不要改成 melody**：本流水线把 SVS 输出当作后续
+    # prompt 的音色来源（select-svs / --svc-prompt svs|psvs_mix），而 melody 会把原唱
+    # 的 f0 喂进模型（soulxsinger.py:126 gt_f0=meta['target']['f0']），原唱信息重新进入
+    # 音色链路 —— 那样提出来的 prompt_svs 会带原唱音色，整条设计的立论就没了。
+    # score = 只吃 MIDI+歌词，gt_f0=None（soulxsinger.py:124），原唱不进模型。
+    # 代价是音程走不完（绿色段0 音程走完比 0.26 vs 真人 0.64）、听感偏糊，但音准由
+    # 后续 SVC 用 target_f0 修回来（实测 >50cents 帧 37.9% -> 4.8%）。
+    svs_control: str = "score"
+    # SVS 用哪个 prompt。ext = prompt_ext.wav（音域扩展后，45s），prompt = prompt.wav。
+    # 注意 svs_song.py 的裁剪必须走 stratified，否则 prompt_ext 尾部的移调段会被切光。
+    svs_ref: str = "ext"
+    svs_prompt_max_sec: float = 20.0
+    # SVC 用哪个 prompt。ext = prompt_ext.wav（原流程）；svs = prompt_svs.wav
+    # （从 SVS 输出里选段，见 select-svs 阶段）。svs 的动机是 SVS 输出覆盖到 774Hz，
+    # 而 PC-NSF 受素材 med 上限约束到不了 547Hz+。
+    # psvs_mix = prompt_svs_mix.wav：分层混合，干净素材优先、SVS 只补它到不了的高音格。
+    # **默认 svs**（2026-08）。爱笑的眼睛 75 窗配对、seed 1234：主指标 SIM vs svs_vocal
+    # 0.7432 -> 0.7881（+0.0449, 75/75 窗, p<1e-4），已达 SVS 自身 0.8192 的 96%；
+    # 音准不受影响（>50cents 帧 5.4% -> 4.8%，音高来自 target_f0 而非 prompt）；
+    # 稳定性同向改善（drift 0.0783 -> 0.0692，worst 0.4286 -> 0.4941）；
+    # 按真歌词 CER 0.2793 -> 0.2500。代价是 SIM vs 真实参考 0.5899 -> 0.5735，
+    # 但那正好收敛到 SVS 自身的 0.5734 —— 绝对音色由 SVS 那一环负责。
+    # psvs_mix 三个变体都测过，在任何权重 w·S+(1-w)·R 下都不最优，见 AGENTS.md。
+    svc_prompt: str = "svs"
+    # select-svs 是否走分层混合（产出 prompt_svs_mix.wav 而不是 prompt_svs.wav）
+    select_svs_mix: bool = False
     mix: bool = False
     no_sep_cache: bool = False
 
@@ -258,8 +330,39 @@ class Cfg:
         return self.p("prompt_ext_f0.npy")
 
     @property
+    def prompt_svs_wav(self) -> str:
+        """select-svs 阶段产物：从 SVS 输出里选段拼成的 prompt。"""
+        return self.p("prompt_svs.wav")
+
+    @property
+    def prompt_svs_f0(self) -> str:
+        return self.p("prompt_svs_f0.npy")
+
+    @property
+    def prompt_svs_mix_wav(self) -> str:
+        """分层混合 prompt：干净素材优先，SVS 只补它到不了的高音格。"""
+        return self.p("prompt_svs_mix.wav")
+
+    @property
+    def prompt_svs_mix_f0(self) -> str:
+        return self.p("prompt_svs_mix_f0.npy")
+
+    @property
+    def svc_prompt_wav(self) -> str:
+        """SVC 实际使用的 prompt（由 --svc-prompt 选）。"""
+        return {"svs": self.prompt_svs_wav,
+                "psvs_mix": self.prompt_svs_mix_wav}.get(self.svc_prompt, self.prompt_ext_wav)
+
+    @property
+    def svc_prompt_f0(self) -> str:
+        return {"svs": self.prompt_svs_f0,
+                "psvs_mix": self.prompt_svs_mix_f0}.get(self.svc_prompt, self.prompt_ext_f0)
+
+    @property
     def vocal_wav(self) -> str:
-        return self.p("vocal.wav")
+        # 各臂产物分开，避免互相覆盖（A/B 需要同时留存）
+        return {"svs": self.p("vocal_psvs.wav"),
+                "psvs_mix": self.p("vocal_psvs_mix.wav")}.get(self.svc_prompt, self.p("vocal.wav"))
 
     @property
     def mix_wav(self) -> str:
@@ -273,6 +376,11 @@ class Cfg:
     def ext_shifted_dir(self) -> str:
         """ext 阶段的移调段输出目录（seedvc/ 或其他）。"""
         return self.p("seedvc")  # w_ext.py 写死这个名字
+
+    @property
+    def svs_ref_wav(self) -> str:
+        """SVS 的 prompt 输入（由 --svs-ref 选）。"""
+        return self.prompt_ext_wav if self.svs_ref == "ext" else self.prompt_wav
 
     @property
     def svs_vocal_wav(self) -> str:
@@ -316,6 +424,10 @@ def preflight(cfg: Cfg) -> None:
         ]
     elif cfg.ext_method == "seedvc":
         required += [("seed-vc venv", VENVS["seedvc"])]
+    # SVS 权重共 2.9GB，只在真要跑 svs 时才强制要求 —— 否则用 --svc-prompt ext 的旧
+    # 流程也被逼着下载。select-svs / cascade 只读 svs/ 下的产物，不加载这些模型。
+    if "svs" in (cfg.stages or []):
+        required += SVS_REQUIRED
     missing = [(label, p) for label, p in required if not os.path.exists(p)]
     for label, p in required:
         log.info(f"  [{'OK ' if os.path.exists(p) else '缺失'}] {label:<14} {p}")
@@ -425,14 +537,54 @@ def stage_ext(cfg: Cfg) -> None:
          "--device", cfg.device], stage="ext")
 
 
+def stage_select_svs(cfg: Cfg) -> None:
+    mix = cfg.select_svs_mix
+    banner(f"Stage: 构建 {'prompt_svs_mix（干净优先 + SVS 补高音）' if mix else 'prompt_svs'}")
+    for p in (cfg.svs_vocal_wav, cfg.target_f0):
+        if not os.path.exists(p):
+            raise Fail(f"缺少前置产物: {p}（先跑 svs 阶段）")
+    out_wav = cfg.prompt_svs_mix_wav if mix else cfg.prompt_svs_wav
+    out_f0 = cfg.prompt_svs_mix_f0 if mix else cfg.prompt_svs_f0
+    log.info(f"  素材: {cfg.svs_vocal_wav}（SVS 输出，音域覆盖到歌曲全域）")
+    extra: list[str] = []
+    if mix:
+        # 干净素材必须是 prompt.wav（纯选段，未过 vocoder），**不能用 prompt_ext.wav**：
+        # 后者 45% 是 PC-NSF 重合成的移调段，本身就带 vocoder 损失（实测 vs 真实参考
+        # 0.9259 vs prompt.wav 的 0.9550，差 0.029）。混合的立论是"低中音区用最高保真的
+        # 素材"，掺进移调误差就自相矛盾了。
+        if not os.path.exists(cfg.prompt_wav):
+            raise Fail(f"缺少干净素材: {cfg.prompt_wav}（先跑 select 阶段）")
+        log.info(f"  干净素材: {cfg.prompt_wav}（纯选段，未过 vocoder；SVS 只补它到不了的频段）")
+        extra = ["--clean", cfg.prompt_wav, "--clean-f0", cfg.prompt_f0]
+    # svs_f0 由 cascade 阶段产出；单独跑 select-svs 时它可能还不存在
+    if not os.path.exists(cfg.svs_f0):
+        log.info("  先提 SVS 输出 F0")
+        run([VENVS["soulx"], os.path.join(WORKERS, "w_f0.py"),
+             "--wav", cfg.svs_vocal_wav, "--out", cfg.svs_f0,
+             "--device", cfg.device, "--max-duration", "600"], stage="select-svs")
+    run([VENVS["gsv"], os.path.join(WORKERS, "w_select_svs.py"),
+         "--svs", cfg.svs_vocal_wav,
+         "--svs-f0", cfg.svs_f0,
+         "--target-f0", cfg.target_f0,
+         "--ref", cfg.ref_clean,
+         "--out-wav", out_wav,
+         "--out-f0", out_f0,
+         "--budget", str(cfg.max_sec),
+         *extra,
+         "--device", cfg.device], stage="select-svs")
+    if not os.path.exists(out_wav):
+        raise Fail(f"select-svs 未产生输出: {out_wav}")
+    log.info(f"  -> {out_wav}")
+
+
 def _svc_cmd(cfg: Cfg, svc_dir: str, seed: int | None) -> list[str]:
     """构建单次 SVC 推理命令。"""
     cmd = [VENVS["soulx"], os.path.join(SOULX_DIR, "cli", "inference_svc.py"),
            "--device", cfg.device,
            "--model_path", SVC_MODEL, "--config", SVC_CONFIG,
-           "--prompt_wav_path", cfg.prompt_ext_wav,
+           "--prompt_wav_path", cfg.svc_prompt_wav,
            "--target_wav_path", cfg.lead_wav,
-           "--prompt_f0_path", cfg.prompt_ext_f0,
+           "--prompt_f0_path", cfg.svc_prompt_f0,
            "--target_f0_path", cfg.target_f0,
            "--save_dir", svc_dir,
            "--pitch_shift", str(cfg.pitch_shift),
@@ -472,7 +624,7 @@ def _svc_multi_seed(cfg: Cfg) -> None:
     os.makedirs(cfg.p("svc"), exist_ok=True)
     report = cfg.p("svc", "dp_select.json")
     run([VENVS["gsv"], os.path.join(WORKERS, "w_dpselect.py"),
-         "--prompt", cfg.prompt_ext_wav,
+         "--prompt", cfg.svc_prompt_wav,
          "--target-f0", cfg.target_f0,
          "--cands", *cands,
          "--out", cfg.vocal_wav,
@@ -485,10 +637,13 @@ def _svc_multi_seed(cfg: Cfg) -> None:
 
 
 def stage_svc(cfg: Cfg) -> None:
-    banner("Stage: 歌声转换 (SoulX-Singer SVC)")
-    for p in (cfg.prompt_ext_wav, cfg.prompt_ext_f0, cfg.lead_wav, cfg.target_f0):
+    banner(f"Stage: 歌声转换 (SoulX-Singer SVC, prompt={cfg.svc_prompt})")
+    for p in (cfg.svc_prompt_wav, cfg.svc_prompt_f0, cfg.lead_wav, cfg.target_f0):
         if not os.path.exists(p):
-            raise Fail(f"缺少前置产物: {p}")
+            raise Fail(f"缺少前置产物: {p}"
+                       + ("（--svc-prompt svs 需先跑 select-svs 阶段）"
+                          if cfg.svc_prompt == "svs" else ""))
+    log.info(f"  prompt: {cfg.svc_prompt_wav}")
     if cfg.n_seeds > 1:
         _svc_multi_seed(cfg)
         return
@@ -516,21 +671,23 @@ def stage_svc(cfg: Cfg) -> None:
 
 
 def stage_svs(cfg: Cfg) -> None:
-    banner("Stage: SVS 合成 (score-control, MIDI+lyrics+ref)")
-    for p in (cfg.lead_wav, cfg.prompt_wav):
+    banner(f"Stage: SVS 合成 ({cfg.svs_control}-control, MIDI+lyrics+ref={cfg.svs_ref})")
+    for p in (cfg.lead_wav, cfg.svs_ref_wav):
         if not os.path.exists(p):
-            raise Fail(f"缺少前置产物: {p}")
-    # svs_song.py 默认用 prompt.wav（说话），可传 --prompt-wav 换成唱歌干声
-    # 这里保持与 SVC 一致：都用 prompt.wav（说话参考），方便直接对比
+            raise Fail(f"缺少前置产物: {p}"
+                       + ("（--svs-ref ext 需先跑 ext 阶段）" if cfg.svs_ref == "ext" else ""))
     svs_dir = cfg.p("svs")
     os.makedirs(svs_dir, exist_ok=True)
+    log.info(f"  prompt: {cfg.svs_ref_wav}（分层裁剪到 {cfg.svs_prompt_max_sec:g}s）")
     cmd = [VENVS["soulx"], os.path.join(WORKERS, "svs_song.py"),
            "--song-dir", cfg.out_dir,
            "--out-dir", svs_dir,
-           "--prompt-wav", cfg.prompt_wav,
+           "--prompt-wav", cfg.svs_ref_wav,
+           "--prompt-max-sec", str(cfg.svs_prompt_max_sec),
+           "--prompt-trim", "stratified",
            "--device", cfg.device,
            "--seed", str(cfg.seed) if cfg.seed is not None else "1234",
-           "--control", "score"]
+           "--control", cfg.svs_control]
     run(cmd, stage="svs", cwd=SOULX_DIR, env={"PYTHONPATH": SOULX_DIR})
     if not os.path.exists(cfg.svs_vocal_wav):
         raise Fail(f"SVS 未产生输出: {cfg.svs_vocal_wav}")
@@ -581,26 +738,46 @@ def stage_cascade(cfg: Cfg) -> None:
 
 
 def stage_eval(cfg: Cfg) -> None:
-    banner("Stage: 相似度评测 (ERes2NetV2, 对照真实语音)")
+    banner("Stage: 相似度评测 (ERes2NetV2)")
     out = run([VENVS["gsv"], os.path.join(ROOT, "eval_sim.py"),
                "--ref", cfg.ref_clean,
                "--gen", cfg.vocal_wav,
                "--f0", cfg.target_f0,
                "--ref-f0", cfg.prompt_f0], stage="eval")
+    log.info("  [对照真实语音]")
+    log.info("  " + out.replace("\n", "\n  "))
+    # prompt_svs / psvs_mix 路线的**主指标是 SIM vs svs_vocal**（音色由 SVS 那一环负责，
+    # 对真实参考的绝对分只作参考）。双锚点评测同时给出两列 + 音准，见 singing/eval_dual.py
+    dual = ""
+    if cfg.svc_prompt in ("svs", "psvs_mix") and os.path.exists(cfg.svs_vocal_wav):
+        cmd = [VENVS["gsv"], os.path.join(WORKERS, "eval_dual.py"),
+               "--gen", cfg.vocal_wav, "--labels", cfg.svc_prompt,
+               "--svs", cfg.svs_vocal_wav, "--ref", cfg.ref_clean,
+               "--target-f0", cfg.target_f0]
+        if os.path.exists(cfg.svs_f0):
+            cmd += ["--svs-f0", cfg.svs_f0]
+        dual = run(cmd, stage="eval")
+        log.info("  [双锚点: 主指标 = vs svs_vocal]")
+        log.info("  " + dual.replace("\n", "\n  "))
     with open(cfg.p("eval.txt"), "w", encoding="utf-8") as f:
         f.write(out + "\n")
-    log.info("  " + out.replace("\n", "\n  "))
+        if dual:
+            f.write("\n=== 双锚点（主指标 = vs svs_vocal）===\n" + dual + "\n")
 
 
 def stage_mix(cfg: Cfg) -> None:
     banner("Stage: 混音 (人声 + 伴奏)")
-    # 用户指定 > cascade 产物 > vocal.wav
+    # 用户指定 > 当前 --svc-prompt 对应的产物 > cascade 产物 > vocal.wav
+    # 注意顺序：cfg.vocal_wav 已随 --svc-prompt 变化（默认 svs -> vocal_psvs.wav），
+    # 所以它优先于 cascade —— cascade 现在是 opt-in 支线，不该悄悄顶掉默认产物。
     if cfg.mix_vocal:
         # 支持绝对路径或相对于歌曲目录的文件名
         if os.path.isabs(cfg.mix_vocal):
             vocal_input = cfg.mix_vocal
         else:
             vocal_input = cfg.p(cfg.mix_vocal)
+    elif os.path.exists(cfg.vocal_wav):
+        vocal_input = cfg.vocal_wav
     elif os.path.exists(cfg.vocal_cascade_wav):
         vocal_input = cfg.vocal_cascade_wav
     else:
@@ -633,6 +810,7 @@ STAGE_FN = {
     "ext": stage_ext,
     "svc": stage_svc,
     "svs": stage_svs,
+    "select-svs": stage_select_svs,
     "cascade": stage_cascade,
     "eval": stage_eval,
     "mix": stage_mix,
@@ -740,6 +918,31 @@ def main() -> None:
     ap.add_argument("--dp-lam", type=float, default=0.0,
                     help="DP 边界一致性惩罚权重（默认 0 = 朴素 argmax，均值最高）。"
                          "调高只换来更稳的边界、更低的均值（拿 SIM 换 drift，同 --cfg 的形状）")
+    ap.add_argument("--svs-control", default="score", choices=["score", "melody"],
+                    help="SVS 控制模式。**score 是默认，级联/prompt_svs 链路必须用它**："
+                         "只吃 MIDI+歌词，原唱不进模型(gt_f0=None)，所以从 SVS 输出提取的 "
+                         "prompt 不含原唱音色。melody 会把原唱 f0 喂进模型，音程过渡更像真人"
+                         "（音程走完比 0.62 vs score 0.26）但原唱信息重回音色链路 —— 只在"
+                         "单独听 SVS 成品、且不做 select-svs 时才考虑")
+    ap.add_argument("--svs-ref", default="ext", choices=["ext", "prompt"],
+                    help="SVS 用哪个 prompt。ext（默认）= prompt_ext.wav（音域扩展后）；"
+                         "prompt = prompt.wav。注意 svs_song.py 现按音高分层裁剪，"
+                         "否则 prompt_ext 尾部的移调段会被头部截断切光（实测切光后与"
+                         "完全不做 ext 不可分辨，p=0.064）")
+    ap.add_argument("--svs-prompt-max-sec", type=float, default=20.0,
+                    help="SVS prompt 时长上限（默认 20）。SVS 只用 metadata 第一段，"
+                         "过长会被 --max-merge-ms 切成多段而只用首段")
+    ap.add_argument("--svc-prompt", default="svs", choices=["svs", "ext", "psvs_mix"],
+                    help="SVC 用哪个 prompt。svs（默认）= prompt_svs.wav（从 SVS 输出选段，"
+                         "需 svs + select-svs 阶段）：主指标 SIM vs svs_vocal +0.0449 "
+                         "(75/75 窗, p<1e-4)，音准与稳定性同向改善；ext = prompt_ext.wav"
+                         "（旧默认，SIM vs 真实参考最高 0.5899）；"
+                         "psvs_mix = prompt_svs_mix.wav（分层混合：干净素材优先，SVS 只补"
+                         "它到不了的高音格）。三臂产物分别写 vocal.wav / vocal_psvs.wav / "
+                         "vocal_psvs_mix.wav，互不覆盖")
+    ap.add_argument("--select-svs-mix", action="store_true",
+                    help="select-svs 走分层混合，产出 prompt_svs_mix.wav（配 --svc-prompt "
+                         "psvs_mix 用）。干净素材取 prompt_ext.wav")
     ap.add_argument("--mix", action="store_true", help="跑混音阶段（验收纯人声后）")
     ap.add_argument("--vocal-gain", type=float, default=1.0)
     ap.add_argument("--acc-gain", type=float, default=0.8)
@@ -790,7 +993,11 @@ def main() -> None:
               vocal_gain=args.vocal_gain, acc_gain=args.acc_gain,
               match_acc=args.match_acc, match_margin=args.match_margin,
               match_max_boost=args.match_max_boost, limit_db=args.limit_db,
-              mix_mono=args.mix_mono, mix_vocal=args.mix_vocal, mix=args.mix,
+              mix_mono=args.mix_mono, mix_vocal=args.mix_vocal,
+              svs_control=args.svs_control,
+              svs_ref=args.svs_ref, svs_prompt_max_sec=args.svs_prompt_max_sec,
+              svc_prompt=args.svc_prompt, select_svs_mix=args.select_svs_mix,
+              mix=args.mix,
               no_sep_cache=args.no_sep_cache)
 
     setup_logging(cfg.log_file, args.verbose)
@@ -813,9 +1020,9 @@ def main() -> None:
         
         # 根据跑过的阶段输出产物路径
         if "svc" in stages and os.path.exists(cfg.vocal_wav):
-            log.info(f"  SVC 人声 : {cfg.vocal_wav}")
+            log.info(f"  SVC 人声 : {cfg.vocal_wav}  (prompt={cfg.svc_prompt}) <- 成片用这个")
         if "svs" in stages and os.path.exists(cfg.svs_vocal_wav):
-            log.info(f"  SVS 人声 : {cfg.svs_vocal_wav}")
+            log.info(f"  SVS 中间 : {cfg.svs_vocal_wav}（音准未修，不是成品）")
         if "cascade" in stages and os.path.exists(cfg.vocal_cascade_wav):
             log.info(f"  级联人声 : {cfg.vocal_cascade_wav}")
         if "eval" in stages and os.path.exists(cfg.p("eval.txt")):

@@ -65,6 +65,56 @@ def build_meta(wav: str, save_dir: str, language: str, device: str,
     return meta_path, save_dir
 
 
+def trim_stratified(y: np.ndarray, sr: int, max_sec: float,
+                    f0: np.ndarray | None = None) -> np.ndarray:
+    """把 y 裁到 max_sec，但**保持原素材的音高构成**，而不是取时间前缀。
+
+    动机: prompt_ext.wav 按移调量排序拼接（w_ext.py:_render 的
+    `for sh in sorted(by_shift)`），高音段全在尾部。取前 N 秒会 100% 切掉音域扩展 ——
+    实测这样得到的 prompt 与完全不做 ext 的 prompt.wav 不可分辨（p=0.064）。
+
+    做法: 按 F0 分成低/中/高三层（<380 / 380-460 / >=460 Hz，与评测分桶一致），
+    每层按其在原素材中的时长占比分配预算，层内均匀取块。块粒度 0.5s，避免切碎音节。
+    F0 缺失时退回按时间均匀抽样（仍比取前缀好，至少覆盖全曲构成）。
+    """
+    n_keep = int(max_sec * sr)
+    if len(y) <= n_keep:
+        return y
+    blk = int(0.5 * sr)                      # 0.5s 块，避免切碎音节
+    n_blk = len(y) // blk
+    if n_blk == 0:
+        return y[:n_keep]
+
+    if f0 is not None and len(f0) > 0:
+        # 每块的中位 F0（f0 是 50Hz 网格）
+        band = []
+        for i in range(n_blk):
+            a = int(i * blk / sr * 50.0)
+            b = int((i + 1) * blk / sr * 50.0)
+            v = f0[a:b]
+            v = v[v > 0]
+            m = float(np.median(v)) if len(v) else 0.0
+            band.append(0 if m < 380 else (1 if m < 460 else 2))
+        band = np.asarray(band)
+    else:
+        band = np.zeros(n_blk, dtype=int)
+
+    keep_blk = max(1, n_keep // blk)
+    chosen: list[int] = []
+    for bi in (0, 1, 2):
+        idx = np.flatnonzero(band == bi)
+        if len(idx) == 0:
+            continue
+        # 该层配额 = 该层块数占比 × 总配额；层内均匀取（保留时间顺序与语气连贯）
+        quota = int(round(keep_blk * len(idx) / n_blk))
+        quota = max(1, min(quota, len(idx)))
+        pick = idx[np.linspace(0, len(idx) - 1, quota).round().astype(int)]
+        chosen.extend(int(x) for x in pick)
+    chosen = sorted(set(chosen))[:keep_blk]
+    out = np.concatenate([y[i * blk:(i + 1) * blk] for i in chosen])
+    return out[:n_keep]
+
+
 def wav_for(seg_index: str, save_dir: str) -> str:
     for sub in ("long_cut_wavs", "cut_wavs"):
         p = os.path.join(save_dir, sub, f"{seg_index}.wav")
@@ -83,7 +133,17 @@ def main() -> None:
                     help="参考音色音频。默认 <song>/prompt.wav（说话）。"
                          "传 refsep2/lead.wav 可用参考人的唱歌干声（VDE 更好）")
     ap.add_argument("--prompt-max-sec", type=float, default=20.0,
-                    help="prompt 只取前 N 秒（inference 只用第一段）")
+                    help="prompt 时长上限（inference 只用第一段）")
+    ap.add_argument("--prompt-trim", default="stratified",
+                    choices=["head", "stratified"],
+                    help="prompt 超长时怎么裁。stratified（默认）按音高分层等比抽样，"
+                         "head = 旧行为「取前 N 秒」。**对 prompt_ext.wav 必须用 "
+                         "stratified**：w_ext.py 的 _render 按移调量排序拼接 "
+                         "(for sh in sorted(by_shift))，所有移调高音段都在尾部，"
+                         "头部截断会把音域扩展 100% 切掉。实测爱笑的眼睛 45s 的 "
+                         "prompt_ext 前 24.76s 是 +0st 干净素材(>380Hz 仅 0.9%)、"
+                         "后 20.21s 才是移调段(>380Hz 占 79.9%)，取前 18.55s 得到的 "
+                         "prompt 与不做 ext 的 prompt.wav 在 SIM 上不可分辨(p=0.064)")
     ap.add_argument("--language", default="Mandarin")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--seed", type=int, default=1234)
@@ -119,7 +179,19 @@ def main() -> None:
     ptrim = os.path.join(pdir, "src.wav")
     if not os.path.exists(ptrim):
         y, sr = librosa.load(prompt_src, sr=None, mono=True)
-        y = y[: int(args.prompt_max_sec * sr)]
+        if args.prompt_trim == "head":
+            y = y[: int(args.prompt_max_sec * sr)]
+        else:
+            # 同名 _f0.npy 若存在就用它分层（prompt_ext.wav -> prompt_ext_f0.npy）
+            f0 = None
+            cand = os.path.splitext(prompt_src)[0] + "_f0.npy"
+            if os.path.exists(cand):
+                f0 = np.load(cand)
+            before = len(y) / sr
+            y = trim_stratified(y, sr, args.prompt_max_sec, f0)
+            if before > args.prompt_max_sec:
+                print(f"[prompt] 分层裁剪 {before:.2f}s -> {len(y)/sr:.2f}s"
+                      f"（f0={'有' if f0 is not None else '无，退回时间均匀'}）")
         sf.write(ptrim, y, sr)
     pmeta_path, pdir_out = build_meta(
         ptrim, pdir, args.language, args.device,

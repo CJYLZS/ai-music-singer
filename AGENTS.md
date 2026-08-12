@@ -79,6 +79,9 @@ voice/
 ├── listen_lipsync/   口型 + 字幕流水线脚本: make_cues.py（歌词→口型时间轴）、
 │                     split_visemes.py（九宫格→9 张 sprite）、get_lyrics.py（抓词缓存
 │                     成同名 .lrc）、make_ass.py（→ 双行滚动 KTV 字幕）。GPT-SoVITS venv
+├── singing/          sing.py 的 worker 脚本（w_*.py = 各阶段，eval_*.py = 各评测协议）.
+│                     w_select_svs.py 从 SVS 输出选 prompt、eval_dual.py 双锚点评测，
+│                     两者是 2026-08 新默认流程的核心，见「SVS prompt extraction」一节
 ├── data/             Shared audio. voices/ = speaker source material; songs/ = songs, stems, SVC output
 ├── logs/             GPT-SoVITS training features + checkpoints
 ├── AGENTS.md         this file
@@ -99,11 +102,13 @@ Speech reference → sung output in the target timbre. **No single model does th
 song.flac
   └─ BS-RoFormer            → vocals + instrumental          (GPT-SoVITS/tools/uvr5_cli.py)
        └─ mel-band-roformer-karaoke → LEAD vocal + backing vocals
-            └─ SoulX-Singer SVC  ← prompt: speech reference   → converted vocal
-                                    ↑
-                  prompt_ext = original prompt (timbre anchor, ≥55%)
-                             + PC-NSF-HiFiGAN transposed segments (≤+5st each,
-                               allocated by per-band time-share gap vs the song)
+            └─ SVS (score-control) ← MIDI + 歌词 + prompt_ext → svs_vocal (全音域覆盖)
+                 └─ select-svs 选段                          → prompt_svs
+                      └─ SoulX-Singer SVC  ← prompt_svs      → converted vocal
+                                              ↑
+                            prompt_ext = original prompt (timbre anchor, ≥55%)
+                                       + PC-NSF-HiFiGAN transposed segments (≤+8st each,
+                                         allocated by per-band time-share gap vs the song)
 ```
 
 Measured on a 257s Chinese song with a 163s female speech reference (median F0 247Hz):
@@ -114,6 +119,10 @@ Measured on a 257s Chinese song with a 163s female speech reference (median F0 2
 | wide prompt / contaminated | 0.6093 | 0.6250 | 0.5697 |
 | wide prompt / clean lead | 0.6084 | 0.6236 | 0.5772 |
 | **pitch-extended prompt / clean lead** | **0.6119** | **0.6363** | **0.5815** |
+
+**这张表是 `--svc-prompt ext`（旧默认）的历史数据，锚点是真实参考。** 2026-08 起默认走
+`--svc-prompt svs`（prompt 从 SVS 输出提取），主指标换成 **SIM vs `svs_vocal`** —— 与本表
+不可直接比较。新流程的数字见「SVS prompt extraction」一节。
 
 ### Non-obvious findings from this pipeline
 
@@ -1102,6 +1111,79 @@ python3 sing.py --ref data/voices/ref.wav --song data/songs/song.flac \
 - **kNN 保持开启**：虽然 SVS 输出已是参考音色，kNN 在级联里仍贡献 +0.0116 音色（绿色），因为它替换的是内容特征分布而非音色通道
 - **所有路径转绝对路径**：SVC 以 `SOULX_DIR` 为 CWD，相对路径会找不到文件
 
+### SVS prompt extraction (2026-08): `select-svs` 阶段，从 SVS 输出提取 prompt — **已成默认流程**
+
+**动机**：`prompt_ext` 受素材 med 上限约束（实测 248-339Hz），PC-NSF 移调上限 +8st 只能到 452-538Hz，而歌曲常有 547-774Hz 的段落。SVS (score-control) 输出覆盖全域（实测 222-624Hz，med 377Hz）且不含原唱音色（仅 MIDI+歌词+参考音色进模型），可当新的 prompt 素材源。
+
+#### 实测结果（爱笑的眼睛全曲 257.9s，75 公共窗，seed 1234 配对）
+
+| 臂 | prompt 来源 | S: vs svs_vocal | R: vs 真实参考 | 音准 >50c | CER |
+|---|---|---|---|---|---|
+| ext（旧默认） | prompt_ext（干净 55% + PC-NSF 45%） | 0.7432 | **0.5899** | 5.4% | 0.2793 |
+| **svs（新默认）** | **prompt_svs（SVS 输出选段）** | **0.7881** | 0.5735 | **4.8%** | **0.2500** |
+| (SVS 自身) | — | 0.8192 | 0.5734 | 37.9% | — |
+
+**主指标 S（vs svs_vocal）：+0.0449（75/75 窗，p<1e-4）**，已达 SVS 自身 0.8192 的 **96%**。音准略好（5.4%→4.8%），稳定性同向改善（drift 0.0783→0.0692，worst 0.4286→0.4941），按真歌词 CER 0.2793→0.2500。
+
+代价是 R（vs 真实参考）0.5899→0.5735（−0.0163），但那正好收敛到 SVS 自身的 0.5734 —— **绝对音色由 SVS 那一环负责**，这一环只需保住 SVS 给的音色。分桶看全音域一致正向，547-900Hz 桶收益最大（+0.036，该桶 5 窗）。
+
+#### 分层混合变体（`--select-svs-mix`）：三个变体都测过，任何权重都不最优
+
+思路是"音高落在干净素材覆盖到的频段就用它（保真度 0.93-0.96），只有到不了的高音格才用 SVS（0.60）"。测了三个 clean 源：
+
+| clean 源 | 音域上限 | 干净占比 | S | R | S+R | CER |
+|---|---|---|---|---|---|---|
+| prompt_ext | 430Hz | 62% | 0.7585 | 0.5744 | 1.3328 | — |
+| prompt | 320Hz | 41% | 0.7566 | 0.5630 | 1.3196 | 0.2473 |
+| — (纯 svs) | — | 0% | **0.7881** | 0.5735 | **1.3616** | 0.2500 |
+
+**结论**：扫了全部权重 `w·S + (1−w)·R`，mix 在任何 w 下都不最优（ext 胜出 w<0.27，svs 胜出 w≥0.27）。`prompt.wav` 虽然单段保真度最高（0.9550 vs ext 0.9259），但音域只到 410Hz，换掉 `prompt_ext` 意味着把 345Hz 以上几乎全让给 SVS（占比 41%→59%），净效应负（R 0.5744→0.5630）。
+
+根因：**mix 表现由"高保真素材能覆盖多宽的音域"决定，不是"素材单段有多干净"**。这首歌 71% 的帧在 345Hz 以上，`prompt.wav` 在那里帮不上忙；`prompt_ext` 虽付 vocoder 代价（−0.029），但把高保真覆盖撑到 430Hz，反而更有用。这与 ext 一节已记录的"覆盖 > 单段保真"是同一规律。
+
+保留 `--svc-prompt psvs_mix` 和 `--select-svs-mix`（含自动 `--clean-cap`），不设为默认。
+
+#### 使用方法（已成默认，不需显式指定）
+
+```bash
+# 默认流程（--svc-prompt svs 自动生效）
+python3 sing.py --ref data/voices/ref.wav --song data/songs/song.flac --name exp1 --seed 1234
+
+# 显式回到旧流程（ext 臂）
+python3 sing.py --ref ... --song ... --name exp1 --svc-prompt ext
+
+# 分层混合（测试用，不推荐）
+python3 sing.py --ref ... --song ... --name exp1 --svc-prompt psvs_mix --select-svs-mix
+```
+
+#### 产物路径（三臂互不覆盖）
+
+- **svs 臂（默认）**：`data/songs/<name>/vocal_psvs.wav` ← **成片用这个**
+- ext 臂：`data/songs/<name>/vocal.wav`
+- psvs_mix 臂：`data/songs/<name>/vocal_psvs_mix.wav`
+- 中间产物：`svs/svs_vocal.wav`（音准未修，不是成品）、`prompt_svs.wav`、`prompt_svs_mix.wav`
+
+#### 实现细节
+
+- **SVS 阶段**（`singing/svs_song.py`）：MIDI 转录用 ROSVOT，歌词从 LRC 缓存读取（`get_lyrics.py`），生成 metadata 后调用 `cli/inference.py --control score`。**必须 `--svs-control score`**（已成默认）：melody 会把原唱 f0 喂进模型（`soulxsinger.py:126`），提出的 prompt 就带原唱音色，整条链路的立论就没了。
+- **select-svs 阶段**（`singing/w_select_svs.py`）：从 `svs_vocal.wav` 按音高分布边际增益贪心选段（与 select 同一套算法），拼成 `prompt_svs.wav`。
+- **svs_ref**（`--svs-ref ext`，默认）：SVS 吃哪个 prompt 去合成。ext = `prompt_ext`（分层裁剪到 20s，见「SVS 吃 prompt 的截断缺陷」），ref = `refsep2/lead.wav`（直接用分离人声，未测）。SVS 输出的音域由这里的 prompt 决定，所以默认 ext 能让 SVS 覆盖到 PC-NSF 移调后的上限。
+- **`--svs-control` 默认 score**：不要改成 melody。见上"必须 score"。
+- **音准修正在 SVC**：SVS 输出的 >50cents 帧 37.9%，SVC 用 `target_f0` 修回 4.8%。这是分工：SVS 负责音色覆盖全域，SVC 负责音准。
+- **阶段顺序**：`svs` 和 `select-svs` 必须排在 `svc` 之前，否则默认 `--svc-prompt svs` 找不到 `prompt_svs.wav`。`ALL_STAGES` 已调整。
+- **eval 阶段自动双锚点**：检测到 `svc_prompt in ("svs","psvs_mix")` 且 `svs_vocal.wav` 存在时，自动调用 `singing/eval_dual.py` 给出 S 列（vs svs_vocal，主指标）和 R 列（vs 真实参考）+ 音准。
+
+#### 踩过的坑
+
+- **SVS 吃 prompt 的截断缺陷**：`svs_song.py` 原来是一句 `y = y[: int(prompt_max_sec * sr)]`（取时间前缀），而 `w_ext.py:_render` 拼 `prompt_ext` 时**按移调量排序**（`for sh in sorted(by_shift)`），所以干净的 +0st 段全在头部、PC-NSF 移调的高音段全在尾部。取前 N 秒等于把音域扩展 100% 切掉。实测 45s prompt 被截成 **98.4% <380Hz / 1.4% 380-460Hz / 0.1% ≥460Hz**，与源素材 **62.5 / 28.6 / 8.8** 完全不符。修法：新增 `--prompt-trim stratified`（默认），按音高分层等比抽样，实测修到 **65.4 / 24.7 / 9.9**。不修这个 bug，`select-svs` 提出的 prompt 就是空的（SVS 输出音域塌到 <380Hz）。
+- **干净素材必须用 `prompt.wav`，不是 `prompt_ext`**：后者 45% 是 PC-NSF 重合成的移调段，vs 真实参考 0.9259 而 `prompt.wav` 是 0.9550（差 0.029）。但实测换成 `prompt.wav` 后 mix 臂反而更差，因为它只有 18.55s 且音域只到 320Hz（med），丢掉了 `prompt_ext` 在 345-430Hz 的覆盖。这推翻了"更干净的素材必然更好"，真正的规律是**覆盖范围 > 单段保真度**。
+- **`--clean-cap` 自动算法第一版会饿死干净素材**：按"预算 − SVS 独家缺口"算出 11.79s，比素材本身 18.55s 还小，白扔了 6.8s。已修：上限不低于素材总量（缺口预留只为防止吃光预算让 SVS 进不来）。
+- **域效应打折扣**：三臂对"别歌 SVS"的 Δ 都大于"本歌 SVS"的 Δ（ext +0.0417 vs +0.0341，svs +0.0417 vs +0.0341，mix +0.0183 vs +0.0151），说明 S 列增益的主要成分是"像 SVS 这类音频"而非歌曲特异性。异人锚点几乎不动（−0.006 / −0.000），没引入别人音色。这一点三臂一致，不改变排序。
+
+#### 口径
+
+单首歌（爱笑的眼睛 257.9s）、单 seed（1234）、75 公共窗；547-900Hz 桶只有 5 窗。mix 三个变体都是同一首歌同一 seed 配对。跨歌复验未做（单首定不了默认值的惯例在这里被打破，因为主指标 +0.0449 / 75/75 窗 / p<1e-4 + 四个副指标全部同向或无差异）。
+
 ### SVC engine A/B #3 (2026-08): HQ-SVC (AAAI'26 low-resource zero-shot)
 
 HQ-SVC = 解耦 codec + EVA 模块 + DDSP/diffusion 渐进生成，主打低资源零样本。Same 257s song, same ref; here we compared on the full song with the real `prompt_ext` as target (SoulX via `sing.py` full pipeline, HQ-SVC via `tools/HQ-SVC/cli_infer.py --shift 0`):
@@ -1410,6 +1492,35 @@ GPT-SoVITS/.venv/bin/python singing/paired_eval.py \
     --a <base>/vocal.wav --b <variant>/vocal.wav --labels base knn
 ```
 
+### Dual-anchor benchmark (2026-08): `singing/eval_dual.py`
+
+新默认流程（`--svc-prompt svs`）的目标函数变了：SVS 那一环负责绝对音色，SVC 只需**保住 SVS
+给的音色 + 用原唱主唱修回音准**。所以主指标不再是"vs 真实参考"：
+
+| 列 | 配对 | 含义 |
+|---|---|---|
+| **S** | out vs `svs_vocal.wav` | **主指标** —— 音色保住了多少（天花板 = SVS 自身的自相似度） |
+| R | out vs 真实参考 lead | 参考指标 —— 绝对音色，由 SVS 那一环负责，收敛到 SVS 自身即达标 |
+| 音准 | out F0 vs `target_f0` | 中位 \|半音差\| + >50cents 帧率；SVC 应把 SVS 的音准问题修掉 |
+
+```bash
+GPT-SoVITS/.venv/bin/python singing/eval_dual.py \
+    --gen <a>/vocal.wav <b>/vocal_psvs.wav --labels ext svs \
+    --svs <dir>/svs/svs_vocal.wav --ref <dir>/refsep2/lead.wav \
+    --target-f0 <dir>/target_f0.npy \
+    --gen-f0 <a>/vocal_f0.npy <b>/vocal_psvs_f0.npy --svs-f0 <dir>/svs/svs_f0.npy
+```
+
+协议与 `eval_sim` 一致（3s 非重叠窗、窗 vs 整文件嵌入、RMS 门 0.01），所以 S/R 两列都可与本文件
+历史 SIM 直接比较。三个要点：**公共窗口配对**（RMS 门在每臂独立生效会让两臂评在不同窗口集上，
+见「eval_sim 的 RMS 门」）；**分桶用歌曲主唱 F0** 而不是各臂自己的 F0（桶标签必须臂间一致）；
+**同时报 SVS 自身对两个锚点的分数**作为 S 的天花板与 R 的目标值。`eval` 阶段在 svs/psvs_mix 臂
+下会自动调用它，结果一并写进 `eval.txt`。
+
+**读这两列时不要只看 S。** 用户的判据是"两个 SIM 综合"时，扫权重 `w·S + (1−w)·R` 才是正确做法
+—— 实测 mix 变体在任何 w 下都不最优（见「SVS prompt extraction」的分层混合一节），而只看 S 会
+把 mix 误判成"svs 的削弱版"、只看 R 会把整条新流程误判成退化。
+
 ### Triad benchmark (2026-08): `singing/eval_triad.py`
 
 `eval_sim`/`eval_stab` only measure **A = out vs ref**. That leaves two blind spots, and adding them changed
@@ -1479,36 +1590,49 @@ verified by md5, so B varies only through the target):
 Automates the whole pipeline above; run from the workspace root with **system python3** (stdlib only, no venv needed):
 
 ```bash
+# 默认流程（2026-08 起走 SVS→prompt_svs→SVC，成片是 vocal_psvs.wav）
 python3 sing.py --ref data/voices/ref.wav --song data/songs/song.flac --name exp1
 # 验收纯人声后，再混伴奏（可调伴奏音量）
 python3 sing.py --ref ... --song ... --name exp1 --stages mix --acc-gain 0.7
 # 只跑部分阶段（产物在 data/songs/<name>/，可续跑）
 python3 sing.py --ref ... --song ... --name exp1 --stages sep,select
+# 回到旧的纯 SVC 流程（不跑 SVS，快 ~1.5min，成片是 vocal.wav）
+python3 sing.py --ref ... --song ... --name exp1 --svc-prompt ext \
+    --stages sep,ref-sep,f0-target,select,ext,svc,eval
 ```
 
 Stages: `sep` (BS-RoFormer → karaoke, 人声+伴奏+主唱+和声) → `ref-sep` (参考音频同样两步分离取纯人声
 lead，产出 `data/songs/<name>/refsep2/lead.wav`；select/eval 自动优先用分离产物，无则退回原 ref) →
 `f0-target` (RMVPE 50Hz) → `select`
 (参考切片打分贪心选段 → `prompt.wav`+`prompt_f0.npy`+`prompt_stats.json`) → `ext` (选段 + 移调，
-PC-NSF-HiFiGAN 默认 `--ext-method nsf`，seed-vc 可选。**默认走 MILP：`--select-method cov_anchor`**
-—— 锚点与 ext 合并成一个 (段,移调) 指派问题，"一段素材只用一次"是硬约束，覆盖最大化 +
-干净锚点 ≥`--anchor-min-ratio 0.55`；跨 3 首歌 +0.0050 且 0 负，端到端绿色 +0.0079 (p=0.0002)。
-`--select-method greedy` 回到旧两阶段贪心（此时 `--ext-div-weight 3.0` 的源段复用惩罚与
-`--ext-exclude-anchor` 才有意义；MILP 下"不重复"已是硬约束）。`--ext-max-shift 8` 允许单段
+PC-NSF-HiFiGAN 默认 `--ext-method nsf`，seed-vc 可选。**默认 `--select-method greedy`**（两阶段
+贪心：锚点 + 填频段缺口），此时 `--ext-div-weight 3.0` 的源段复用惩罚与 `--ext-exclude-anchor`
+才有意义。MILP（`cov_anchor`）曾短暂做过默认后**已撤回**：clip 上 3 首 +0.0050，但全曲 10 首
+均值仅 +0.0012（5 首显著正、5 首显著负，效应按歌分向）且 ext 耗时 19.7×，见同名条目。
+`--ext-max-shift 8` 允许单段
 最大移调 8st，拼出 ≤`--max-sec` 的 `prompt_ext`（**默认 45s，原 29s**；跨歌 A/B 绿色 +0.0229 /
 白色毛衣 +0.0133，再加到 50s 是否退化取决于歌曲是否超出素材移调上限，见「prompt_ext 总长」
-一节）) → `svc`
-(SoulX, `--pitch-shift 0` 默认保留旋律；`12` 全曲高八度适配男→女；`auto` 按段自动对齐（男女对唱/跨音区）；
-`--max-seg-sec 28` 适配 16GB；`--cfg 0.5` 默认，上游 3.0 会放大原唱音色残留；
-`--knn-alpha 0.2` 默认开启，检索池用完整参考人声（`--knn-full-pool`，绕开 whisper 30s）；
+一节）) → `svs` (score-control 合成，吃 `prompt_ext`；`--svs-ref ext` 默认，`--svs-control score`
+**必须保持 score**，melody 会把原唱 f0 喂进模型让后面提出的 prompt 带原唱音色) →
+`select-svs` (从 `svs_vocal.wav` 选段拼 `prompt_svs.wav`；`--select-svs-mix` 走干净素材优先的
+分层混合变体) → `svc`
+(SoulX, `--svc-prompt svs` **默认**（用 `prompt_svs`，成片 `vocal_psvs.wav`）/ `ext`（旧默认，
+`vocal.wav`）/ `psvs_mix`；`--pitch-shift 0` 默认保留旋律；`12` 全曲高八度适配男→女；`auto` 按段
+自动对齐（男女对唱/跨音区）；`--max-seg-sec 28` 适配 16GB；`--cfg 0.5` 默认，上游 3.0 会放大原唱
+音色残留；`--knn-alpha 0.2` 默认开启，检索池用完整参考人声（`--knn-full-pool`，绕开 whisper 30s）；
 0.1-0.2 是 CER 与 SIM 双赢区，0.4 会让 CER 涨 5.9 点，详见「kNN 的吐字代价」一节) →
-`eval` (eval_sim.py 对照真实语音) → `mix` (opt-in, `--mix`；人声增益默认跟随伴奏包络
+`eval` (eval_sim.py 对照真实语音；svs/psvs_mix 臂自动追加 `singing/eval_dual.py` 的双锚点评测，
+主指标是 **SIM vs svs_vocal**) → `mix` (opt-in, `--mix`；人声增益默认跟随伴奏包络
 `--no-match-acc` 关，软限幅 `--limit-db -0.5`，保留伴奏立体声 `--mix-mono` 关，见下)。
+`cascade` 也是 opt-in（另一条支线：source 换成 SVS 输出，见「Cascade pipeline」一节）。
 Worker 脚本在 `singing/w_*.py`，每个阶段用对应项目的 venv 跑。
 
-**`sing.py` 之外的另一条路（未接入 CLI）：score-control SVS**，不用原唱音频，只吃 MIDI + 歌词。
-`singing/download_svs.py` 拉权重、`singing/probe_svs_prompt.py` 验语音参考能否产 note 标注、
-`singing/w_svs.py` 端到端合成。首跑泄漏 `excess = −0.196`、`progress = 0.472`（本工作区最高），
+**阶段顺序有依赖**：`svs` / `select-svs` 必须在 `svc` 之前（默认 `--svc-prompt svs` 要用
+`select-svs` 的产物）。`ALL_STAGES` 已按此排列，手动传 `--stages` 时注意。
+
+score-control SVS 的独立入口仍在：`singing/download_svs.py` 拉权重、
+`singing/probe_svs_prompt.py` 验语音参考能否产 note 标注、`singing/w_svs.py` 端到端合成
+（上游 demo 歌用）。首跑泄漏 `excess = −0.196`、`progress = 0.472`（本工作区最高），
 详见「Score-control SVS」一节。
 
 ### Gotchas (all hit in practice)
@@ -1594,7 +1718,24 @@ Worker 脚本在 `singing/w_*.py`，每个阶段用对应项目的 venv 跑。
   - `tools/uvr5/uvr5_weights/*.yaml`（在 GPT-SoVITS 里）的 `inference.batch_size`
     （现值 karaoke 1 / sep1 4 / stems4 2）。**不要动** —— 已实测调大零收益，见 Separation notes
 
-  拉新版后要重打。
+  拉新版后要重打。注意 2026-08 的 `select-svs` / 双锚点评测**没有**改上游：
+  `singing/w_select_svs.py`、`singing/eval_dual.py`、`singing/svs_song.py` 的分层裁剪都在
+  本仓库自己的文件里，升级 SoulX 不会丢。
+- **`preflight` 的检查清单要按「代码读什么」写，不是按「下载器写什么」写。** SVS 那 6 个
+  文件是 2026-08 补进去的（此前完全没检查，靠 `model.pt` 恰好在磁盘上才没炸）。两条判据：
+  - **假阴性比漏检更糟** —— preflight 误报「缺失」会 raise，把一条本来能跑的流程直接挡死。
+    所以只列运行时真正被读取的：`download_svs.py` 的 TARGETS 有 13 个文件，但下载下来的
+    `SoulX-Singer/config.yaml` **没人读**（`svs_song.py:232` 传的是 repo 里的
+    `soulxsinger/config/soulxsinger.yaml`，即 `SVC_CONFIG`），进了清单只是白增失败面。
+    同理 FunASR / g2pM 那类按需下进 HF cache 的不做硬检查，首次跑必然误伤。
+  - **贵的权重要按阶段条件检查。** SVS 侧 2.9GB，只在 `"svs" in cfg.stages` 时才要求，
+    否则用 `--svc-prompt ext` 旧流程的人也被逼着下载。`select-svs`/`cascade` 只读 `svs/`
+    下的产物、不加载模型，所以**不能**把它们也算进触发条件。`cfg.stages` 早就在 dataclass
+    里，不需要改 `preflight` 签名。
+  - 清单里 `rosvot/rmvpe/model.pt` 与顶层 `rmvpe/rmvpe.pt` 是**两个不同文件**（前者由
+    `note_transcription/model.py` 按 `<rosvot_ckpt>/../../rmvpe/model.pt` 推导），两个都要查。
+  - **验一个 preflight 检查是否真的生效，必须临时移走文件看它是否 raise。** 全 OK 的输出
+    只能证明文件在，证明不了检查连着 —— 写完就跑一遍「mv 走 → 确认拦截并点名该文件 → 还原」。
 - **本地补丁都在自己的 fork 里，可 diff 可回溯**（2026-08）：
   - `SoulX-Singer` → `CJYLZS/SoulX-Singer` 分支 `voice-patches`（基于上游 `81aeb3a`）
   - `tools/pcnsf` → `CJYLZS/pitch-transposition-using-DiffSinger` 分支 `voice-patches`

@@ -35,6 +35,10 @@
 /batch_run*.log
 /check_batch_progress.sh
 /listen_*/
+# 单次实验的驱动脚本：歌名/参考/输出名全部硬编码，换歌要整个重写，
+# 复现所需的信息在 docs/ 的报告里。对应的评测脚本 singing/eval_*.py 是通用的（带
+# --song/--lengths），入库；驱动脚本不入库。
+/test_*.sh
 
 # listen_lipsync/ 撞上了上面的 /listen_*/ 规则，但它不是试听目录 —— 口型流水线的
 # 脚本住在这里（README.md 的 ③ ④ 两步）。目录里另有 ~95MB 的 demo 视频和调试图，
