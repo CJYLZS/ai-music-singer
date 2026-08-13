@@ -81,7 +81,7 @@ voice/
 │                     成同名 .lrc）、make_ass.py（→ 双行滚动 KTV 字幕）。GPT-SoVITS venv
 ├── singing/          sing.py 的 worker 脚本（w_*.py = 各阶段，eval_*.py = 各评测协议）.
 │                     w_select_svs.py 从 SVS 输出选 prompt、eval_dual.py 双锚点评测，
-│                     两者是 2026-08 新默认流程的核心，见「SVS prompt extraction」一节
+│                     两者只服务 --svc-prompt svs 臂（素材音域不足时的备选，非默认）
 ├── data/             Shared audio. voices/ = speaker source material; songs/ = songs, stems, SVC output
 ├── logs/             GPT-SoVITS training features + checkpoints
 ├── AGENTS.md         this file
@@ -120,9 +120,11 @@ Measured on a 257s Chinese song with a 163s female speech reference (median F0 2
 | wide prompt / clean lead | 0.6084 | 0.6236 | 0.5772 |
 | **pitch-extended prompt / clean lead** | **0.6119** | **0.6363** | **0.5815** |
 
-**这张表是 `--svc-prompt ext`（旧默认）的历史数据，锚点是真实参考。** 2026-08 起默认走
-`--svc-prompt svs`（prompt 从 SVS 输出提取），主指标换成 **SIM vs `svs_vocal`** —— 与本表
-不可直接比较。新流程的数字见「SVS prompt extraction」一节。
+**这张表是窄素材时代（163s 说话参考）的历史数据，锚点是真实参考，`--svc-prompt ext`。**
+`ext` 仍是当前默认，但参考素材加强后移调那一层已基本不触发（`--anchor-min-ratio 1.0`），
+所以表里"pitch-extended prompt"这一行对新素材不再适用 —— 见「参考素材加强」一节。
+中间曾以 `--svc-prompt svs` 为默认（主指标换成 SIM vs `svs_vocal`，与本表不可比），
+现已退回备选，见「SVS prompt extraction」一节。
 
 ### Non-obvious findings from this pipeline
 
@@ -1087,7 +1089,7 @@ SVC 二次转换时该残留变成**参考音色的真实特征**，不再是污
 #### 使用方法
 
 ```bash
-# 完整级联流程（推荐用于最终成片）
+# 完整级联流程（opt-in 支线，必须显式列出 svs + cascade —— 默认流程不跑它们）
 python3 sing.py --ref data/voices/ref.wav --song data/songs/song.flac \
   --name song_cascade --stages sep,ref-sep,f0-target,select,ext,svs,cascade \
   --seed 1234
@@ -1102,7 +1104,8 @@ python3 sing.py --ref data/voices/ref.wav --song data/songs/song.flac \
 
 - SVC：`data/songs/<name>/vocal.wav`
 - SVS：`data/songs/<name>/svs/svs_vocal.wav`
-- **Cascade**：`data/songs/<name>/vocal_cascade.wav` ← **最终成片用这个**
+- **Cascade**：`data/songs/<name>/vocal_cascade.wav`（这一节内的最优臂；注意 cascade 是
+  opt-in 支线，当前默认流程不跑它，成片走 `vocal.wav`，见「参考素材加强」一节）
 
 #### 实现细节
 
@@ -1111,7 +1114,94 @@ python3 sing.py --ref data/voices/ref.wav --song data/songs/song.flac \
 - **kNN 保持开启**：虽然 SVS 输出已是参考音色，kNN 在级联里仍贡献 +0.0116 音色（绿色），因为它替换的是内容特征分布而非音色通道
 - **所有路径转绝对路径**：SVC 以 `SOULX_DIR` 为 CWD，相对路径会找不到文件
 
-### SVS prompt extraction (2026-08): `select-svs` 阶段，从 SVS 输出提取 prompt — **已成默认流程**
+### 参考素材加强（2026-08）：音域够宽之后，移调与 SVS 两层同时变成多余 — **当前默认**
+
+补录参考素材后（`data/voices/ref_talk_sing.wav` 538s 说话+唱歌纯人声、
+`ref_sing_only.wav` 372s 纯唱歌），本文件此前几乎所有"绕开素材音域不足"的机制都失去了前提。
+默认已改为 **`--svc-prompt ext` + `--max-prompt 45` + `--anchor-min-ratio 1.0`**，
+即"选 45s 干净素材直接当 prompt"，不移调、不跑 SVS。
+
+**素材本身（浊音帧，RMVPE 50Hz 同口径）**：
+
+| | 时长 | 浊音 | p10 | med | p90 | p99 |
+|---|---|---|---|---|---|---|
+| 旧 `ref.wav` | 163s | 106.6s | 198.7 | 245.8 | 306.1 | 349.8 |
+| **`ref_talk_sing.wav`** | **538s** | **379.0s** | 219.3 | **328.5** | **447.2** | **631.0** |
+| `ref_sing_only.wav` | 372s | 273.4s | 255.5 | 362.2 | 468.3 | 694.7 |
+
+med 抬了 5.8 半音、p99 抬了 10.2 半音，而歌曲 med 是 291-374Hz —— 素材中位数直接落进歌曲音域。
+12 首歌逐首算"不移调时 45s 预算内的需求满足率"（需求 = 歌曲各频段格时长占比 × 预算）：
+
+| 素材 | 满足率 | 完全缺口 | 最差歌 |
+|---|---|---|---|
+| 旧 ref | 54.5% | 23.2% | 爱笑的眼睛 29.0% |
+| **talk_sing** | **99.8%** | **0.0%** | 冬眠 99.6% |
+| sing_only | 99.0% | 0.3% | 那女孩对我说 93.1% |
+
+真实 `select`（budget 45s）复核，三首代表歌：覆盖 28.6/45.0/65.2% → **88.2/84.7/87.9%**，
+候选池 143 → 429 段，**`suggested_shift` 从 +4…+6 掉到 −1…+1**。后者是最直接的判据 ——
+它就是"还需不需要移调"本身。
+
+**`talk_sing` 优于 `sing_only`，说话素材不是冗余**：它补的是低音区。sing_only 在 175-280Hz
+只有 0.7-23.0s（talk_sing 是 7.4-46.4s），而歌曲低音段占比可以很高（那女孩对我说的
+175-277Hz 占 49.6%），所以 sing_only 在那首掉到 93.1%。
+
+#### 雨爱三臂 A/B（seed 1234 配对，旧素材臂是既有产物）
+
+雨爱是旧素材最吃亏的歌之一（满足率 37.5%、建议移调 +6）：
+
+| 指标 | A: 旧素材+移调+SVS | **C: 新素材·免移调·无SVS** | B: 新素材·免移调+SVS |
+|---|---|---|---|
+| SIM（新锚点，配对） | 0.7202 | **0.7600** `+0.0398` 55/69 p<1e-4 | 0.7624 |
+| SIM（旧锚点，配对） | 0.4979 | **0.5300** `+0.0321` 56/69 p<1e-4 | — |
+| eval_stab mean / worst | 0.6680 / 0.3884 | 0.7065 / 0.4030 | 0.7071 / 0.4082 |
+| drift / dropouts | 0.0594 / 0 | 0.0641 / 0 | 0.0613 / 0 |
+| CER（真歌词 371 字） | 0.3801 | **0.3639** | 0.4016 |
+| 音准 >50cents | 4.08% | 5.13% | 4.78% |
+
+- **素材本身的收益 +0.032…+0.040，是本工作区第二大的单一改动**（仅次于 `--cfg` 与
+  song_3 低音区的 `--pitch-shift auto`），所有音高桶一致正向。这是"素材决定上限"那一条的
+  正面确认，而不是又一次 prompt 结构调整 —— 后者在本文件里已被否证多次（覆盖率 +9pp 换
+  +0.0002、预移调 +25pp 换 −0.0029）。
+- **去掉 SVS 那层：SIM 不可区分（+0.0024，wins 37/69，p=0.63），但 CER 明显更好
+  （0.3639 vs 0.4016，咬字变形 S=62 vs 76）。** 即 SVS 多一层重合成的代价落在**吐字**上，
+  不在音色上 —— 只测 SIM 会得出"两者等价、留着无妨"的结论，而它其实是净损失（还白跑
+  svs + select-svs 两个阶段）。这是本文件"动内容侧必须查 CER"那条规则的第二次生效。
+- SVS 路线的历史数字（爱笑的眼睛 +0.0449，75/75 窗）**仍然成立，但只在素材音域不够时成立**。
+  它存在的理由是"PC-NSF 受素材 med 上限约束、到不了 547Hz+"，而 talk_sing 的 p99 是 631Hz。
+- 稳定性：mean +0.039、worst 改善、dropouts 三臂全 0，drift 仅 +0.005（本文件其他杠杆是
+  +0.006…+0.018）。音准三臂持平（4.1-5.1%，都远好于 SVS 自身的 29.4%）。
+
+#### 必须记住的两个方法论点
+
+- **换素材做 A/B 时，锚点会静默变成上一个参考的缓存。** `Cfg.ref_clean` 原本是"`refsep2/lead.wav`
+  存在就用它"，而复用同一 `--name` 时那个文件是旧参考的分离产物（雨爱目录里那份是 8 月 3 日的
+  163s 旧 ref）。新增 **`--ref-is-clean`**：跳过 ref-sep，且 `ref_clean` **无条件**返回 `--ref`。
+  没有这个开关，整轮对比会变成"新 prompt vs 旧锚点"，而日志里看不出任何异常。
+- **不同锚点下的 SIM 绝对值不可比，必须双向检验。** 第一次跑出 C=0.7600 vs A=0.4979 像是
+  +0.26 的暴涨，其实两臂锚点不同（新素材 med 350Hz vs 旧 ref med 277Hz）。统一锚点后是
+  +0.0398；再用**旧锚点**复核仍是 +0.0321、56/69 窗、全桶正向。只跑对自己有利的那个锚点，
+  这个结论是立不住的 —— 反向检验才排除了"新锚点偏袒新素材"。
+
+#### 附带结论
+
+- **`--anchor-min-ratio 1.0` 不是"禁用移调"，它是自适应的。** 锚点 =
+  `min(prompt_dur, max_sec × ratio)`，余量才给移调段：素材够宽（select 选满 45s）→ 移调预算
+  0.13s → 日志 `无可用移调段，prompt_ext = 原始 prompt`，两者 **md5 一致**，省掉过一遍 vocoder
+  的 0.02-0.045 SIM 损失；素材偏窄（只选出 25s）→ 锚点 25s、移调预算 20s，ext 照常补高音格。
+  所以它对窄素材没有回归风险，不需要按素材切换。
+- **`corr(pitch distance, SIM)` 从 −0.42…−0.48 变成 +0.046。** 本文件开篇"pitch distance drives
+  similarity，是最大的质量杠杆"在这批素材上失效了 —— 不是结论错，是瓶颈换了位置。后续再调
+  音高相关的参数（`--pitch-shift`、ext 移调上限）应先重算这个相关系数，接近 0 就说明没有可捞的。
+- **素材干净度已验证，不需要额外处理**：`<150Hz` 能量 **0.03%**（旧 ref 是 0.11%），无削波，
+  底噪 −76.6/−106.3dB(rel) —— 没有伴奏或贝斯残留。音色一致性：talk_sing vs 旧 ref 整体嵌入
+  **0.8490**（不同说话人地板 0.37-0.43），talk_sing vs sing_only 0.9686（同批录音）。
+  `sing_only vs 旧 ref = 0.6915` 看着偏低，是**唱歌 vs 说话的域差不是音色差**：旧 ref 自己的
+  ≥280Hz 窗 SIM 只有 0.7076 vs <280Hz 的 0.8891，同一人同一录音仅因音高就掉 0.18。
+- 口径：**单首歌、单 seed**。SIM 的 +0.032…+0.040 是噪声底（±0.004）的 8-10 倍且双锚点一致，
+  可信；CER 的 −0.038（S 差 14 字）只有一次测量，方向可信、幅度未定。跨歌复验未做。
+
+### SVS prompt extraction (2026-08): `select-svs` 阶段，从 SVS 输出提取 prompt — **素材音域不足时的备选（曾是默认）**
 
 **动机**：`prompt_ext` 受素材 med 上限约束（实测 248-339Hz），PC-NSF 移调上限 +8st 只能到 452-538Hz，而歌曲常有 547-774Hz 的段落。SVS (score-control) 输出覆盖全域（实测 222-624Hz，med 377Hz）且不含原唱音色（仅 MIDI+歌词+参考音色进模型），可当新的 prompt 素材源。
 
@@ -1143,14 +1233,14 @@ python3 sing.py --ref data/voices/ref.wav --song data/songs/song.flac \
 
 保留 `--svc-prompt psvs_mix` 和 `--select-svs-mix`（含自动 `--clean-cap`），不设为默认。
 
-#### 使用方法（已成默认，不需显式指定）
+#### 使用方法（**不再是默认**，需显式指定；svs + select-svs 阶段会自动带出）
 
 ```bash
-# 默认流程（--svc-prompt svs 自动生效）
-python3 sing.py --ref data/voices/ref.wav --song data/songs/song.flac --name exp1 --seed 1234
+# 素材音域不够时走这条（歌曲音域远超素材、suggested_shift 仍是 +4 以上）
+python3 sing.py --ref ... --song ... --name exp1 --svc-prompt svs --seed 1234
 
-# 显式回到旧流程（ext 臂）
-python3 sing.py --ref ... --song ... --name exp1 --svc-prompt ext
+# 当前默认（选段直接当 prompt，不跑 SVS）
+python3 sing.py --ref ... --song ... --name exp1 --seed 1234
 
 # 分层混合（测试用，不推荐）
 python3 sing.py --ref ... --song ... --name exp1 --svc-prompt psvs_mix --select-svs-mix
@@ -1158,8 +1248,8 @@ python3 sing.py --ref ... --song ... --name exp1 --svc-prompt psvs_mix --select-
 
 #### 产物路径（三臂互不覆盖）
 
-- **svs 臂（默认）**：`data/songs/<name>/vocal_psvs.wav` ← **成片用这个**
-- ext 臂：`data/songs/<name>/vocal.wav`
+- svs 臂：`data/songs/<name>/vocal_psvs.wav`
+- **ext 臂（当前默认）**：`data/songs/<name>/vocal.wav` ← **成片用这个**
 - psvs_mix 臂：`data/songs/<name>/vocal_psvs_mix.wav`
 - 中间产物：`svs/svs_vocal.wav`（音准未修，不是成品）、`prompt_svs.wav`、`prompt_svs_mix.wav`
 
@@ -1170,7 +1260,7 @@ python3 sing.py --ref ... --song ... --name exp1 --svc-prompt psvs_mix --select-
 - **svs_ref**（`--svs-ref ext`，默认）：SVS 吃哪个 prompt 去合成。ext = `prompt_ext`（分层裁剪到 20s，见「SVS 吃 prompt 的截断缺陷」），ref = `refsep2/lead.wav`（直接用分离人声，未测）。SVS 输出的音域由这里的 prompt 决定，所以默认 ext 能让 SVS 覆盖到 PC-NSF 移调后的上限。
 - **`--svs-control` 默认 score**：不要改成 melody。见上"必须 score"。
 - **音准修正在 SVC**：SVS 输出的 >50cents 帧 37.9%，SVC 用 `target_f0` 修回 4.8%。这是分工：SVS 负责音色覆盖全域，SVC 负责音准。
-- **阶段顺序**：`svs` 和 `select-svs` 必须排在 `svc` 之前，否则默认 `--svc-prompt svs` 找不到 `prompt_svs.wav`。`ALL_STAGES` 已调整。
+- **阶段顺序**：`svs` 和 `select-svs` 必须排在 `svc` 之前，否则 `--svc-prompt svs` 找不到 `prompt_svs.wav`。`ALL_STAGES` 已调整；两个阶段都在 `OPT_IN_STAGES` 里，由 `--svc-prompt svs|psvs_mix` 自动带出。
 - **eval 阶段自动双锚点**：检测到 `svc_prompt in ("svs","psvs_mix")` 且 `svs_vocal.wav` 存在时，自动调用 `singing/eval_dual.py` 给出 S 列（vs svs_vocal，主指标）和 R 列（vs 真实参考）+ 音准。
 
 #### 踩过的坑
@@ -1494,8 +1584,9 @@ GPT-SoVITS/.venv/bin/python singing/paired_eval.py \
 
 ### Dual-anchor benchmark (2026-08): `singing/eval_dual.py`
 
-新默认流程（`--svc-prompt svs`）的目标函数变了：SVS 那一环负责绝对音色，SVC 只需**保住 SVS
-给的音色 + 用原唱主唱修回音准**。所以主指标不再是"vs 真实参考"：
+**只适用于 `--svc-prompt svs|psvs_mix` 臂**（不再是默认，见「参考素材加强」一节）：那条路线的
+目标函数变了 —— SVS 那一环负责绝对音色，SVC 只需**保住 SVS 给的音色 + 用原唱主唱修回音准**，
+所以主指标不是"vs 真实参考"。默认 `ext` 臂只有单锚点，直接看 `eval_sim` / `paired_eval`：
 
 | 列 | 配对 | 含义 |
 |---|---|---|
@@ -1590,15 +1681,17 @@ verified by md5, so B varies only through the target):
 Automates the whole pipeline above; run from the workspace root with **system python3** (stdlib only, no venv needed):
 
 ```bash
-# 默认流程（2026-08 起走 SVS→prompt_svs→SVC，成片是 vocal_psvs.wav）
-python3 sing.py --ref data/voices/ref.wav --song data/songs/song.flac --name exp1
+# 默认流程（2026-08 起：参考选段 → SVC，不跑 SVS，成片是 vocal.wav）
+python3 sing.py --ref data/voices/ref_talk_sing.wav --ref-is-clean \
+    --song data/songs/song.flac --name exp1
+# 参考已是纯人声就务必加 --ref-is-clean：跳过 ref-sep，且锚点直接指向 --ref
+# （不加会沿用 refsep2/lead.wav，换素材复用同一 --name 时那是上一个参考的缓存）
 # 验收纯人声后，再混伴奏（可调伴奏音量）
 python3 sing.py --ref ... --song ... --name exp1 --stages mix --acc-gain 0.7
 # 只跑部分阶段（产物在 data/songs/<name>/，可续跑）
 python3 sing.py --ref ... --song ... --name exp1 --stages sep,select
-# 回到旧的纯 SVC 流程（不跑 SVS，快 ~1.5min，成片是 vocal.wav）
-python3 sing.py --ref ... --song ... --name exp1 --svc-prompt ext \
-    --stages sep,ref-sep,f0-target,select,ext,svc,eval
+# 素材音域不够时才走 SVS 路线（svs + select-svs 自动带出，成片 vocal_psvs.wav）
+python3 sing.py --ref ... --song ... --name exp1 --svc-prompt svs
 ```
 
 Stages: `sep` (BS-RoFormer → karaoke, 人声+伴奏+主唱+和声) → `ref-sep` (参考音频同样两步分离取纯人声
@@ -1612,12 +1705,18 @@ PC-NSF-HiFiGAN 默认 `--ext-method nsf`，seed-vc 可选。**默认 `--select-m
 `--ext-max-shift 8` 允许单段
 最大移调 8st，拼出 ≤`--max-sec` 的 `prompt_ext`（**默认 45s，原 29s**；跨歌 A/B 绿色 +0.0229 /
 白色毛衣 +0.0133，再加到 50s 是否退化取决于歌曲是否超出素材移调上限，见「prompt_ext 总长」
-一节）) → `svs` (score-control 合成，吃 `prompt_ext`；`--svs-ref ext` 默认，`--svs-control score`
-**必须保持 score**，melody 会把原唱 f0 喂进模型让后面提出的 prompt 带原唱音色) →
-`select-svs` (从 `svs_vocal.wav` 选段拼 `prompt_svs.wav`；`--select-svs-mix` 走干净素材优先的
-分层混合变体) → `svc`
-(SoulX, `--svc-prompt svs` **默认**（用 `prompt_svs`，成片 `vocal_psvs.wav`）/ `ext`（旧默认，
-`vocal.wav`）/ `psvs_mix`；`--pitch-shift 0` 默认保留旋律；`12` 全曲高八度适配男→女；`auto` 按段
+一节）。**`--anchor-min-ratio` 默认 1.0（原 0.55）**：它是 cap 而非固定值，锚点 =
+`min(prompt_dur, max_sec×ratio)`，所以 1.0 是自适应的 —— 素材够宽时移调预算为 0
+（`prompt_ext` 与 `prompt.wav` md5 一致，省掉 vocoder 的 0.02-0.045 SIM 损失），素材窄时
+仍用余量补高音格。配套 `--max-prompt` 默认 45（原 25，那是"只选锚点、余量交给移调"时代的值）） →
+`svs` (**opt-in**，只在 `--svc-prompt svs|psvs_mix` 时自动带出。score-control 合成，吃
+`prompt_ext`；`--svs-ref ext` 默认，`--svs-control score` **必须保持 score**，melody 会把原唱
+f0 喂进模型让后面提出的 prompt 带原唱音色) →
+`select-svs` (同为 opt-in。从 `svs_vocal.wav` 选段拼 `prompt_svs.wav`；`--select-svs-mix` 走
+干净素材优先的分层混合变体) → `svc`
+(SoulX, `--svc-prompt ext` **默认**（用 `prompt_ext`，成片 `vocal.wav`）/ `svs`（用
+`prompt_svs`，成片 `vocal_psvs.wav`，素材音域不够时用）/ `psvs_mix`；
+`--pitch-shift 0` 默认保留旋律；`12` 全曲高八度适配男→女；`auto` 按段
 自动对齐（男女对唱/跨音区）；`--max-seg-sec 28` 适配 16GB；`--cfg 0.5` 默认，上游 3.0 会放大原唱
 音色残留；`--knn-alpha 0.2` 默认开启，检索池用完整参考人声（`--knn-full-pool`，绕开 whisper 30s）；
 0.1-0.2 是 CER 与 SIM 双赢区，0.4 会让 CER 涨 5.9 点，详见「kNN 的吐字代价」一节) →
@@ -1625,10 +1724,11 @@ PC-NSF-HiFiGAN 默认 `--ext-method nsf`，seed-vc 可选。**默认 `--select-m
 主指标是 **SIM vs svs_vocal**) → `mix` (opt-in, `--mix`；两级动态控制默认都开：先按
 `sep2/lead.wav` 逐帧对齐人声包络 `--no-match-lead` 关，再按伴奏包络给时变增益
 `--no-match-acc` 关，软限幅 `--limit-db -0.5`，保留伴奏立体声 `--mix-mono` 关，见下)。
-`cascade` 也是 opt-in（另一条支线：source 换成 SVS 输出，见「Cascade pipeline」一节）。
-Worker 脚本在 `singing/w_*.py`，每个阶段用对应项目的 venv 跑。
+`cascade` 也是 opt-in，且**不再被 `--mix` 带出**（它依赖 `svs/svs_vocal.wav`，而默认路线不跑
+svs，绑在一起会让 `--mix` 必然 Fail）；要跑级联就显式 `--stages ...,svs,cascade`，见
+「Cascade pipeline」一节。Worker 脚本在 `singing/w_*.py`，每个阶段用对应项目的 venv 跑。
 
-**阶段顺序有依赖**：`svs` / `select-svs` 必须在 `svc` 之前（默认 `--svc-prompt svs` 要用
+**阶段顺序有依赖**：`svs` / `select-svs` 必须在 `svc` 之前（`--svc-prompt svs` 要用
 `select-svs` 的产物）。`ALL_STAGES` 已按此排列，手动传 `--stages` 时注意。
 
 score-control SVS 的独立入口仍在：`singing/download_svs.py` 拉权重、
@@ -1773,7 +1873,7 @@ score-control SVS 的独立入口仍在：`singing/download_svs.py` 拉权重、
     `soulxsinger/config/soulxsinger.yaml`，即 `SVC_CONFIG`），进了清单只是白增失败面。
     同理 FunASR / g2pM 那类按需下进 HF cache 的不做硬检查，首次跑必然误伤。
   - **贵的权重要按阶段条件检查。** SVS 侧 2.9GB，只在 `"svs" in cfg.stages` 时才要求，
-    否则用 `--svc-prompt ext` 旧流程的人也被逼着下载。`select-svs`/`cascade` 只读 `svs/`
+    否则走默认 `--svc-prompt ext` 的人也被逼着下载。`select-svs`/`cascade` 只读 `svs/`
     下的产物、不加载模型，所以**不能**把它们也算进触发条件。`cfg.stages` 早就在 dataclass
     里，不需要改 `preflight` 签名。
   - 清单里 `rosvot/rmvpe/model.pt` 与顶层 `rmvpe/rmvpe.pt` 是**两个不同文件**（前者由

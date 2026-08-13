@@ -65,12 +65,14 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 log = logging.getLogger("sing")
 
 # 阶段顺序即 --stages all 的执行顺序。**svc 必须排在 svs / select-svs 之后**：
-# 默认 --svc-prompt svs 要用 select-svs 产出的 prompt_svs.wav（见 Cfg.svc_prompt）。
+# --svc-prompt svs|psvs_mix 要用 select-svs 产出的 prompt_svs.wav（见 Cfg.svc_prompt）。
 # cascade 是另一条支线（source 换成 SVS 输出），仍排在 svc 之后。
 ALL_STAGES = ["sep", "stems4", "ref-sep", "f0-target", "select", "ext",
               "svs", "select-svs", "svc", "cascade", "eval", "mix"]
-# cascade 默认不跑：它与默认的 prompt_svs 路线是两条独立支线，同时跑只是浪费一次推理。
-OPT_IN_STAGES = {"mix", "cascade"}  # 先验收纯人声，再 --mix
+# svs / select-svs 只在 --svc-prompt svs|psvs_mix（或 cascade）时才跑：默认 ext 路线
+# 用不到它们，白跑要多花一次 SVS 合成 + 一次选段。
+# cascade 与 prompt_svs 路线是两条独立支线，同时跑只是浪费一次推理。
+OPT_IN_STAGES = {"mix", "cascade", "svs", "select-svs"}  # 先验收纯人声，再 --mix
 
 VENVS = {
     "gsv": os.path.join(ROOT, "GPT-SoVITS", ".venv", "bin", "python"),
@@ -196,11 +198,24 @@ class Cfg:
     name: str
     gpu: str = "0"
     stages: list[str] = None  # type: ignore[assignment]
-    max_prompt: float = 25.0
+    # 参考音频已是纯人声（自己录的干声/已分离好的素材）：跳过 ref-sep，
+    # 且 ref_clean 直接指向它而不是 refsep2/lead.wav（见 ref_clean 的说明）。
+    ref_is_clean: bool = False
+    # prompt.wav（干净锚点素材）的时长上限。**默认 45（原 25）**：25 是窄素材时代的值，
+    # 那时 select 只需选出锚点、剩下的交给 ext 移调补。素材加强后 select 能直接选满
+    # max_sec，把预算留给干净素材比留给移调段更值（见 anchor_min_ratio）。
+    max_prompt: float = 45.0
     select_min_sec: float = 0.3   # select 候选最短时长（见 AGENTS.md「最小分段长度」）
     semitone_shift: int | None = None
     ext_method: str = "nsf"
-    anchor_min_ratio: float = 0.55
+    # 干净锚点占 prompt_ext 的份额**上限**（cap）：锚点 = min(prompt_dur, max_sec×ratio)，
+    # 余量才给移调段。**默认 1.0（原 0.55）**，是自适应的而非"禁用移调"：
+    #   素材够宽（select 选满 45s）→ 移调预算 0，prompt_ext 与 prompt.wav md5 一致，
+    #                              省掉过一遍 vocoder 的 0.02-0.045 SIM 损失；
+    #   素材偏窄（只选出 25s）    → 锚点 25s、移调预算 20s，ext 照常补高音格。
+    # 雨爱配对 A/B（新素材, 统一锚点, seed 1234）：+0.0398 (55/69, p<1e-4)，旧锚点复核
+    # +0.0321 (56/69) 方向一致；建议移调 +6 -> +2，覆盖 37% -> 88.2%。
+    anchor_min_ratio: float = 1.0
     ext_max_shift: int = 8   # ext 单段最大移调半音。原默认 5，2026-08 A/B 3首
     # 结论：ms=8 在复用未饱和的歌上解锁新源段（1.37-1.41×→1.10×），在饱和的歌上
     # 扩展高音格覆盖，3/3 全正（+0.003-0.007，p<0.01）。见 AGENTS.md「ext 移调上限扩展」。
@@ -265,14 +280,17 @@ class Cfg:
     # （从 SVS 输出里选段，见 select-svs 阶段）。svs 的动机是 SVS 输出覆盖到 774Hz，
     # 而 PC-NSF 受素材 med 上限约束到不了 547Hz+。
     # psvs_mix = prompt_svs_mix.wav：分层混合，干净素材优先、SVS 只补它到不了的高音格。
-    # **默认 svs**（2026-08）。爱笑的眼睛 75 窗配对、seed 1234：主指标 SIM vs svs_vocal
-    # 0.7432 -> 0.7881（+0.0449, 75/75 窗, p<1e-4），已达 SVS 自身 0.8192 的 96%；
-    # 音准不受影响（>50cents 帧 5.4% -> 4.8%，音高来自 target_f0 而非 prompt）；
-    # 稳定性同向改善（drift 0.0783 -> 0.0692，worst 0.4286 -> 0.4941）；
-    # 按真歌词 CER 0.2793 -> 0.2500。代价是 SIM vs 真实参考 0.5899 -> 0.5735，
-    # 但那正好收敛到 SVS 自身的 0.5734 —— 绝对音色由 SVS 那一环负责。
+    # 历史（窄素材时代，163s 说话参考、音域满足率 54.5%）：svs 曾是默认，爱笑的眼睛
+    # 75 窗配对主指标 SIM vs svs_vocal 0.7432 -> 0.7881（+0.0449, 75/75, p<1e-4），
+    # CER 0.2793 -> 0.2500。那批数字仍然成立，但**只在素材音域不够时成立**。
     # psvs_mix 三个变体都测过，在任何权重 w·S+(1-w)·R 下都不最优，见 AGENTS.md。
-    svc_prompt: str = "svs"
+    # **默认 ext**（2026-08 改回）。svs 路线存在的前提是"PC-NSF 受素材 med 上限约束、
+    # 到不了 547Hz+"，而参考素材加强后（538s 唱歌+说话，p99 631Hz，12 首歌音域满足率
+    # 99.8%、零缺口格）这个前提消失了。雨爱配对 A/B（seed 1234，统一锚点）：
+    # SIM 不可区分（+0.0024, wins 37/69, p=0.63），但 CER 明显更差（0.4016 vs 0.3639，
+    # 咬字变形 S=76 vs 62）—— SVS 多一层重合成的代价落在吐字而非音色上，且白跑
+    # svs+select-svs 两个阶段。素材窄的场景仍可 --svc-prompt svs 切回。
+    svc_prompt: str = "ext"
     # select-svs 是否走分层混合（产出 prompt_svs_mix.wav 而不是 prompt_svs.wav）
     select_svs_mix: bool = False
     mix: bool = False
@@ -299,7 +317,14 @@ class Cfg:
 
     @property
     def ref_clean(self) -> str:
-        """选段/评测用的参考：已跑 ref-sep 则用分离后的纯人声 lead，否则退回原音频。"""
+        """选段/评测用的参考：已跑 ref-sep 则用分离后的纯人声 lead，否则退回原音频。
+
+        --ref-is-clean 时**无条件**返回 self.ref。不能沿用"lead 存在就用"的逻辑：
+        换素材后复用同一 --name 时，refsep2/lead.wav 往往是上一个参考的缓存产物，
+        静默拿它当选段素材和评测锚点，会让 A/B 变成"新 prompt vs 旧锚点"的假对比。
+        """
+        if self.ref_is_clean:
+            return self.ref
         return self.ref_lead if os.path.exists(self.ref_lead) else self.ref
 
     @property
@@ -486,6 +511,10 @@ def stage_stems4(cfg: Cfg) -> None:
 
 
 def stage_ref_sep(cfg: Cfg) -> None:
+    if cfg.ref_is_clean:
+        banner("Stage: 参考分离 — 跳过（--ref-is-clean）")
+        log.info(f"  参考已是纯人声，直接使用: {cfg.ref}")
+        return
     banner("Stage: 参考分离 (BS-RoFormer + karaoke, 去 BGM)")
     extra = ["--no-cache"] if cfg.no_sep_cache else []
     run([VENVS["gsv"], os.path.join(WORKERS, "w_sep.py"), "--in", cfg.ref,
@@ -873,14 +902,21 @@ def main() -> None:
     )
     ap.add_argument("--ref", required=True,
                     help="参考音频（通常带 BGM/BGM 含人声；ref-sep 阶段会自动两步分离取纯人声）")
+    ap.add_argument("--ref-is-clean", action="store_true",
+                    help="参考音频已是纯人声（自录干声/已分离素材）：跳过 ref-sep，"
+                         "选段与评测锚点都直接用 --ref。换素材而复用同一 --name 时必须加，"
+                         "否则 refsep2/lead.wav 的旧缓存会被当成锚点，A/B 变成新 prompt vs 旧锚点")
     ap.add_argument("--song", required=True, help="原始歌曲（flac/wav/mp3）")
     ap.add_argument("--name", required=True, help="实验名，决定输出目录 data/songs/<name>/")
     ap.add_argument("--gpu", default="0", help="GPU 编号")
     ap.add_argument("--stages", default="all",
-                    help=f"要执行的阶段，逗号分隔。可选: {','.join(ALL_STAGES)}"
-                         f"（{'/'.join(sorted(OPT_IN_STAGES))} 默认不跑，需 --mix）")
-    ap.add_argument("--max-prompt", type=float, default=25.0,
-                    help="选段 prompt 时长上限(秒)，需 <30（whisper 硬顶）")
+                    help=f"要执行的阶段，逗号分隔。可选: {','.join(ALL_STAGES)}。"
+                         "默认不跑: mix/cascade（需 --mix）、svs/select-svs"
+                         "（需 --svc-prompt svs|psvs_mix，会自动带出）。显式列出则一定跑")
+    ap.add_argument("--max-prompt", type=float, default=45.0,
+                    help="选段 prompt.wav 时长上限(秒)，默认 45（原 25 是窄素材时代的值）。"
+                         "不受 whisper 30s 限制：那只约束 pt_content_feat 且已被 encode_long() "
+                         "绕开，音色通道 pt_mel 从波形直接算；真正的顶是 RoPE 4096（约 50s）")
     ap.add_argument("--select-min-sec", type=float, default=0.3,
                     help="select 候选段最短时长(秒)，默认 0.3。降到 0.15 可捕捉极短高音，"
                          "提到 0.8-1.2 可减少拼接点")
@@ -888,9 +924,12 @@ def main() -> None:
                     help="覆盖自动计算的 seed-vc 变调半音数（默认按 song/prompt 的 p90 自动）")
     ap.add_argument("--ext-method", default="nsf", choices=["seedvc", "nsf"],
                     help="音域扩展引擎: nsf（默认，PC-NSF-HiFiGAN）| seedvc")
-    ap.add_argument("--anchor-min-ratio", type=float, default=0.55,
-                    help="原始干净音频在 prompt_ext 中占的份额上限 cap，默认 0.55 时锚点裁到 "
-                         "15.95s、ext 拿 45 pct。扫 0.0 到 0.9 即 ext 占比 100 pct 到 14 pct")
+    ap.add_argument("--anchor-min-ratio", type=float, default=1.0,
+                    help="原始干净音频在 prompt_ext 中占的份额上限 cap（锚点 = "
+                         "min(prompt_dur, max_sec x ratio)，余量给移调段）。默认 1.0 是自适应的，"
+                         "不是禁用移调：素材够宽则移调预算为 0（prompt_ext 与 prompt.wav 一致，"
+                         "省掉 vocoder 损失），素材窄则照常用余量补高音格。"
+                         "调到 0.55 回到窄素材时代行为（锚点裁到 24.75s、ext 拿 45 pct）")
     ap.add_argument("--ext-div-weight", type=float, default=3.0,
                     help="ext 源段复用惩罚，折算为等价半音数（默认 3）。0=旧行为。"
                          "只按移调量最小排序会把素材锁在 med 最高的少数段上（实测 143 段池"
@@ -973,13 +1012,13 @@ def main() -> None:
     ap.add_argument("--svs-prompt-max-sec", type=float, default=20.0,
                     help="SVS prompt 时长上限（默认 20）。SVS 只用 metadata 第一段，"
                          "过长会被 --max-merge-ms 切成多段而只用首段")
-    ap.add_argument("--svc-prompt", default="svs", choices=["svs", "ext", "psvs_mix"],
-                    help="SVC 用哪个 prompt。svs（默认）= prompt_svs.wav（从 SVS 输出选段，"
-                         "需 svs + select-svs 阶段）：主指标 SIM vs svs_vocal +0.0449 "
-                         "(75/75 窗, p<1e-4)，音准与稳定性同向改善；ext = prompt_ext.wav"
-                         "（旧默认，SIM vs 真实参考最高 0.5899）；"
-                         "psvs_mix = prompt_svs_mix.wav（分层混合：干净素材优先，SVS 只补"
-                         "它到不了的高音格）。三臂产物分别写 vocal.wav / vocal_psvs.wav / "
+    ap.add_argument("--svc-prompt", default="ext", choices=["svs", "ext", "psvs_mix"],
+                    help="SVC 用哪个 prompt。ext（默认）= prompt_ext.wav，直接用参考素材选段，"
+                         "不跑 svs/select-svs：素材音域够宽时 SVS 那层在 SIM 上不可区分"
+                         "(+0.0024, p=0.63) 而 CER 更差 (0.4016 vs 0.3639)；"
+                         "svs = prompt_svs.wav（从 SVS 输出选段，自动带出 svs + select-svs 阶段），"
+                         "窄素材/歌曲音域远超素材时用；psvs_mix = 分层混合（干净素材优先，"
+                         "SVS 只补它到不了的高音格）。三臂产物分别写 vocal.wav / vocal_psvs.wav / "
                          "vocal_psvs_mix.wav，互不覆盖")
     ap.add_argument("--select-svs-mix", action="store_true",
                     help="select-svs 走分层混合，产出 prompt_svs_mix.wav（配 --svc-prompt "
@@ -1013,7 +1052,14 @@ def main() -> None:
     args = ap.parse_args()
 
     if args.stages == "all":
-        stages = [s for s in ALL_STAGES if s not in OPT_IN_STAGES or args.mix]
+        # svs / select-svs 只在 prompt 真的来自 SVS 时才跑。
+        # cascade 不再被 --mix 带出：它依赖 svs/svs_vocal.wav，而默认 ext 路线不跑 svs，
+        # 绑在一起会让 --mix 必然 Fail。要跑级联就显式 --stages ...,svs,cascade。
+        need_svs = args.svc_prompt in ("svs", "psvs_mix")
+        stages = [s for s in ALL_STAGES
+                  if s not in OPT_IN_STAGES
+                  or (s in ("svs", "select-svs") and need_svs)
+                  or (s == "mix" and args.mix)]
     else:
         stages = [s.strip() for s in args.stages.split(",")]
         bad = [s for s in stages if s not in ALL_STAGES]
@@ -1022,7 +1068,8 @@ def main() -> None:
         args.mix = args.mix or "mix" in stages
 
     cfg = Cfg(ref=args.ref, song=args.song, name=args.name, gpu=args.gpu,
-              stages=stages, max_prompt=args.max_prompt,
+              stages=stages, ref_is_clean=args.ref_is_clean,
+              max_prompt=args.max_prompt,
               select_min_sec=args.select_min_sec,
               semitone_shift=args.semitone_shift, ext_method=args.ext_method,
               anchor_min_ratio=args.anchor_min_ratio,
