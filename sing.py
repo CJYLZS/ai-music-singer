@@ -205,7 +205,27 @@ class Cfg:
     # 那时 select 只需选出锚点、剩下的交给 ext 移调补。素材加强后 select 能直接选满
     # max_sec，把预算留给干净素材比留给移调段更值（见 anchor_min_ratio）。
     max_prompt: float = 45.0
-    select_min_sec: float = 0.3   # select 候选最短时长（见 AGENTS.md「最小分段长度」）
+    select_min_sec: float = 1.0   # select 候选最短时长。2026-08 混合切法默认 [1s,4s]：
+    # 旧默认 0.3 是 frame 2048/top_db 25 细切时代的值（候选池 med 0.67s，319/429 <1s），
+    # 细切把短语内部 58ms 微停顿全当边界。新默认切法见 w_select.fine_cands。
+    select_max_sec: float = 4.0   # select 候选最长时长（混合切法硬上限）
+    gain_alpha: float = 1.0   # select 贪心排序键的时长归一化指数 gain/dur**alpha。
+    # 1.0 = 单位时长增益（默认，2026-08）。**与 dbs_group=2 绑定**：跨 4 首歌 +0.0165 SIM 的
+    # 实验全部在 α=1 上测得，单独改回 0 会脱离已验证配置。
+    # 0 = 绝对增益，长段占优（历史默认，新切法 [1s,4s] 下选出 12 段 med 3.89s）。
+    select_seed: int = -1   # RCL 随机种子（--select-rcl>1 时生效）
+    select_rcl: int = 1     # RCL 宽度：每步从增益前 K 名随机抽一个（GRASP 半贪心）。1=纯贪心
+    # （默认，与历史产物 bit-identical）。K>1 是多起点探索选段空间的实验参数。
+    rcl_eps: float = 0.0    # 值域 RCL：每步从增益 >= 最优×(1-eps) 的候选随机抽。0=关；
+    # 0.1 = 增益在最优值 10% 内的候选都进窗口。同音高候选增益相近会整组进入 ——
+    # 模拟: eps=0.1 覆盖仅掉 ~2pp，eps=0.3 掉 10pp+ 过界。seed 由 --select-seed 控制。
+    dbs_group: int = 2      # Diverse Beam Search（2026-08）：取第几轮贪心的结果。0=纯贪心。
+    # 第 g 轮排序键减去 lam×该段被前 g 轮选过次数，惩罚累积，所以必须顺序跑 0..g 轮。
+    # **默认 2**：跨 4 首歌 × 2-3 seed 实测 vs g0 平均 +0.0165 SIM（爱笑的眼睛 +0.0367 /
+    # 雨爱 +0.0231 / 绿色 +0.0078 / 冬眠 -0.0016），7/8 arm 正、无显著负例、零推理成本。
+    # 增益与基线负相关（基线最差的歌收益最大，同 kNN 的模式），压缩跨歌差距。
+    # 注意它降低音高格覆盖率（雨爱 86.8%->85.0%）—— 覆盖率与 SIM 已 9 次否证，别据此回调。
+    dbs_lam: float = 0.1    # DBS 多样性惩罚权重（等效覆盖秒数/每次被前轮使用）
     semitone_shift: int | None = None
     ext_method: str = "nsf"
     # 干净锚点占 prompt_ext 的份额**上限**（cap）：锚点 = min(prompt_dur, max_sec×ratio)，
@@ -542,6 +562,13 @@ def stage_select(cfg: Cfg) -> None:
          "--ref", cfg.ref_clean, "--target-f0", cfg.target_f0,
          "--out-dir", cfg.out_dir, "--budget", str(cfg.max_prompt),
          "--min-sec", str(cfg.select_min_sec),
+         "--max-sec", str(cfg.select_max_sec),
+         "--select-seed", str(cfg.select_seed),
+         "--select-rcl", str(cfg.select_rcl),
+         "--rcl-eps", str(cfg.rcl_eps),
+         "--dbs-group", str(cfg.dbs_group),
+         "--dbs-lam", str(cfg.dbs_lam),
+         "--gain-alpha", str(cfg.gain_alpha),
          "--device", cfg.device], stage="select")
 
 
@@ -917,9 +944,28 @@ def main() -> None:
                     help="选段 prompt.wav 时长上限(秒)，默认 45（原 25 是窄素材时代的值）。"
                          "不受 whisper 30s 限制：那只约束 pt_content_feat 且已被 encode_long() "
                          "绕开，音色通道 pt_mel 从波形直接算；真正的顶是 RoPE 4096（约 50s）")
-    ap.add_argument("--select-min-sec", type=float, default=0.3,
-                    help="select 候选段最短时长(秒)，默认 0.3。降到 0.15 可捕捉极短高音，"
-                         "提到 0.8-1.2 可减少拼接点")
+    ap.add_argument("--select-min-sec", type=float, default=1.0,
+                    help="select 候选段最短时长(秒)，默认 1.0（混合切法的合并下限）。"
+                         "旧默认 0.3 是细切时代的值，已随 2026-08 切法改动废弃")
+    ap.add_argument("--select-max-sec", type=float, default=4.0,
+                    help="select 候选段最长时长(秒)，默认 4.0（混合切法的硬上限）。"
+                         "扫过 2.0/2.5/3.0 全部不及默认，且缩短会稀释 --dbs-group 的多样性惩罚")
+    ap.add_argument("--select-seed", type=int, default=-1,
+                    help="RCL 随机种子（--select-rcl>1 时生效）")
+    ap.add_argument("--select-rcl", type=int, default=1,
+                    help="RCL 宽度：select 贪心每步从增益前 K 名随机抽一个（GRASP 半贪心）。"
+                         "1=纯贪心（默认）。实验参数，见 Cfg.select_rcl")
+    ap.add_argument("--rcl-eps", type=float, default=0.0,
+                    help="值域 RCL：每步从增益 >= 最优×(1-eps) 的候选随机抽。0=关（默认）。"
+                         "0.1 = 同音高候选整组进入随机窗口。seed 由 --select-seed 控制")
+    ap.add_argument("--dbs-group", type=int, default=2,
+                    help="DBS：取第几轮贪心的结果，默认 2（跨 4 首歌 +0.0165 SIM，见 Cfg.dbs_group）。"
+                         "0 = 纯贪心，回到历史产物")
+    ap.add_argument("--dbs-lam", type=float, default=0.1,
+                    help="DBS 多样性惩罚权重（等效覆盖秒数/每次被前轮使用）")
+    ap.add_argument("--gain-alpha", type=float, default=1.0,
+                    help="select 贪心排序键的时长归一化指数 gain/dur**alpha。默认 1.0=单位时长增益，"
+                         "**与 --dbs-group 2 绑定**（+0.0165 的实验全在 α=1 上测得）；0=绝对增益")
     ap.add_argument("--semitone-shift", type=int, default=None,
                     help="覆盖自动计算的 seed-vc 变调半音数（默认按 song/prompt 的 p90 自动）")
     ap.add_argument("--ext-method", default="nsf", choices=["seedvc", "nsf"],
@@ -1071,6 +1117,13 @@ def main() -> None:
               stages=stages, ref_is_clean=args.ref_is_clean,
               max_prompt=args.max_prompt,
               select_min_sec=args.select_min_sec,
+              select_max_sec=args.select_max_sec,
+              select_seed=args.select_seed,
+              select_rcl=args.select_rcl,
+              rcl_eps=args.rcl_eps,
+              dbs_group=args.dbs_group,
+              dbs_lam=args.dbs_lam,
+              gain_alpha=args.gain_alpha,
               semitone_shift=args.semitone_shift, ext_method=args.ext_method,
               anchor_min_ratio=args.anchor_min_ratio,
               ext_max_shift=args.ext_max_shift,
