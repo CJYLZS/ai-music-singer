@@ -27,6 +27,7 @@ import os
 import sys
 
 import numpy as np
+import torch
 
 sys.path.insert(0, "/home/rookie/voice")
 from eval_sim import SV, load16k, cos  # noqa: E402
@@ -78,6 +79,10 @@ def main() -> None:
     sv = SV()
     anchor_svs = sv.emb(load16k(args.svs))
     anchor_ref = sv.emb(load16k(args.ref))
+    # 长参考的整文件前向会把 PyTorch 缓存池撑到 ~19GB（537s 素材实测 reserved
+    # 19.48GB vs allocated 0.21GB），而后续每个窗只要 0.34GB。不清掉会在 16GB 卡上
+    # 随机 OOM（见 eval_sim.py 同处注释）。embedding 已算完，清理不改数值。
+    torch.cuda.empty_cache()
     tf0 = np.load(args.target_f0)
 
     # ---- 公共窗口：所有臂都过 RMS 门，且该窗歌曲 F0 有足够浊音帧 ----

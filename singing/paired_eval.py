@@ -45,6 +45,10 @@ def main():
 
     sv = SV()
     ref_emb = sv.emb(load16k(args.ref))
+    # 长参考的整文件前向会把 PyTorch 缓存池撑到 ~19GB（537s 素材实测 reserved
+    # 19.48GB vs allocated 0.21GB），而后续每个窗只要 0.34GB。不清掉会在 16GB 卡上
+    # 随机 OOM（见 eval_sim.py 同处注释）。embedding 已算完，清理不改数值。
+    torch.cuda.empty_cache()
     ref_f0 = np.load(args.ref_f0)
     ref_med = float(np.median(ref_f0[ref_f0 > 0]))
     f0 = np.load(args.f0)

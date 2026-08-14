@@ -58,6 +58,10 @@ def main() -> None:
             return m.forward3(f).squeeze(0)
 
     gt = emb(load16k(args.ref))
+    # 长参考的整文件前向会把 PyTorch 缓存池撑到 ~19GB（537s 素材实测 reserved
+    # 19.48GB vs allocated 0.21GB），而后续每个窗只要 0.34GB。不清掉会在 16GB 卡上
+    # 随机 OOM（见 eval_sim.py 同处注释）。embedding 已算完，清理不改数值。
+    torch.cuda.empty_cache()
     cos = lambda a, b: float(torch.nn.functional.cosine_similarity(a, b, dim=0))  # noqa: E731
 
     print(f"参考: {args.ref}   窗口 {args.win}s   dropout 阈值 {args.dropout}\n")

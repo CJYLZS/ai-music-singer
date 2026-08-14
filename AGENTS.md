@@ -1569,6 +1569,14 @@ Why does TTS sound like game voice? Measured on ref_cut (real), NSF +5st, WORLD 
 Do not judge by ear alone. `eval_sim.py` scores speaker similarity with the ERes2NetV2 model already in
 `GPT-SoVITS/GPT_SoVITS/pretrained_models/sv/`, bucketed by pitch distance from the reference.
 
+**长参考的整文件嵌入前向必须清一次 PyTorch 缓存池，否则 16GB 卡随机 OOM。** 537s 素材的
+`sv.emb(load16k(ref))` 实测 allocated 只有 0.21GB、**reserved 19.48GB**（CUDA caching
+allocator 在长序列上预取整块显存），而后面每个 3s 窗只要 0.34GB。不清掉的话 eval 会在
+随机的某一首歌挂掉——表现是 SVC 全部成功、只有 eval OOM，且换歌重试不稳定（前 4 首侥幸
+通过、第 5 首失败）。已在 `eval_sim.py` / `eval_dual.py` / `eval_stab.py` / `eval_triad.py` /
+`paired_eval.py` 的参考嵌入之后统一加 `torch.cuda.empty_cache()`（embedding 已算完，
+清理不改数值）。新增 eval 类脚本时同样处理。
+
 **Always score against the real, unmodified speech** as ground truth. Scoring a pitch-shifted variant against
 its own shifted prompt hides the very degradation you are trying to measure — that mistake made a real
 regression look like a tie.
@@ -2239,11 +2247,29 @@ PSD 立绘 + `make_cues.py` 口型时间轴 → MV。上游是交互式浏览器
   （D→C、F→E、G→B、H→C），`push()` 里有 `FOLD` 兜底。依据是 Bristow《5 things that can go
   wrong with animated lip sync》——口型过大是新手错误第一位，且 anime 常只用 open/shut
   两型也没人抱怨。**注意 Rhubarb 的 H 是 long "L"（舌尖抬起），不是 ü**，我一度弄错。
-- **口型的文本源优先用真歌词强制对齐，不要用 ASR 转写 —— 这是本轮最大的免费收益。**
-  `make_cues.py` 不传 `--text` 会走 paraformer ASR，但它在 SVC 转换后的人声上漏字严重：
-  云烟成雨全曲 ASR 只认出 **103 字**，喂真歌词（`get_lyrics.py` 的缓存）能对齐 **347 字**，
-  且不再听错词。代价是零 —— 歌词本来就为字幕抓过，347 字对齐只花 14.5s。所以流程顺序应是
-  先 `get_lyrics.py`、再 `make_cues.py --text`。
+ - **口型的文本源优先用真歌词强制对齐，不要用 ASR 转写 —— 这是本轮最大的免费收益。**
+   `make_cues.py` 不传 `--text` 会走 paraformer ASR，但它在 SVC 转换后的人声上漏字严重：
+   云烟成雨全曲 ASR 只认出 **103 字**，喂真歌词（`get_lyrics.py` 的缓存）能对齐 **347 字**，
+   且不再听错词。代价是零 —— 歌词本来就为字幕抓过，347 字对齐只花 14.5s。所以流程顺序应是
+   先 `get_lyrics.py`、再 `make_cues.py --text`。
+ - **全曲口型时间轴直接用增强 LRC（`make_cues.py --lrc`），不要做 ASR 强制对齐 —— 这是
+   2026-08 的最终结论。** fa-zh（funasr 强制对齐）在长音频上系统性漂移（实测全曲 96.74s 起
+   每行错位 +4.5~+7.5s；FunASR #2784/#2019 确认是模型 bug 且官方不修，「官方基本不会处理
+   了」），逐句切段对齐 + ASR 锚定歌词区间绕不开三个互相纠缠的问题：36s 长句的歌词定位、
+   副歌重复段文本匹配错位、句子 lo 乱序。**口型对齐的真实需求是「时间准 + 发音近似」，而
+   KRC 行级时间是人工校对、与音频能量跃变 <0.2s 偏差（43/43 行落在有声处）** —— 逐字时间
+   反而不可信（雨爱「彩虹的美丽」把「美」「丽」标进 21s 间奏的静音区）。所以 `--lrc` 路径：
+   行起点 = LRC 时间戳（权威），行内字数均摊到「行内第一段 ≥0.35s 长静音的起点」
+   （`first_long_silence`，与 `--max-hold-sil` 同判据），拖腔/闭嘴交给下游能量门控。
+   验证判据：行起点落在有声处 + 间奏/尾奏全闭嘴 + 唱歌段全张嘴。
+   **行结束不能用 `last_voiced`（找最后有声）** —— 它会把下一行的起音算进本行（雨爱
+   「彩虹的美丽」行的下一行「冷」气口在 124.4s，5 个字因此均摊到 27.7s、间奏张嘴 25s），
+   「第一段长静音」从源头断开才对。用法：
+   ```bash
+   GPT-SoVITS/.venv/bin/python listen_lipsync/make_cues.py \
+       --wav vocal.wav --lrc data/songs/<名>.lrc --out cues.json --gate-db -40
+   ```
+   `--lrc` 优先于 `--text`，完全不加载模型（省 30s+ 启动、零显存）。
 - **尾奏静音会让最后一个口型撑到文件结尾（已修）。** `make_cues.py` 尾部分支原本用
   `is_voiced()` 的**单帧**判据，淡出时的孤立过限帧就判成「还在唱」：全曲版歌词 220.6s 唱完、
   音频 240.8s，尾部 20.2s 是数字静音（−175dB），而嘴张着 `C` 型僵了 20 秒。改为复用
@@ -2275,6 +2301,18 @@ PSD 立绘 + `make_cues.py` 口型时间轴 → MV。上游是交互式浏览器
   时全部失效 —— 雾和水珠主导了这些统计量，量到的是玻璃不是人。本轮据此连续得出两个错误
   结论（先"水珠糊住了角色"，再"角色其实在画面里"）。**有效判据**：渲染两帧只改
   `--char-scale`，若角色在画，差异必然达 80% 像素级别；最终观感必须由人目视确认。
+- **`--visemes data/pics/visemes` 必须传，漏了口型完全不动且日志不报错。** 默认值是
+  `null`，`render.mjs` 的 `if (visemes)` 分支整个跳过——渲染照常完成、帧数正确、连嘴部
+  区域像素都会「随歌声变化」（那是形变/阴影伪差异），**唯一线索是启动日志里没有
+  `visemes: A B C D E F G H X anchor=(679,587) box=89x51` 那一行**。带上的判据：
+  唱歌段嘴部暗红像素 800-1000+、间奏/尾部 <5；漏传时唱歌段只有 10-43。完整渲染参数
+  清单（雨爱全曲实测）：`--psd data/pics/figure.psd --cues cues.json --visemes
+  data/pics/visemes --rain-glass data/pics/rainy_love_bg.png --glass-blur 0
+  --glass-mist-blur 4 --glass-mist-time 10 --streaks --streak-density 2.8 --sway
+  data/songs/<名>/beats.json --sway-beats 1 --size 1920x1080 --char-scale 1.15
+  --char-x 0.62 --char-y 0.56 --video out.mp4 --audio mix.wav --fps 30`（CWD 必须是
+  voice 根目录，否则 psd fetch 404；`--rain-glass` 是路径参数不是 flag，裸传会
+  `ERR_INVALID_ARG_TYPE`）。
 - 确定性靠三件事：固定步长 `1/fps`、播种 mulberry32、`vendor/raindrop-fx.js` 内 6 处
   `Math.random()` 改走 `globalThis.__rdRandom`。另外玻璃 sim 要先 warmup 固定帧数
   （水珠数 44→280 于 ~30s 饱和），否则开场是干玻璃、且帧 N 会依赖起始位置。

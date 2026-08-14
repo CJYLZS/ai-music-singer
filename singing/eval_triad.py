@@ -140,6 +140,10 @@ def main() -> None:
     ref_w, tgt_w = load16k(ref), load16k(target)
     a_ref, a_tgt = sv.emb(ref_w), sv.emb(tgt_w)
     imp = {p: sv.emb(load16k(p)) for p in (args.impostor or []) if os.path.exists(p)}
+    # 长参考的整文件前向会把 PyTorch 缓存池撑到 ~19GB（537s 素材实测 reserved
+    # 19.48GB vs allocated 0.21GB），而后续每个窗只要 0.34GB。不清掉会在 16GB 卡上
+    # 随机 OOM（见 eval_sim.py 同处注释）。embedding 已算完，清理不改数值。
+    torch.cuda.empty_cache()
 
     print(f"ref    {ref}   {len(ref_w) / SR:.1f}s")
     print(f"target {target}   {len(tgt_w) / SR:.1f}s")

@@ -71,6 +71,11 @@ def main() -> None:
 
     sv = SV()
     ref_emb = sv.emb(load16k(args.ref))
+    # 长参考的整文件前向会把 PyTorch 缓存池撑到 ~19GB（537s 素材实测 allocated 只有
+    # 0.21GB，reserved 19.48GB），而后面每个 3s 窗只要 0.34GB。不清掉这段缓存，
+    # 16GB 卡上 eval 会在随机的某一首歌 OOM —— 表现是 SVC 全部成功、只有 eval 挂掉，
+    # 且换歌重试不稳定（前 4 首侥幸通过、第 5 首失败）。ref_emb 本身已算完，清理不改数值。
+    torch.cuda.empty_cache()
     ref_f0 = np.load(args.ref_f0)
     ref_med = float(np.median(ref_f0[ref_f0 > 0]))
     print(f"reference: {args.ref}  median F0 = {ref_med:.0f} Hz\n")
