@@ -2313,6 +2313,14 @@ PSD 立绘 + `make_cues.py` 口型时间轴 → MV。上游是交互式浏览器
   --char-x 0.62 --char-y 0.56 --video out.mp4 --audio mix.wav --fps 30`（CWD 必须是
   voice 根目录，否则 psd fetch 404；`--rain-glass` 是路径参数不是 flag，裸传会
   `ERR_INVALID_ARG_TYPE`）。
+- **`--rnd-pose` 默认改为 0（2026-08）：随机姿势漂移会把卡拍的摆动「糊掉」。**
+  随机姿势（`index.html` 的 rnd 通道，每 1.4-4.0s 重采样 + ~0.9s 缓动）与 sway 落在
+  同一个 `tgt.body`/`tgt.angleZ` 通道上：它不改变摆动的**相位**（probe 直接读几何值
+  验证极值仍卡在拍子 ±12ms 内），但会移动**摆动中心**——0.35 时中心漂移 std 0.059、
+  max 0.104（= 摆动幅度的 35%），左右极值不对称（实测 +0.388/−0.183 → +0.259/−0.336），
+  视觉上就是「摆着摆着往一边偏、没卡在拍子上」。30s 并排 A/B（body 0.70 放大差异）
+  确认是主要嫌疑。需要 idle 生命感时显式传 `--rnd-pose 0.15`（中心漂移降到 ±0.045，
+  可忽略）；gaze（眼睛）随机不受影响。
 - 确定性靠三件事：固定步长 `1/fps`、播种 mulberry32、`vendor/raindrop-fx.js` 内 6 处
   `Math.random()` 改走 `globalThis.__rdRandom`。另外玻璃 sim 要先 warmup 固定帧数
   （水珠数 44→280 于 ~30s 饱和），否则开场是干玻璃、且帧 N 会依赖起始位置。
