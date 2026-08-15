@@ -50,12 +50,19 @@ Cascade 流程:
 （vocal.wav 换修复版，原输出备份 vocal_raw.wav）:
     python3 sing.py --ref ... --song ... --name exp1 --leak-repair
 
+评测默认含 SingMOS naturalness MOS（tools/singmos 独立 venv，写 natmos_report.json）；
+--no-eval-singmos 关闭，--eval-nisqa 额外跑 NISQA（语音域，仅诊断）。
+SVC 输出后处理可选：--post-nsf 用 PC-NSF-HiFiGAN 重合成平滑（默认关，见 AGENTS.md
+「SingMOS 自然度评测与 NSF 后处理」）:
+    python3 sing.py --ref ... --song ... --name exp1 --post-nsf
+
 日志写到 data/songs/<name>/sing.log；-v 打印全部子进程输出。
 """
 
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import logging
 import os
@@ -72,19 +79,21 @@ log = logging.getLogger("sing")
 # --svc-prompt svs|psvs_mix 要用 select-svs 产出的 prompt_svs.wav（见 Cfg.svc_prompt）。
 # cascade 是另一条支线（source 换成 SVS 输出），仍排在 svc 之后。
 ALL_STAGES = ["sep", "stems4", "ref-sep", "f0-target", "select", "ext",
-              "svs", "select-svs", "svc", "cascade", "eval",
+              "svs", "select-svs", "svc", "cascade", "post-nsf", "eval",
               "leak-detect", "leak-repair", "mix"]
 # svs / select-svs 只在 --svc-prompt svs|psvs_mix（或 cascade）时才跑：默认 ext 路线
 # 用不到它们，白跑要多花一次 SVS 合成 + 一次选段。
 # cascade 与 prompt_svs 路线是两条独立支线，同时跑只是浪费一次推理。
 # leak-detect 默认开（双模型 3s 共识漏音扫描，写 leak_report.json）；leak-repair 默认关
 # （定点重转修复：vocal.wav 换成修复版、原版备份为 vocal_raw.wav）。
-OPT_IN_STAGES = {"mix", "cascade", "svs", "select-svs", "leak-repair"}  # 先验收纯人声，再 --mix
+# post-nsf 默认关（--post-nsf 开启）：PC-NSF 重合成平滑，SingMOS 增益稳健但 CER 因歌而异。
+OPT_IN_STAGES = {"mix", "cascade", "svs", "select-svs", "leak-repair", "post-nsf"}  # 先验收纯人声，再 --mix
 
 VENVS = {
     "gsv": os.path.join(ROOT, "GPT-SoVITS", ".venv", "bin", "python"),
     "soulx": os.path.join(ROOT, "SoulX-Singer", ".venv", "bin", "python"),
     "seedvc": os.path.join(ROOT, "seed-vc", ".venv", "bin", "python"),
+    "singmos": os.path.join(ROOT, "tools", "singmos", ".venv", "bin", "python"),
 }
 WORKERS = os.path.join(ROOT, "singing")
 SOULX_DIR = os.path.join(ROOT, "SoulX-Singer")
@@ -137,6 +146,8 @@ NSF_CONFIG = os.path.join(ROOT, "tools", "pcnsf_hifigan",
                           "pc_nsf_hifigan_44.1k_hop512_128bin_2025.02", "config.json")
 NSF_CKPT = os.path.join(ROOT, "tools", "pcnsf_hifigan",
                         "pc_nsf_hifigan_44.1k_hop512_128bin_2025.02", "model.ckpt")
+
+SINGMOS_SCRIPT = os.path.join(ROOT, "tools", "singmos", "score_naturalness.py")
 
 
 def setup_logging(logfile: str, verbose: bool) -> None:
@@ -329,6 +340,12 @@ class Cfg:
     leak_arm_seed: int = 1     # 修复臂：CFM 噪声 seed（雨爱实测 seed1 胜原 seed1234）
     leak_arm_alpha: float = 0.2  # 修复臂：kNN 替换强度（α≥0.3 有吐字退化，0.2 是 CER/SIM 双赢区）
     leak_arm_cfg: float = 0.5  # 修复臂：CFG（与全局 --cfg 默认一致）
+    # --- 后处理与自然度评测（见 AGENTS.md「SingMOS 自然度评测与 NSF 后处理」）---
+    post_nsf: bool = False   # SVC 后处理：PC-NSF-HiFiGAN 重合成平滑（默认关）。
+    #   两首歌 SingMOS +0.068/+0.111 稳健，但 CER 因歌而异（-0.002/+0.022），
+    #   NISQA-TTS 跨歌翻向 —— 所以默认不打开，按歌人工决定（--post-nsf）。
+    eval_singmos: bool = True   # 评测阶段默认跑 SingMOS naturalness MOS（tools/singmos 独立 venv）
+    eval_nisqa: bool = False    # 评测额外跑 NISQA（语音域模型，唱歌内容上不可靠，仅诊断用）
 
     @property
     def leak_report_json(self) -> str:
@@ -861,6 +878,55 @@ def stage_cascade(cfg: Cfg) -> None:
     log.info(f"  -> {cfg.vocal_cascade_wav}")
 
 
+def stage_post_nsf(cfg: Cfg) -> None:
+    """SVC 后处理：PC-NSF-HiFiGAN 纯重合成（--transpose 0）平滑 vocoder 伪影。
+
+    默认关（--post-nsf 开启）。跨两首歌 SingMOS naturalness +0.068/+0.111、尾部
+    p10 +0.62/+0.29 稳健，但 CER 因歌而异（那女孩对我说 -0.002 / 雨爱 +0.022），
+    见 AGENTS.md「SingMOS 自然度评测与 NSF 后处理」。覆盖 vocal.wav（SVC 原始
+    输出保留在 svc/generated.wav），因此 eval / leak-detect / mix 都自动吃到后处理版。
+    """
+    banner("Stage: 后处理 NSF 重合成 (PC-NSF-HiFiGAN, transpose 0)")
+    if not os.path.exists(cfg.vocal_wav):
+        raise Fail(f"缺少 {cfg.vocal_wav}，需先跑 svc 阶段")
+    nsf_dir = cfg.p("nsf")
+    os.makedirs(nsf_dir, exist_ok=True)
+    run([PCNSF_VENV, os.path.join(ROOT, "tools", "pcnsf", "scripts", "pitch_transpose.py"),
+         cfg.vocal_wav, "--transpose", "0", "--method", "nsfhifigan",
+         "--config", NSF_CONFIG, "--ckpt", NSF_CKPT,
+         "--pitchalgo", "rmvpe", "--rmvpeckpt", RMVPE, "--out", nsf_dir],
+        stage="post-nsf")
+    outs = sorted(glob.glob(os.path.join(nsf_dir, "*-nsfhifigan-0.0-out.wav")))
+    if not outs:
+        raise Fail(f"NSF 重合成未产生输出: {nsf_dir}")
+    shutil.copy(outs[-1], cfg.vocal_wav)
+    log.info(f"  -> {cfg.vocal_wav}（NSF 重合成 44.1kHz；SVC 原始输出仍在 svc/generated.wav）")
+
+
+def _stage_eval_singmos(cfg: Cfg) -> None:
+    """SingMOS naturalness MOS（唱歌域，3s 窗）。tools/singmos 独立 venv，见 AGENTS.md。"""
+    banner("Stage: 自然度评测 (SingMOS naturalness MOS)")
+    if not os.path.exists(cfg.vocal_wav):
+        log.warning(f"  缺少 {cfg.vocal_wav}，跳过 SingMOS")
+        return
+    if not os.path.exists(VENVS["singmos"]):
+        log.warning("  ⚠ tools/singmos venv 不存在，跳过 SingMOS（安装见 AGENTS.md）")
+        return
+    cmd = [VENVS["singmos"], SINGMOS_SCRIPT,
+           "--out", cfg.p("natmos_report.json"),
+           "--csv", cfg.p("natmos_windows.csv")]
+    if not cfg.eval_nisqa:
+        cmd += ["--no-nisqa"]
+    if os.path.exists(cfg.lead_wav):
+        cmd.append(f"原唱={cfg.lead_wav}")
+    cmd.append(f"合成={cfg.vocal_wav}")
+    nout = run(cmd, stage="eval")
+    log.info("  [SingMOS naturalness MOS（原唱=对照锚点）]")
+    log.info("  " + nout.replace("\n", "\n  "))
+    with open(cfg.p("eval.txt"), "a", encoding="utf-8") as f:
+        f.write("\n=== SingMOS naturalness MOS ===\n" + nout + "\n")
+
+
 def stage_eval(cfg: Cfg) -> None:
     banner("Stage: 相似度评测 (ERes2NetV2)")
     out = run([VENVS["gsv"], os.path.join(ROOT, "eval_sim.py"),
@@ -887,6 +953,8 @@ def stage_eval(cfg: Cfg) -> None:
         f.write(out + "\n")
         if dual:
             f.write("\n=== 双锚点（主指标 = vs svs_vocal）===\n" + dual + "\n")
+    if cfg.eval_singmos:
+        _stage_eval_singmos(cfg)
 
 
 def stage_mix(cfg: Cfg) -> None:
@@ -984,6 +1052,7 @@ STAGE_FN = {
     "svs": stage_svs,
     "select-svs": stage_select_svs,
     "cascade": stage_cascade,
+    "post-nsf": stage_post_nsf,
     "eval": stage_eval,
     "leak-detect": stage_leak_detect,
     "leak-repair": stage_leak_repair,
@@ -1188,6 +1257,13 @@ def main() -> None:
                     help="漏音修复臂的 kNN 替换强度（默认 0.2；0.3+ 有吐字退化）")
     ap.add_argument("--leak-arm-cfg", type=float, default=0.5,
                     help="漏音修复臂的 CFG（默认 0.5）")
+    ap.add_argument("--post-nsf", action="store_true",
+                    help="SVC 后处理：PC-NSF-HiFiGAN 重合成平滑（默认关；SingMOS 自然度"
+                         "两首歌 +0.07/+0.11 但 CER 因歌而异，见 AGENTS.md）")
+    ap.add_argument("--no-eval-singmos", dest="eval_singmos", action="store_false",
+                    default=True, help="评测阶段跳过 SingMOS naturalness MOS（默认跑）")
+    ap.add_argument("--eval-nisqa", action="store_true",
+                    help="评测额外跑 NISQA（语音域模型，唱歌内容上不可靠，仅诊断用）")
     ap.add_argument("-v", "--verbose", action="store_true", help="打印子进程完整输出")
     args = ap.parse_args()
 
@@ -1200,7 +1276,8 @@ def main() -> None:
                   if s not in OPT_IN_STAGES
                   or (s in ("svs", "select-svs") and need_svs)
                   or (s == "mix" and args.mix)
-                  or (s == "leak-repair" and args.leak_repair)]
+                  or (s == "leak-repair" and args.leak_repair)
+                  or (s == "post-nsf" and args.post_nsf)]
         if not args.leak_detect:
             stages = [s for s in stages if s != "leak-detect"]
     else:
@@ -1251,7 +1328,10 @@ def main() -> None:
               leak_impostor=args.leak_impostor,
               leak_arm_seed=args.leak_arm_seed,
               leak_arm_alpha=args.leak_arm_alpha,
-              leak_arm_cfg=args.leak_arm_cfg)
+              leak_arm_cfg=args.leak_arm_cfg,
+              post_nsf=args.post_nsf,
+              eval_singmos=args.eval_singmos,
+              eval_nisqa=args.eval_nisqa)
 
     setup_logging(cfg.log_file, args.verbose)
     log.info(f"实验    : {cfg.name}")

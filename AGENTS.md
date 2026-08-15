@@ -70,6 +70,11 @@ voice/
 │                     .venv = torch 2.6+cu124. 结论是否定的，见「共振峰」一节
 ├── tools/stems4.py   4-stem separation (drums/bass/other/vocals) via BS-RoFormer 4stems_ft.
 │                     Uses GPT-SoVITS venv + uvr5 weights; see "Separation notes".
+├── tools/singmos/    SingMOS naturalness MOS 打分（score_naturalness.py）+ 指标敏感性探针
+│                     （probe_metric_sensitivity.py）。独立 uv venv（torch 2.2.1+cu121）.
+│                     见「SingMOS 自然度评测与 NSF 后处理」
+├── tools/nisqa/      NISQA 语音质量/自然度评测（官方仓库浅克隆，权重内置在仓库里）.
+│                     重新获取: git clone --depth 1 https://github.com/gabrielmittag/NISQA.git tools/nisqa
 ├── a25rig/           Anime2.5DRig (MIT) fork + 离线渲染补丁: PSD → 逐帧 PNG（口型吃
 │                     make_cues.py 时间轴）. driver/ 是 WSL 内无头 Chrome 驱动.
 │                     入口 ./render.sh（必须用它，见「Anime2.5DRig 离线渲染」一节）
@@ -1768,6 +1773,62 @@ verified by md5, so B varies only through the target):
 - Reuses the same `pretrained_eres2netv2w24s4ep4.ckpt` as `eval_sim`/`eval_stab`. Fine for A and B, but note
   the caveat recorded under GPT-SoVITS: anything that injects timbre via v2Pro's `sv_emb` shares this exact
   network, so those scores would be self-reinforcing.
+
+## SingMOS 自然度评测与 NSF 后处理（2026-08）— `sing.py` 默认评测含 SingMOS
+
+**评测侧新增第三个读数：SingMOS naturalness MOS**（唱歌域自然度，`singmos_pro` 预测器，wav2vec2
+骨干，16kHz）。`eval` 阶段现在默认跑三样：`eval_sim`（音色相似）+ `eval_stab`/CER（按需）+ **SingMOS
+naturalness**（`--no-eval-singmos` 关闭；`--eval-nisqa` 额外跑 NISQA，语音域模型，唱歌上不可靠，仅诊断）。
+工具在 `tools/singmos/`（独立 uv venv：torch 2.2.1+cu121 + s3prl + librosa；权重缓存重定向到工具目录内
+`.torch-cache/.s3prl-cache`，因为默认 `~/.cache` 在沙箱下不可写；**沙箱 /tmp 是每进程隔离的，跨进程临时
+文件必须放工作区**）：
+
+```bash
+tools/singmos/.venv/bin/python tools/singmos/score_naturalness.py \
+    --out <dir>/natmos_report.json --csv <dir>/natmos_windows.csv \
+    原唱=<dir>/sep2/lead.wav 合成=<dir>/vocal.wav      # --no-nisqa 只跑 SingMOS
+```
+
+协议：统一 16k 单声道、3s 非重叠窗、跳过 RMS < 1%×p95 的静音窗；报 mean/median/p10/p90。**原唱 lead
+是"真实演唱"锚点，参考（说话）是唱歌域模型的 OOD 输入，绝对分不与唱歌文件比。** SingMOS 是唱歌域模型，
+sanity check 通过（两首歌原唱 > 合成，配对窗 70%/68% 原唱赢）；NISQA 主模型会把"干净的合成"排在
+"带分离伪影的原唱"前面（它测干净度不测真实感），**不能当自然度排名**。
+
+### 指标敏感性（探针：60s 片段受控扰动，SingMOS Δ / NISQA-TTS Δ）
+
+| 扰动 | SingMOS | NISQA-TTS |
+|---|---|---|
+| 混响 30% 湿 | **−0.75** | −0.93 |
+| 音高抖动 ±40cents/0.8s | −0.54 | **−1.28** |
+| 强噪声 SNR25 | −0.56 | −0.13 |
+| 轻噪声 SNR40 | −0.16 | +0.79（不可信） |
+| 7kHz 限带 | +0.06 | −0.41 |
+
+SingMOS 喜欢"亮、响、清音多"的窗（3s 窗特征相关：centroid +0.46、zcr +0.34、rms +0.30）。低分窗 =
+弱响度+低清音占比 或 大滑音装饰音（f0std 17-30st）——**与原唱的低分窗高度重合**，是歌曲本身难点，
+不是 SVC 独有缺陷。含义：**指标评的是干声自然度**；成品混音加了混响分数会掉，那是正常的。
+
+### NSF 后处理（PC-NSF-HiFiGAN 纯重合成，`--post-nsf`，默认关）
+
+对最终 vocal 过一遍 `pitch_transpose.py --transpose 0`（CPU ~2-3 分钟/首，输出升到 44.1kHz），
+SingMOS 增益**跨两首歌稳健**，但 CER/NISQA-TTS 因歌而异 —— 所以是 opt-in 阶段（`--stages all` 不含它），
+按歌人工决定：
+
+| NSF Δ | 那女孩对我说 | 雨爱 |
+|---|---|---|
+| SingMOS mean | **+0.068** | **+0.111** |
+| SingMOS p10（最差尾部） | +0.620 | +0.287 |
+| SingMOS 配对胜率 | 59% | 68% |
+| SIM mean（管道协议 ref=参考人声） | **−0.003** | 0.000 |
+| CER | −0.002 | **+0.022** |
+| NISQA-TTS | +0.635 | **−0.544** |
+
+结论：① **SingMOS 主指标支持默认开启，但 CER 是反例门**（雨爱 +0.022 咬字变糊），建议 per-song
+门控：`SingMOS 增益 ≥0.05 且 CER 恶化 ≤0.01` 才采用；② NISQA-TTS 是语音域模型，唱歌内容上跨歌翻向
+（探针里加噪还 +0.79），**别拿它当唱歌开关门**；③ NSF 损伤是局部的（7/69、12/83 窗），且与泄漏修复窗
+有交互（雨爱 w7 是修复过的泄漏窗，NSF 重磨后 SingMOS 掉 0.17）——下一步候选是**选择性 NSF**
+（只重合成 SingMOS 低分窗）。注意 eval_sim 的 A/B 必须**同协议同参考**（管道默认 ref=`ref_clean`，
+手动对比时用 `--ref-is-clean` 的同一文件），换参考会整体平移分数。
 
 ## `sing.py` — one-command zero-shot singing CLI
 

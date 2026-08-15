@@ -54,6 +54,18 @@ __pycache__/
 venv/
 *.egg-info/
 
+# ---- 自然度评测工具（tools/singmos：脚本入库，venv/权重缓存/临时文件不入库）----
+/tools/singmos/.venv/
+/tools/singmos/.torch-cache/
+/tools/singmos/.s3prl-cache/
+/tools/singmos/.uv-cache/
+/tools/singmos/.uv-state/
+/tools/singmos/.tmp/
+/tools/singmos/.mplconfig/
+# NISQA 官方仓库克隆（权重内置在仓库里）。重新获取：
+#   git clone --depth 1 https://github.com/gabrielmittag/NISQA.git tools/nisqa
+/tools/nisqa/
+
 # ---- 编辑器/系统 ----
 .DS_Store
 .idea/
