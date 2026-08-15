@@ -46,6 +46,10 @@ Cascade 流程:
     python3 sing.py --ref ... --song ... --name exp1 --stages sep,select
     python3 sing.py --ref ... --song ... --name exp1 --stages svc
 
+漏音检测默认开（写 leak_report.json）；加 --leak-repair 定点修复漏音段
+（vocal.wav 换修复版，原输出备份 vocal_raw.wav）:
+    python3 sing.py --ref ... --song ... --name exp1 --leak-repair
+
 日志写到 data/songs/<name>/sing.log；-v 打印全部子进程输出。
 """
 
@@ -68,11 +72,14 @@ log = logging.getLogger("sing")
 # --svc-prompt svs|psvs_mix 要用 select-svs 产出的 prompt_svs.wav（见 Cfg.svc_prompt）。
 # cascade 是另一条支线（source 换成 SVS 输出），仍排在 svc 之后。
 ALL_STAGES = ["sep", "stems4", "ref-sep", "f0-target", "select", "ext",
-              "svs", "select-svs", "svc", "cascade", "eval", "mix"]
+              "svs", "select-svs", "svc", "cascade", "eval",
+              "leak-detect", "leak-repair", "mix"]
 # svs / select-svs 只在 --svc-prompt svs|psvs_mix（或 cascade）时才跑：默认 ext 路线
 # 用不到它们，白跑要多花一次 SVS 合成 + 一次选段。
 # cascade 与 prompt_svs 路线是两条独立支线，同时跑只是浪费一次推理。
-OPT_IN_STAGES = {"mix", "cascade", "svs", "select-svs"}  # 先验收纯人声，再 --mix
+# leak-detect 默认开（双模型 3s 共识漏音扫描，写 leak_report.json）；leak-repair 默认关
+# （定点重转修复：vocal.wav 换成修复版、原版备份为 vocal_raw.wav）。
+OPT_IN_STAGES = {"mix", "cascade", "svs", "select-svs", "leak-repair"}  # 先验收纯人声，再 --mix
 
 VENVS = {
     "gsv": os.path.join(ROOT, "GPT-SoVITS", ".venv", "bin", "python"),
@@ -315,6 +322,35 @@ class Cfg:
     select_svs_mix: bool = False
     mix: bool = False
     no_sep_cache: bool = False
+    # --- 漏音检测/修复（见 AGENTS.md「漏音检测与局部修复」）---
+    leak_detect: bool = True   # 默认开：双模型(ERes2NetV2+CAMPPlus) 1s+3s 共识扫描 → leak_report.json
+    leak_repair: bool = False  # 默认关：按报告跨度定点重转+对齐拼接，vocal.wav 换修复版
+    leak_impostor: list[str] = None  # type: ignore[assignment]  # 显式 impostor（默认自动发现同目录其他歌曲）
+    leak_arm_seed: int = 1     # 修复臂：CFM 噪声 seed（雨爱实测 seed1 胜原 seed1234）
+    leak_arm_alpha: float = 0.2  # 修复臂：kNN 替换强度（α≥0.3 有吐字退化，0.2 是 CER/SIM 双赢区）
+    leak_arm_cfg: float = 0.5  # 修复臂：CFG（与全局 --cfg 默认一致）
+
+    @property
+    def leak_report_json(self) -> str:
+        return self.p("leak_report.json")
+
+    def leak_impostor_wavs(self) -> list[str]:
+        """漏音扫描的 impostor 池（其他歌手的分离主唱）。显式指定优先，否则自动发现。"""
+        if self.leak_impostor:
+            return [os.path.abspath(p) if not os.path.isabs(p)
+                    else p for p in self.leak_impostor]
+        found: list[str] = []
+        songs_root = os.path.join(ROOT, "data", "songs")
+        if os.path.isdir(songs_root):
+            for d in sorted(os.listdir(songs_root)):
+                if d == self.name:
+                    continue
+                p = os.path.join(songs_root, d, "sep2", "lead.wav")
+                if os.path.exists(p):
+                    found.append(p)
+                if len(found) >= 5:
+                    break
+        return found
 
     @property
     def out_dir(self) -> str:
@@ -895,6 +931,48 @@ def stage_mix(cfg: Cfg) -> None:
     run(cmd, stage="mix")
 
 
+def stage_leak_detect(cfg: Cfg) -> None:
+    """漏音检测：双模型(ERes2NetV2+CAMPPlus) 1s+3s 共识扫描 → leak_report.json。
+
+    默认开。协议见 AGENTS.md「漏音检测与局部修复」：1s 单模型不可靠，3s 双模型共识
+    才可信；报告里同时给出建议修复跨度（供 leak-repair 用）。
+    """
+    banner("Stage: 漏音检测 (ERes2NetV2 + CAMPPlus, 1s+3s 共识)")
+    if not os.path.exists(cfg.vocal_wav):
+        raise Fail(f"缺少 {cfg.vocal_wav}，需先跑 svc 阶段")
+    if not os.path.exists(cfg.lead_wav):
+        raise Fail(f"缺少 {cfg.lead_wav}（原唱分离人声，漏音对照锚点）")
+    imps = cfg.leak_impostor_wavs()
+    if not imps:
+        log.info("  ⚠ 未找到 impostor（其他歌曲的 sep2/lead.wav），"
+                 "excess 将退化为裸 C（不扣域偏置），建议 --leak-impostor 显式指定")
+    cmd = [VENVS["seedvc"], os.path.join(WORKERS, "w_leak_detect.py"),
+           "--song-dir", cfg.out_dir, "--ref", cfg.ref_clean,
+           "--vocal", cfg.vocal_wav, "--out-json", cfg.leak_report_json]
+    for p in imps:
+        cmd += ["--impostor", p]
+    out = run(cmd, stage="leak-detect")
+    log.info("  " + out.replace("\n", "\n  "))
+
+
+def stage_leak_repair(cfg: Cfg) -> None:
+    """漏音修复：按 leak_report.json 的跨度定点重转+对齐拼接（默认关，--leak-repair 开启）。
+
+    执行后 vocal.wav 是修复版（后续 mix 等阶段自动用修复版），原 SVC 输出备份为
+    vocal_raw.wav。每跨度有增益门：重转 excess 不低于基线则不替换。
+    """
+    banner("Stage: 漏音修复 (定点重转 + 对齐拼接)")
+    if not os.path.exists(cfg.leak_report_json):
+        raise Fail(f"缺少 {cfg.leak_report_json}，需先跑 leak-detect 阶段")
+    cmd = [VENVS["seedvc"], os.path.join(WORKERS, "w_leak_repair.py"),
+           "--song-dir", cfg.out_dir, "--report", cfg.leak_report_json,
+           "--arm-seed", str(cfg.leak_arm_seed),
+           "--arm-alpha", str(cfg.leak_arm_alpha),
+           "--arm-cfg", str(cfg.leak_arm_cfg)]
+    out = run(cmd, stage="leak-repair")
+    log.info("  " + out.replace("\n", "\n  "))
+
+
 STAGE_FN = {
     "sep": stage_sep,
     "stems4": stage_stems4,
@@ -907,6 +985,8 @@ STAGE_FN = {
     "select-svs": stage_select_svs,
     "cascade": stage_cascade,
     "eval": stage_eval,
+    "leak-detect": stage_leak_detect,
+    "leak-repair": stage_leak_repair,
     "mix": stage_mix,
 }
 
@@ -1094,6 +1174,20 @@ def main() -> None:
                          "不存在则回退到 vocal.wav。可指定绝对路径或相对于 data/songs/<name>/ 的文件名")
     ap.add_argument("--no-sep-cache", action="store_true",
                     help="禁用分离缓存（sep/ref-sep 强制重新分离）")
+    ap.add_argument("--no-leak-detect", dest="leak_detect", action="store_false", default=True,
+                    help="关闭漏音检测阶段（默认开：双模型 3s 共识扫描，~5-8 分钟）")
+    ap.add_argument("--leak-repair", action="store_true",
+                    help="启用漏音修复阶段（默认关）：按 leak_report.json 的跨度定点重转+"
+                         "对齐拼接。执行后 vocal.wav 为修复版，原 SVC 输出备份为 vocal_raw.wav")
+    ap.add_argument("--leak-impostor", action="append", default=None, metavar="LEAD",
+                    help="漏音扫描的 impostor 人声（可多次）。默认自动发现 "
+                         "data/songs/ 下其他歌曲的 sep2/lead.wav（最多 5 个）")
+    ap.add_argument("--leak-arm-seed", type=int, default=1,
+                    help="漏音修复臂的 CFM seed（默认 1）")
+    ap.add_argument("--leak-arm-alpha", type=float, default=0.2,
+                    help="漏音修复臂的 kNN 替换强度（默认 0.2；0.3+ 有吐字退化）")
+    ap.add_argument("--leak-arm-cfg", type=float, default=0.5,
+                    help="漏音修复臂的 CFG（默认 0.5）")
     ap.add_argument("-v", "--verbose", action="store_true", help="打印子进程完整输出")
     args = ap.parse_args()
 
@@ -1105,7 +1199,10 @@ def main() -> None:
         stages = [s for s in ALL_STAGES
                   if s not in OPT_IN_STAGES
                   or (s in ("svs", "select-svs") and need_svs)
-                  or (s == "mix" and args.mix)]
+                  or (s == "mix" and args.mix)
+                  or (s == "leak-repair" and args.leak_repair)]
+        if not args.leak_detect:
+            stages = [s for s in stages if s != "leak-detect"]
     else:
         stages = [s.strip() for s in args.stages.split(",")]
         bad = [s for s in stages if s not in ALL_STAGES]
@@ -1149,7 +1246,12 @@ def main() -> None:
               svs_ref=args.svs_ref, svs_prompt_max_sec=args.svs_prompt_max_sec,
               svc_prompt=args.svc_prompt, select_svs_mix=args.select_svs_mix,
               mix=args.mix,
-              no_sep_cache=args.no_sep_cache)
+              no_sep_cache=args.no_sep_cache,
+              leak_detect=args.leak_detect, leak_repair=args.leak_repair,
+              leak_impostor=args.leak_impostor,
+              leak_arm_seed=args.leak_arm_seed,
+              leak_arm_alpha=args.leak_arm_alpha,
+              leak_arm_cfg=args.leak_arm_cfg)
 
     setup_logging(cfg.log_file, args.verbose)
     log.info(f"实验    : {cfg.name}")

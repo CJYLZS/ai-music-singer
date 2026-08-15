@@ -2627,3 +2627,42 @@ Non-obvious behaviors that materially change how training should be configured:
 - **`3-get-semantic.py` can silently drop items.** Observed: 21 entries in `2-name2text.txt` but only 20 rows in `6-name2semantic.tsv` (a ~2s clip vanished, no error). Cross-check counts across `2-name2text.txt` / `4-cnhubert` / `5-wav32k` / `7-sv_cn` / `6-name2semantic.tsv` before training.
 - **webui's own defaults are the sane baseline**, not the values in the config templates. `webui.py:124-127` for non-v3/v4: `default_sovits_epoch = 8`, `save_every = 4`, `max_sovits_epoch = 25`. The `epochs: 100` sitting in `s2v2Pro.json` is not a recommendation.
 - **v2Pro vs v2ProPlus differ only in vocoder width.** Configs differ by two lines (`upsample_initial_channel` 512→768, first kernel 16→20); all 19M extra params are in the decoder (14.9M→33.8M), and both share the same GPT base (`s1v3.ckpt`). They take identical code paths (`models.py:623` `v2pro_set`). Expect no gain on timbre or prosody — only potentially on waveform quality, and only if the source material actually has high-frequency content to reconstruct.
+
+## 漏音检测与局部修复（2026-08，雨爱实测）
+
+**检测：1s 单模型逐窗不可靠，必须 3s + 双模型共识 + 持续性。** 同一协议（窗口 vs
+全局锚点、excess/margin、5 个 impostor）下 ERes2NetV2 与 CAMPPlus（`eval_leak_campplus.py`，
+seed-vc 自带 funasr campplus，192d fbank 输入）对 1s 窗口的 excess 判定 Spearman 仅 +0.28、
+TOP-12 重合 1/12（3s 窗升到 +0.54 / 5/12）；两模型都报的 3s 窗才是可信漏音区（雨爱：
+78/156/192/213/219s，恰为反复副歌句）。`leak_agree.py` 做两 CSV 一致性 + 尖峰持续性 +
+听感片段导出（**注意 vocal.wav 24k 与 sep2/lead.wav 44.1k 采样率不同，导出必须按各自
+采样率写，否则原唱片段变慢放**）。
+
+**修复：`repair_leaky.py` 局部重转漏音段，网格选优拼接。** 对每个区域：切 lead+F0
+（两侧各 1s pad 给上下文）→ (seed × knn_alpha × cfg) 网格重转（子进程须
+`cwd=SoulX-Singer` + `PYTHONPATH=SoulX-Singer`，且**所有路径绝对化**，相对路径会在
+cwd 下解析失败）→ ERes2NetV2+CAMPPlus 双模型 1s 逐窗打分，选 score =
+Δexcess + 0.3·Δmargin 最大、A 不塌陷（ΔA > −0.015）且 score > 0.005 的臂 → 0.15s
+交叉淡化拼回。雨爱实测（4 区域 × 8 臂）：**α=0.4 臂漏音降幅最大但 CER +3.0，
+α=0.2 臂 CER +1.9 且漏音降幅几乎相同**（R1 150-162s excess −0.013/−0.014 双模型、
+R3 210-225s campplus −0.034）；区域 2（186-198s）两模型分歧大（eres2net 无感、
+campplus 0.112），α0.4 修复代价 4 吞字，不值。SIM 全版本不降反升（0.7794→0.7820）。
+**结论：漏音段修复默认用 α=0.2 臂；CER 是硬约束，每版必须过 eval_cer。**
+
+**流水线集成（2026-08）：leak-detect 默认开，leak-repair 默认关。** `sing.py` 新增两个阶段：
+- `leak-detect`（默认，svc→eval 之后）：`w_leak_detect.py` 双模型(ERes2NetV2+CAMPPlus)
+  1s+3s 扫描 → `leak_report.json`（逐窗 excess/margin、共识标记、区域、建议修复跨度）。
+  共识 = 两模型 excess 都 ≥ max(地板, p85)（地板 er 0.05 / cp 0.07）；跨度锚定原版气口。
+  impostor 自动发现 data/songs/ 其他歌的 sep2/lead.wav（最多 5 个），可用
+  `--leak-impostor` 覆盖（**注意 nargs="*" 的重复 flag 只有最后一个生效，必须用
+  action="append"**）。
+- `leak-repair`（`--leak-repair` 开启）：`w_leak_repair.py` 按报告跨度定点重转
+  （固定臂 `--leak-arm-seed/alpha/cfg`，默认 1/0.2/0.5）→ 增益门（重转 excess 不低于
+  基线则不替换）→ 包络对齐 + 公共静音拼接 → **vocal.wav 换修复版，原输出备份为
+  vocal_raw.wav** → 自动复检写 leak_report_after.json。
+- 全曲重转一轮无助于整体漏音（seed1 实测：逐窗 55 改善/54 变差，均值 +0.0002），
+  定点修复才有用；均值被分离歌声域偏置地板主导，动不了。
+- **跨歌验证（2026-08，那女孩对我说）：检测判定"无漏、跳过修复"是真实的。** 3s 双模型
+  excess：er mean −0.0009 / cp mean +0.0137（雨爱对照 0.031 / 0.054），两个模型的 p85
+  都低于地板阈值（er 0.05 / cp 0.07），er 超阈 5 窗 ∩ cp 超阈 9 窗 = **0 窗共识**，
+  于是 leak-repair 直接 no-op（不创建 vocal_raw.wav）。这首歌基线就干净，无需修复。
