@@ -374,11 +374,17 @@ Measured on a 257s Chinese song with a 163s female speech reference (median F0 2
   (which is what the previous entry did) inevitably picks 0.4 and lands on a 44%-worse CER. The
   substitution-error count is where it shows: S goes 31 → 31 → 37 → **52** across α=0.1…0.4.
   **Default is now `--knn-alpha 0.2`**; 0.3 is the crossover, 0.4 is out.
-  **⚠️ 2026-08 更正：默认已改回 0**（见「源音色归一化预处理」C 组）。上表的验证全在旧协议
-  时代（163s 池 / 24.7s prompt / seed 1234 / 当时 SIM 基线 0.55-0.62）；当前协议（537s 池 /
-  44s prompt / seed 1 / 基线 0.75-0.82）下 4 首歌 cfg×α 矩阵显示 α=0.2 净负：SIM 0/4 歌获益
-  （−0.003）、cfg=0.5 下 CER +1.9 点（4/4 歌变差），仅 SingMOS +0.02~0.03。池与 prompt 变大后
-  残留替换的边际收益消失。α=0.2 在 cfg=1.0 下仍帮 CER −1.0 点，保留为按歌实验选项。
+  **⚠️ 2026-08 更正（两次）：默认 0.2 → 0 → 0.2（最终 0.2）**。第一次改 0 的依据是
+  「源音色归一化预处理」C 组 4 首歌 cfg×α 矩阵：上表的验证全在旧协议时代（163s 池 /
+  24.7s prompt / seed 1234 / 当时 SIM 基线 0.55-0.62）；当前协议（537s 池 / 44s prompt /
+  seed 1 / 基线 0.75-0.82）下 4 首歌显示 α=0.2 净负：SIM 0/4 歌获益（−0.003）、cfg=0.5 下
+  CER +1.9 点（4/4 歌变差），仅 SingMOS +0.02~0.03。**但 12 首全量默认参数重跑（2026-08）
+  后追光者暴露吐字回归**：α=0 vs α=0.2 的 CER 0.1226 vs 0.0935（**−2.9 点**，吞字 10→4，
+  SIM 持平 0.7975 vs 0.7969），证明 **α 对吐字的影响按歌分向** —— C 组 4 首是受害歌、
+  追光者是受益歌，全局固定 0 会牺牲受益歌（预转换路线也救不了：seed-vc 预转换源自身
+  CER 0.0742 极好，但 SoulX×预转换源交互把输出恶化到 0.1032，机制与去有风一致）。
+  **默认最终定为 0.2**；受害歌用 `--knn-alpha 0` 按歌关。α=0.2 在 cfg=1.0 下仍帮 CER
+  −1.0 点。
 
   For scale, compare the exchange rate against the published one. kNN-SVC (ICASSP'25, by a kNN-VC
   author) pays **+0.62 WER for +2.82 EER** and calls that "largely imperceptible". α=0.4 here pays

@@ -278,10 +278,13 @@ class Cfg:
     # 见 AGENTS.md「prompt 长度与素材上限的关系」。
     max_seg_sec: float = 28.0
     num_overlaps: int = 1   # 每段往前取几个活性格作上下文（见 AGENTS.md「num_overlaps」）
-    knn_alpha: float = 0.0   # kNN 内容特征替换强度（2026-08 默认改 0：4 首歌 cfg×α 矩阵
-    # 确认 cfg=0.5 下 α=0.2 净负——SIM 0/4 歌获益（−0.003）、CER 4/4 歌变差（+0.019），
-    # 仅 SingMOS +0.02。历史验证（11 首歌 +0.0146）是旧协议时代（163s 池/24.7s prompt）
-    # 的产物，当前协议下不复现；α=0.2 在 cfg=1.0 下仍帮 CER −1.0 点，保留开关按歌实验
+    knn_alpha: float = 0.2   # kNN 内容特征替换强度（2026-08 二改：默认改回 0.2）。
+    # 第一次改 0 的依据是 C 组 4 首歌 cfg×α 矩阵（cfg=0.5 下 α=0.2 净负：SIM 0/4 歌获益
+    # −0.003、CER 4/4 歌变差 +0.019，仅 SingMOS +0.02）；但 12 首全量重跑后追光者暴露
+    # 吐字回归（用户听感 + CER 0.1226 vs α=0.2 的 0.0935，−2.9 点，吞字 10→4，SIM 持平），
+    # 证明 α 对吐字的影响按歌分向（C 组 4 首是受害歌、追光者是受益歌），全局固定 0 会
+    # 牺牲受益歌。历史验证（11 首歌 +0.0146 SIM）是旧协议时代（163s 池/24.7s prompt）
+    # 的产物。保留 --knn-alpha 0 作为按歌选项（C 组受害歌可关）。
     knn_k: int = 4   # kNN 近邻数（默认 4，同 kNN-VC）
     knn_full_pool: bool = True   # kNN 检索池用完整参考人声而非 28.9s prompt_ext（绕开 whisper 30s）
     knn_pool_wav: str = ""   # 显式指定 kNN 检索池（覆盖 knn_full_pool）；可用相对 out_dir 的路径
@@ -1166,10 +1169,11 @@ def main() -> None:
     ap.add_argument("--num-overlaps", type=int, default=1,
                     help="SVC 每段往前取几个活性格作前置上下文（默认 1）。"
                          "总窗仍受 --max-seg-sec 限制，段本来就接近上限时提高它无效")
-    ap.add_argument("--knn-alpha", type=float, default=0.0,
-                    help="kNN 内容特征替换强度（2026-08 默认改 0）。cfg×α 矩阵 4 首歌实测："
-                         "cfg=0.5 下 α=0.2 净负（SIM 0/4 赢、CER +1.9 点），仅 SingMOS +0.02；"
-                         "cfg=1.0 下 α=0.2 帮 CER −1.0 点但 SIM 仍负。见 docs/source-timbre-normalization-survey.md")
+    ap.add_argument("--knn-alpha", type=float, default=0.2,
+                    help="kNN 内容特征替换强度（2026-08 二改：默认 0.2）。C 组 4 首歌矩阵里 "
+                         "cfg=0.5 下 α=0.2 净负（SIM 0/4 赢、CER +1.9 点），但全量重跑后追光者 "
+                         "吐字回归（CER 0.1226→0.0935，−2.9 点）证明效应按歌分向，默认改回 0.2；"
+                         "受害歌可 --knn-alpha 0。见 docs/source-timbre-normalization-survey.md")
     ap.add_argument("--source-wav", default="",
                     help="SVC 源音频覆盖（音色归一化预处理实验）：替代 sep2/lead.wav 进 whisper "
                          "内容特征提取，F0 仍用 target_f0.npy。见 docs/source-timbre-normalization-survey.md")
