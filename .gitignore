@@ -70,3 +70,7 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+
+# source-norm 实验（源音色归一化预处理）
+/.tmp/
+/tools/source_norm/.venv/

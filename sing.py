@@ -278,10 +278,15 @@ class Cfg:
     # 见 AGENTS.md「prompt 长度与素材上限的关系」。
     max_seg_sec: float = 28.0
     num_overlaps: int = 1   # 每段往前取几个活性格作上下文（见 AGENTS.md「num_overlaps」）
-    knn_alpha: float = 0.2   # kNN 内容特征替换强度（0.1-0.2 是 CER/SIM 双赢区，≥0.3 起吐字退化）
+    knn_alpha: float = 0.0   # kNN 内容特征替换强度（2026-08 默认改 0：4 首歌 cfg×α 矩阵
+    # 确认 cfg=0.5 下 α=0.2 净负——SIM 0/4 歌获益（−0.003）、CER 4/4 歌变差（+0.019），
+    # 仅 SingMOS +0.02。历史验证（11 首歌 +0.0146）是旧协议时代（163s 池/24.7s prompt）
+    # 的产物，当前协议下不复现；α=0.2 在 cfg=1.0 下仍帮 CER −1.0 点，保留开关按歌实验
     knn_k: int = 4   # kNN 近邻数（默认 4，同 kNN-VC）
     knn_full_pool: bool = True   # kNN 检索池用完整参考人声而非 28.9s prompt_ext（绕开 whisper 30s）
     knn_pool_wav: str = ""   # 显式指定 kNN 检索池（覆盖 knn_full_pool）；可用相对 out_dir 的路径
+    source_wav: str = ""   # SVC 源音频覆盖（音色归一化预处理实验）：替代 sep2/lead.wav 进
+    # whisper 内容特征提取；F0 仍用 target_f0.npy（光谱编辑不改音高）。空 = 用 lead_wav
     n_steps: int = 32
     cfg: float = 0.5   # 上游默认 3.0，实测偏高（见 AGENTS.md「cfg 扫点」）
     rescale_cfg: float = 0.75   # CFG 外推的 std 归一化混合比（上游默认，0=关闭归一化）
@@ -722,7 +727,7 @@ def _svc_cmd(cfg: Cfg, svc_dir: str, seed: int | None) -> list[str]:
            "--device", cfg.device,
            "--model_path", SVC_MODEL, "--config", SVC_CONFIG,
            "--prompt_wav_path", cfg.svc_prompt_wav,
-           "--target_wav_path", cfg.lead_wav,
+           "--target_wav_path", cfg.source_wav or cfg.lead_wav,
            "--prompt_f0_path", cfg.svc_prompt_f0,
            "--target_f0_path", cfg.target_f0,
            "--save_dir", svc_dir,
@@ -801,6 +806,9 @@ def stage_svc(cfg: Cfg) -> None:
                         f"±12/±24 才是和声上安全的")
     if cfg.seed is not None:
         log.info(f"  CFM 噪声 seed: {cfg.seed}（可复现；第 i 段用 seed+i）")
+    if cfg.source_wav:
+        log.info(f"  SVC 源音频: {cfg.source_wav}（音色归一化预处理，替代 sep2/lead.wav；"
+                 f"F0 仍用 target_f0.npy）")
     run(_svc_cmd(cfg, svc_dir, cfg.seed), stage="svc", cwd=SOULX_DIR,
         env={"PYTHONPATH": SOULX_DIR})
     gen = os.path.join(svc_dir, "generated.wav")
@@ -1158,11 +1166,13 @@ def main() -> None:
     ap.add_argument("--num-overlaps", type=int, default=1,
                     help="SVC 每段往前取几个活性格作前置上下文（默认 1）。"
                          "总窗仍受 --max-seg-sec 限制，段本来就接近上限时提高它无效")
-    ap.add_argument("--knn-alpha", type=float, default=0.2,
-                    help="kNN 内容特征替换强度（默认 0.2）。把 source 的 whisper 帧向参考的帧做 "
-                         "kNN 插值，用目标说话人的残留替换原唱残留（mean-shift 删除已实测变差）。"
-                         "0.1-0.2 是 CER 与 SIM 双赢区；0.3 起吐字开始退化，0.4 时 CER +5.9 点不可用。"
-                         "0=关闭")
+    ap.add_argument("--knn-alpha", type=float, default=0.0,
+                    help="kNN 内容特征替换强度（2026-08 默认改 0）。cfg×α 矩阵 4 首歌实测："
+                         "cfg=0.5 下 α=0.2 净负（SIM 0/4 赢、CER +1.9 点），仅 SingMOS +0.02；"
+                         "cfg=1.0 下 α=0.2 帮 CER −1.0 点但 SIM 仍负。见 docs/source-timbre-normalization-survey.md")
+    ap.add_argument("--source-wav", default="",
+                    help="SVC 源音频覆盖（音色归一化预处理实验）：替代 sep2/lead.wav 进 whisper "
+                         "内容特征提取，F0 仍用 target_f0.npy。见 docs/source-timbre-normalization-survey.md")
     ap.add_argument("--knn-k", type=int, default=4,
                     help="kNN 近邻数（默认 4，同 kNN-VC）")
     ap.add_argument("--knn-pool-wav", default="",
@@ -1310,6 +1320,7 @@ def main() -> None:
               knn_alpha=args.knn_alpha, knn_k=args.knn_k,
               knn_full_pool=args.knn_full_pool,
               knn_pool_wav=args.knn_pool_wav,
+              source_wav=args.source_wav,
               n_steps=args.n_steps, cfg=args.cfg, rescale_cfg=args.rescale_cfg,
               pitch_shift=args.pitch_shift,
               seed=args.seed, n_seeds=args.n_seeds, dp_lam=args.dp_lam,

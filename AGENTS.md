@@ -88,6 +88,7 @@ voice/
 │                     w_select_svs.py 从 SVS 输出选 prompt、eval_dual.py 双锚点评测，
 │                     两者只服务 --svc-prompt svs 臂（素材音域不足时的备选，非默认）
 ├── data/             Shared audio. voices/ = speaker source material; songs/ = songs, stems, SVC output
+├── docs/             调研/实验文档（voice-beautify-survey.md、source-timbre-normalization-survey.md 等）
 ├── logs/             GPT-SoVITS training features + checkpoints
 ├── AGENTS.md         this file
 ├── README.md         MV 出片流程（sing.py 产物 → cues → beats → a25rig 渲染），操作向
@@ -373,6 +374,11 @@ Measured on a 257s Chinese song with a 163s female speech reference (median F0 2
   (which is what the previous entry did) inevitably picks 0.4 and lands on a 44%-worse CER. The
   substitution-error count is where it shows: S goes 31 → 31 → 37 → **52** across α=0.1…0.4.
   **Default is now `--knn-alpha 0.2`**; 0.3 is the crossover, 0.4 is out.
+  **⚠️ 2026-08 更正：默认已改回 0**（见「源音色归一化预处理」C 组）。上表的验证全在旧协议
+  时代（163s 池 / 24.7s prompt / seed 1234 / 当时 SIM 基线 0.55-0.62）；当前协议（537s 池 /
+  44s prompt / seed 1 / 基线 0.75-0.82）下 4 首歌 cfg×α 矩阵显示 α=0.2 净负：SIM 0/4 歌获益
+  （−0.003）、cfg=0.5 下 CER +1.9 点（4/4 歌变差），仅 SingMOS +0.02~0.03。池与 prompt 变大后
+  残留替换的边际收益消失。α=0.2 在 cfg=1.0 下仍帮 CER −1.0 点，保留为按歌实验选项。
 
   For scale, compare the exchange rate against the published one. kNN-SVC (ICASSP'25, by a kNN-VC
   author) pays **+0.62 WER for +2.82 EER** and calls that "largely imperceptible". α=0.4 here pays
@@ -1829,6 +1835,55 @@ SingMOS 增益**跨两首歌稳健**，但 CER/NISQA-TTS 因歌而异 —— 所
 有交互（雨爱 w7 是修复过的泄漏窗，NSF 重磨后 SingMOS 掉 0.17）——下一步候选是**选择性 NSF**
 （只重合成 SingMOS 低分窗）。注意 eval_sim 的 A/B 必须**同协议同参考**（管道默认 ref=`ref_clean`，
 手动对比时用 `--ref-is-clean` 的同一文件），换参考会整体平移分数。
+
+### 源音色归一化预处理（2026-08）— `sing.py --source-wav`
+
+用户观察"原唱音色越接近目标，SVC 效果越好"→ 调研 + 三组 A/B（见
+`docs/source-timbre-normalization-survey.md`）。注入点：`--source-wav <wav>` 替代 `sep2/lead.wav` 进
+whisper 内容特征提取（`_svc_cmd` 的 `--target_wav_path`；**F0 仍用 `target_f0.npy`**，光谱编辑不改音高）。
+
+| 方案 | SIM 效应 | 机制（whisper 逐帧 cos 实测） |
+|---|---|---|
+| LTAS/EQ 匹配（纯形状+限带） | 持平（±0.002） | cos=0.9996 —— whisper 对 EQ 免疫，源没变 |
+| WORLD 共振峰搬移（保 F0） | 持平（±0.002） | cos=0.9999 |
+| seed-vc 预转换到中性第三歌手 | 持平 | cos=0.988，改变太小 |
+| **seed-vc 预转换到目标音色** | **+0.007/+0.011（2/2 歌超噪声底）** | cos=0.9235，16.5% 帧改变——源残留被换成目标残留 |
+
+**seed-vc 预转换到目标是唯一有效的"源音色归一化"**：SIM +0.007~+0.011、SingMOS +0.05（两首歌一致），
+与 kNN α=0.2 叠加生效；低基线歌收益更大（同 kNN 规律）。机制 = 音频域预热（预转换源自身 SIM
+0.80/0.75 ≈ 基线 SVC 输出），SVC 在已向目标靠拢的源上表现更好。**代价是 CER 继承**：预转换自身
+CER 0.139/0.274，最终输出 CER≈输入 CER——按歌门控（预转换源 CER 恶化 ≤0.01 且 SIM 增益 ≥0.005 才用）；
+seed-vc 转换质量差的歌（去有风的地方）禁用。产物命名：seed-vc 把 `--output` 当**目录**用，生成
+`vc_<src>_<tgt>_*.wav`，`--source-wav` 要指到那个文件（或先改名）。工具：`tools/source_norm/`
+（ltas_match.py、formant_shift.py、whisper_diff.py、summarize.py；`tools/source_norm/.venv` 是
+pyworld 独立 venv，setuptools 须 <81 否则 pyworld 缺 pkg_resources）。
+
+**A 组进阶实验（2026-08，见 docs/source-timbre-normalization-survey.md §7.1）——最优配置变成「预转换(prompt_ext 参考) + kNN 关」**：
+
+| 配置（全部 cfg=0.5, seed 1） | 白色毛衣 ΔSIM/ΔCER | 去有风 ΔSIM/ΔCER |
+|---|---|---|
+| 预转换 prompt_ext + kNN 关（e8a0on） | **+0.0082**/+0.0097 | **+0.0171**/**+0.0038** |
+| 预转换 prompt_ext + kNN 0.2（e7） | +0.0071/**−0.0032** | +0.0134/+0.0301 |
+| kNN 关、无预转换（e8a0） | +0.0020/**−0.0194** | +0.0045/**−0.0451** |
+| 迭代自转换 e6p2/e6p3 | +0.006 | **+0.074/+0.217** ——否决 |
+| 双遍 seed-vc e9 | — | +0.0147/+0.0264 ——否决 |
+
+要点：① **预转换参考用 `prompt_ext.wav`（下游音色锚点）而不是说话参考**，去有风的地方的
+CER 损伤从 +5.3 点降到 +0.4 点——说话域参考是 CER 元凶；② **cfg=0.5 下 kNN α=0.2 可能净负**
+（kNN 关时 SIM +0.002/+0.0045 且 CER −0.019/−0.045，两首歌同时更优；历史 kNN 验证全在
+cfg=1.0 时代，cfg=0.5 之后未重验）——需 ≥4 首歌的 cfg×α 2×2 才能动默认，若复现则
+`cfg=0.5×α=0` + 预转换是新的推荐组合；③ E6 迭代自转换（SelfVC 式）在 CFM 管线上伪影
+累积，CER 每轮爆炸，不要做；④ whisper_diff 门控：预转换后内容特征 cos<0.95 才值得启用
+（有效臂 0.87-0.92，无效臂 0.988）。
+
+**B 组（2026-08）—— YingMusic-SVC 预转换（`my_inference.py`，100 步，`--semi-tone-shift 0`，
+参考 prompt_ext.wav）**：预转换源自身 CER 两首歌都优于 seed-vc（0.091 vs 0.139；0.259 vs
+0.274），但**源级优势没传导到最终输出**——白色毛衣最终持平（+0.0083/+0.0065，SingMOS 4.250）；
+去有风的地方 SIM 顶到 +0.0179、SingMOS 3.88/3.92（全实验最高）但 CER +0.087（最差）。
+机制：SoulX 与预转换源的交互按转换器不同而不同（seed-vc 源 0.274→输出 0.222 被修复；
+ym 源 0.259→输出 0.305 被加重，100 步扩散重合成的 whisper 特征更 OOD）。**门控结论**：
+高基线歌用 YingMusic 预转换（CER/SingMOS 略优），低基线+保字歌用 seed-vc+α=0；
+CER 的根不在预转换器，在"SoulX×预转换源交互"（训练侧）或 lead 质量（分离前端）。
 
 ## `sing.py` — one-command zero-shot singing CLI
 
