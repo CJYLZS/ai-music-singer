@@ -136,9 +136,9 @@ def main() -> None:
         for t0, seg in windows(out16, win):
             e = emb_fn(seg)
             A, C = cos(e, a_r), cos(e, a_t)
-            Ci = float(np.mean([cos(e, a) for a in imps])) if imps else 0.0
+            Ci = float(np.mean([cos(e, a) for a in imps])) if imps else float("nan")
             times.append(t0)
-            ex.append(C - Ci)
+            ex.append((C - Ci) if imps else float("nan"))
             mg.append(A - C)
         return np.array(times), np.array(ex), np.array(mg)
 
