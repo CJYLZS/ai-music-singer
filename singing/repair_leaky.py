@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import os
 import subprocess
 import sys
@@ -50,7 +51,7 @@ SVC_CONFIG = os.path.join(REPO, "SoulX-Singer", "soulxsinger", "config", "soulxs
 
 SR_OUT = 24000
 PAD = 1.0  # 转换时两侧各加 1s 上下文
-XF = 0.15  # 拼接交叉淡化秒数
+XF = 0.35  # 拼接交叉淡化秒数（150ms 太短，接缝处音色突变明显；350ms 平衡"可闻接缝"与"双音感"）
 
 
 def fmt(x: float) -> str:
@@ -69,7 +70,10 @@ def region_slice(lead_path: str, f0_path: str, t0: float, t1: float, tmp: str):
     ff = os.path.join(tmp, "f0.npy")
     sf.write(lf, lead[j0:j1], sr)
     np.save(ff, f0[i0:i1])
-    return lf, ff, int(PAD * 50), int(PAD * sr)
+    # pad_samp 必须按 SVC 输出采样率 SR_OUT 算（24k），不能按 lead 的 sr（44.1k）：
+    # 否则拼接处 g0=pad_samp 会把 1s pad 切成 44100 样本，多吞 0.84s 内容，
+    # 修复段整体提前（实测 vocal_repaired 错位 -500~-760ms）。
+    return lf, ff, int(PAD * 50), int(PAD * SR_OUT)
 
 
 def run_svc(prompt_wav, prompt_f0, pool, lead_f, f0_f, out_dir, cfg, alpha, seed) -> str:
@@ -152,6 +156,9 @@ def main() -> None:
     ap.add_argument("--cfgs", type=float, nargs="+", default=[0.0, 0.5])
     ap.add_argument("--pool", default=None, help="kNN 池（默认 = --ref）")
     ap.add_argument("--out", default="vocal_repaired.wav")
+    ap.add_argument("--bars", default=None,
+                    help="节拍网格 JSON（beat_grid.py 产物）。给出后每个修复区域对齐到"
+                         "覆盖它的完整小节边界（整小节修复，避免在小节中间切人声）")
     ap.add_argument("--keep-tmp", action="store_true")
     args = ap.parse_args()
 
@@ -173,6 +180,90 @@ def main() -> None:
     for r in args.regions:
         a, b = r.split("-")
         regions.append((float(a), float(b)))
+
+    # 小节对齐：把每个区域扩到覆盖它的完整小节 [t0+k*barLen, t0+(k+1)*barLen]
+    if args.bars:
+        import json as _json
+        with open(args.bars, encoding="utf-8") as f:
+            beats = _json.load(f)
+        bt0, L = float(beats["t0"]), float(beats["barLen"])
+        nbar = int(beats.get("beatsPerBar", 4))
+        aligned = []
+        for r0, r1 in regions:
+            k0 = math.floor((r0 - bt0) / L)
+            k1 = math.ceil((r1 - bt0) / L)
+            a0, a1 = bt0 + k0 * L, bt0 + k1 * L
+            aligned.append((a0, a1))
+            print(f"  小节对齐: [{r0:.1f}, {r1:.1f}] -> [{a0:.1f}, {a1:.1f}]"
+                  f"（覆盖 {k1 - k0} 个 {nbar} 拍小节，barLen={L:.3f}s）")
+        regions = aligned
+
+        # 拼接点选择（两级优先）：
+        #   首选 = 小节边界 ∩ 静音段；次选 = 足够长的静音段中心（放弃小节约束，
+        #   静音切换优先）；无静音则保持小节边界并警告。
+        # 静音段 = RMS < thr 的连续区，时长 ≥ MIN_SIL（0.3s）；拼接点取段中心
+        # （两侧都有静音缓冲）。扩展上限 = 4 小节。
+        vocal_w, vocal_sr = sf.read(vocal)
+        rms_win = int(0.05 * vocal_sr)
+        rms = np.sqrt(np.array([
+            np.mean(vocal_w[i:i + rms_win] ** 2)
+            for i in range(0, len(vocal_w) - rms_win, rms_win)
+        ]))
+        rms_t = np.arange(len(rms)) * (rms_win / vocal_sr)
+        thr = max(0.02, 0.25 * float(np.median(rms[rms > 0])))
+        MIN_SIL = 0.3     # 最小静音段时长（秒）
+        MAX_EXT = 4       # 起点/终点最多向外扩几个小节
+
+        # 连续静音段 -> (start, end, center)
+        sil_segs: list[tuple[float, float, float]] = []
+        run_start: int | None = None
+        for i, v in enumerate(rms):
+            if v < thr:
+                if run_start is None:
+                    run_start = i
+            elif run_start is not None:
+                if (i - run_start) * rms_win / vocal_sr >= MIN_SIL:
+                    s0 = rms_t[run_start]; s1 = rms_t[i - 1]
+                    sil_segs.append((s0, s1, (s0 + s1) / 2))
+                run_start = None
+        if run_start is not None:
+            s0 = rms_t[run_start]; s1 = rms_t[-1]
+            if s1 - s0 >= MIN_SIL:
+                sil_segs.append((s0, s1, (s0 + s1) / 2))
+
+        def nearest_silence(t_ref, direction):
+            """direction<0: ≤t_ref 的最近静音中心（往前）；>0: ≥t_ref 的（往后）。"""
+            if direction < 0:
+                cands = [(c, s1 - s0) for s0, s1, c in sil_segs if c <= t_ref]
+                cands.sort(key=lambda x: -x[0])
+            else:
+                cands = [(c, s1 - s0) for s0, s1, c in sil_segs if c >= t_ref]
+                cands.sort(key=lambda x: x[0])
+            return cands[0] if cands else (None, None)
+
+        aligned2 = []
+        for a0, a1 in regions:
+            ext = MAX_EXT * L
+            sel = {}
+            for label, t_ref, d in [("起点", a0, -1), ("终点", a1, +1)]:
+                c, sil_len = nearest_silence(t_ref, d)
+                if c is None or abs(c - t_ref) > ext:
+                    sel[label] = (t_ref, None, None, "保持")
+                    continue
+                # 首选判定：静音中心落在某个小节边界上（±0.15s）
+                k = round((c - bt0) / L)
+                on_bar = abs(c - (bt0 + k * L)) < 0.15
+                sel[label] = (c, sil_len, on_bar, "小节∩静音" if on_bar else "静音次选")
+            s0 = sel["起点"][0]; s1 = sel["终点"][0]
+            aligned2.append((s0, s1))
+            for label, (c, sl, on_bar, mode) in sel.items():
+                if mode == "保持":
+                    print(f"  拼接点 {label}: {c:.1f}s 无可用静音段（±{ext:.0f}s 内），保持")
+                else:
+                    print(f"  拼接点 {label}: -> {c:.1f}s  [{mode}]  "
+                          f"静音段时长 {sl:.2f}s，距原边界 {abs(c - (a0 if label == '起点' else a1)):.1f}s")
+            print(f"  最终修复段: [{s0:.1f}, {s1:.1f}]")
+        regions = aligned2
 
     scorer = Scorer(ref, lead, impostors)
 
@@ -223,7 +314,9 @@ def main() -> None:
         sc, tag, gen, g_ex, g_mg = best
         print(f"  >>> 选用 {tag}: excess {fmt(g_ex)} / margin {fmt(g_mg)}")
 
-        # ---- 拼接：候选内容（去掉 pad）替换 vocal[t0:t1]，交叉淡化 ----
+        # ---- 拼接：候选内容（去掉 pad）替换 vocal[t0:t1] ----
+        # 两步：(1) 接缝 RMS 匹配（修复段音量与周边对齐，避免接缝处音量跳变）；
+        #       (2) 交叉淡化（350ms 余弦），时间轴严格按样本对齐（SoulX 输出与输入等长）。
         gen_w, gen_sr = sf.read(gen)
         assert gen_sr == SR_OUT, gen_sr
         g0 = pad_samp
@@ -231,16 +324,31 @@ def main() -> None:
         assert g1 <= len(gen_w), (len(gen_w), g1)
         v0, v1 = int(t0 * SR_OUT), int(t1 * SR_OUT)
         xf = int(XF * SR_OUT)
-        # 直接替换（无叠唱），边界做余弦淡化避免咔哒
         old = vocal_w[v0:v1].copy()
         new = gen_w[g0:g1].copy()
         n = min(len(old), len(new))
+        # (1) 接缝 RMS 匹配：头/尾各取 xf 样本的 RMS 比，增益从接缝处向段内平滑衰减到 1
+        def _rms(x):
+            return float(np.sqrt(np.mean(x**2)) + 1e-9)
+        g_head = _rms(old[:xf]) / _rms(new[:xf])
+        g_tail = _rms(old[-xf:]) / _rms(new[-xf:])
+        # 增益曲线：头部 g_head -> 1（沿段长指数衰减），尾部 1 -> g_tail
+        gain = np.ones(n, dtype=np.float64)
+        hfade = np.exp(-np.linspace(0, 4, min(xf, n)))
+        gain[: len(hfade)] = 1 + (g_head - 1) * hfade
+        tfade = np.exp(-np.linspace(0, 4, min(xf, n)))[::-1]
+        gain[-len(tfade):] *= 1 + (g_tail - 1) * tfade
+        # 限制增益范围，防止把噪声/静音放得太大
+        gain = np.clip(gain, 0.3, 3.0)
+        new = (new.astype(np.float64) * gain).astype(np.float32)
+        # (2) 交叉淡化（余弦，与旧段混合避免接缝咔哒）
         fade = np.cos(np.linspace(0, np.pi / 2, min(xf, n)))[:n]
         for k in range(min(xf, n)):
             new[k] = new[k] * fade[k] + old[k] * (1 - fade[k])
         for k in range(1, min(xf, n) + 1):
             new[-k] = new[-k] * fade[-k] + old[-k] * (1 - fade[-k])
         vocal_w[v0 : v0 + n] = new[:n]
+        print(f"  拼接 RMS 匹配: head gain={g_head:.2f} tail gain={g_tail:.2f}")
 
     sf.write(out_path, vocal_w, SR_OUT)
     print(f"\n已写出 {out_path}")
