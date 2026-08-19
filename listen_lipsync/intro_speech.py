@@ -130,6 +130,7 @@ def generate_speech(args, out_dir: Path) -> tuple[Path, int]:
         "--gpt", str(w["gpt"]),
         "--sovits", str(w["sovits"]),
         "--ref", str(ref_abs),
+        "--speed", str(args.speed),
         "-q",
     ]
     if ref_text:
@@ -268,6 +269,9 @@ def main() -> None:
     ap.add_argument("--base-audio", required=True, help="44.1k 立体声主轨（audio.wav）")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--tts", default="gpt-ft", choices=["gpt-ft", "gpt-zs", "voxcpm2"])
+    ap.add_argument("--speed", type=float, default=1.0,
+                    help="口白语速倍率（GPT-SoVITS 原生，走模型时长缩放，音色不变；"
+                         "webui 滑杆范围 0.6-1.65，<1 = 更慢）。仅 gpt-ft/gpt-zs 生效")
     ap.add_argument("--ref-audio", required=True, help="参考音频（角色音色，3~10s 内）")
     ap.add_argument("--ref-text", default=None, help="参考音频转写（缺省从 girlish.list 反查）")
     ap.add_argument("--first-lyric", type=float, default=None,

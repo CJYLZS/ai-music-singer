@@ -2485,16 +2485,30 @@ MV 成片前可在器乐前奏里用角色音色说一段话。**素材目录约
 放 `data/songs/<歌名>/mv/`（口白 txt、cues、beats、audio、混音、口型、预览与最终 mp4，及
 `100s/`、`ab/` 子目录），`.tmp` 只留跨命令临时物、`data/video/` 不再放新产物。"是否已备料" =
 `mv/` 下 `cues_intro.json`/`audio_intro.wav`/`beats.json`/`speech.wav` 是否齐。渲染入口是
-`python3 mv.py`：`--with-intro --tts-ref <参考音频>` 自动带出 intro 阶段（调 intro_speech.py）
-并做口白版素材；成片写回 `mv/<歌名>_intro.mp4`，**默认渲完自动烧 KTV 字幕** →
-`mv/<歌名>_intro_lyrics.mp4`（复用 `mv/lyrics.ass`，缺则 `make_ass.py` 现建，烧前
-`fc-match SimHei` 校验字体配置，`--no-subs` 跳过烧字）。详见 README ⑥/⑥½/⑦。
+`python3 mv.py`：`--with-intro --tts-ref <参考音频> [--tts-speed 倍率]` 自动带出 intro 阶段
+（调 intro_speech.py）并做口白版素材；成片写回 `mv/<歌名>_intro.mp4`，**默认渲完自动烧 KTV
+字幕** → `mv/<歌名>_intro_lyrics.mp4`（复用 `mv/lyrics.ass`，缺则 `make_ass.py` 现建，烧前
+`fc-match SimHei` 校验字体配置，`--no-subs` 跳过烧字）。**`--with-intro` 只在 intro 阶段真跑时
+才强制要 `--tts-ref`**：仅 `--stages render,subs --with-intro` 重渲/重烧字（口白素材已在）可省略。
+详见 README ⑥/⑥½/⑦。
 
 - **说话模型选型（2026-08 A/B，同一文案，2026-08）**：微调 girlish（`--tts gpt-ft`）> 基座
   零样本（`gpt-zs`）> VoxCPM2（`voxcpm2`）。eval_sim（3s 窗 vs girlish 参考）：
   `gpt-ft 0.8734` / `gpt-zs 0.8406` / `voxcpm2 0.7807` —— 说话→说话同域，天然高于 SVC 的
   0.5-0.6。SingMOS 三者在 ±0.05 噪声内互博、NISQA-TTS 偏好 voxcpm2，**MOS 结论打架**；
   MV 的主导判据是**相似度（音色同源 = 与歌声观感一致）**，故默认 `gpt-ft`。A/B 产物留 `mv/ab/`。
+- **语速永远是模型原生 `--tts-speed`（GPT-SoVITS speed，0.6-1.65，<1 慢），不要 ffmpeg atempo。**
+  它走 VITS 时长模型把 phoneme 时长缩放（音色/音高不变、节奏自然），而 atempo 是时间拉伸会出
+  轻微伪影。实测 0.9 把 34 字口白 7.26s→9.72s（speed 1.0→0.8）量级符合 1/rate。仅 gpt 系生效；
+  `mv.py --tts-speed N` → `intro_speech.py --speed N` → `infer.py --speed N`。
+- **断句标点：`～`/`~` 不可靠，要停顿用 `。！？` 或 `，`。** 标点先归一：`，、；：`→`,`（句内短停）、
+  `。！？`→`.!?`（成句强停）、`～`/`~`→`…`（省略号）。默认切分「按中文句号。切」只在 `。` 处
+  拆句（`split()` 的边界集还含 `！？~…` 等，但 cut3 只用 `。`）；`…` 在模型里学出的停顿极短且
+  不稳定 —— 实测「真好看～如果」几乎无停顿，改成 `！`（赞叹上扬）或 `。`（平静）才明显。
+  `……` 会被归一成 `。`（强停）。想完全无停顿就连写不加标点。
+- **改文本后必须 `--force` 重跑 intro，否则 speech.wav 会被复用（新文本不会念出来）**：
+  `--stages intro --force`；改语速同理。重跑后 render/subs 因 audio_intro/cues_intro 变新自动
+  stale 重渲。
 - **硬约束在脚本里 fail-closed**：`dur ≤ first_lyric − offset − margin`，绝不压到唱段。
   情歌首句 27.08s（重锚后），示例口白 5.68s @ offset 1.5 → end 7.18、buffer 19.9s。
 - **口白口型 = 单独跑 make_cues（`--melodic-accent 0` 说话型）再并回前奏区**：

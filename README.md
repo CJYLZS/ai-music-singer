@@ -380,9 +380,13 @@ setsid a25rig/render.sh --psd data/pics/figure.psd \
 # 成片用口白版 cues/audio，命名 <歌名>_intro.mp4，渲完默认接着烧字幕：
 python3 mv.py --song 情歌 --with-intro \
     --tts-ref data/voices/girlish_sliced/ref-vocal.wav_0000064320_0000268160.wav \
+    --tts-speed 0.9 \
     --first-lyric 27.08 --offset 1.5 --margin 0.6 --speech-gain-db 4.0
 # 成片:            data/songs/情歌/mv/情歌_intro.mp4
 # 成片（带字幕）:  data/songs/情歌/mv/情歌_intro_lyrics.mp4（--no-subs 跳过烧字）
+# 改了口白文本后重生成：在上一命令加 --stages intro --force（新文本才会真的被念出来）
+# 只重渲/重烧字（口白素材已在）：python3 mv.py --song 情歌 --with-intro --stages render,subs
+#   （此时可省略 --tts-ref：仅 intro 阶段真跑时才需要）
 
 # 底层手工命令（等价 mv.py 的 intro 阶段；需要单独重算口白/校验时用）：
 GPT-SoVITS/.venv/bin/python listen_lipsync/intro_speech.py \
@@ -391,9 +395,10 @@ GPT-SoVITS/.venv/bin/python listen_lipsync/intro_speech.py \
     --base-audio data/songs/情歌/mv/audio.wav \
     --out-dir data/songs/情歌/mv/ \
     --tts gpt-ft \
+    --speed 0.9 \
     --ref-audio data/voices/girlish_sliced/ref-vocal.wav_0000064320_0000268160.wav \
     --first-lyric 27.08 --offset 1.5 --margin 0.6 --speech-gain-db 4.0
-#   之后 python3 mv.py --song 情歌 --with-intro --tts-ref ... 出片（会复用已生成的口白素材）
+#   之后 python3 mv.py --song 情歌 --with-intro --stages render,subs 出片（复用已生成的口白素材）
 ```
 
 要点：
@@ -402,6 +407,13 @@ GPT-SoVITS/.venv/bin/python listen_lipsync/intro_speech.py \
   微调 girlish 模型 `gpt-ft`（SIM **0.8734**）> 基座零样本 `gpt-zs`（0.8406）>
   VoxCPM2 零样本（0.7807）；MOS 三者在噪声内/结论不一，相似度上微调大幅领先且与歌声同源，
   故默认 `gpt-ft`。A/B 产物留在 `mv/ab/`。
+* **语速 `--tts-speed`（GPT-SoVITS 原生，非后期变速）**：走 VITS 时长模型把 phoneme 时长缩放，
+  **音色/音高不变**，比 ffmpeg atempo 自然。范围 0.6-1.65（WebUI 滑杆同款），<1 更慢；实测
+  0.9 秒把 34 字口白从 ~6s 拉到 ~10s。仅 gpt-ft/gpt-zs 生效（voxcpm2 不走这条）。
+* **断句靠标点，`～` 不可靠**：`。！？` 是成句级强停顿（默认「按中文句号。切」把长文本在 `。`
+  处拆句）；`，、；：` 是句内短停；**`～`/`~` 会被替换成省略号 `…`，模型基本不给停顿**
+  （实测「真好看～如果」几乎无停顿），想要停顿就用 `。`（平静）/`！`（赞叹上扬）/`，`（轻过渡）。
+  反之想完全无停顿就连写不加标点。语速+断句改完用 `--stages intro --force` 重生成试听。
 * **硬约束（fail-closed）**：`dur ≤ first_lyric − offset − margin`，**口白绝不允许压到唱段**；
   脚本打印 `offset / end / first_lyric / buffer`。生成后先目检 `mv/preview_intro.mp4`（或先渲
   前 ~11s 低清预览）确认口型与语音对得上再全片。

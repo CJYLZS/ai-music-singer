@@ -14,17 +14,20 @@ data/songs/<歌名>/mv/ 下（见 README「素材目录约定」）。某阶段�
     visemes  一次性口型 sprite（split_visemes.py -> data/pics/visemes/）
     intro    （可选）前奏口白：intro_speech.py 产出 speech.wav + speech_cues.json
              + cues_intro.json + audio_intro.wav + align_intro.wav
-             （需 mv/intro.txt 与 --tts-ref；--with-intro 或 --stages ...,intro 开启）
+             （需 mv/intro.txt 与 --tts-ref；--with-intro 或 --stages ...,intro 开启；
+             --tts-speed 调语速，<1 慢；改文本/语速后须 --force 重跑）
     render   a25rig/render.sh 渲片（有 intro 时用 cues_intro/audio_intro，无则用基础版）
     subs     make_ass.py 生成 ASS + ffmpeg 烧 KTV 字幕（--no-subs 关闭）
 
 最简用法（一首歌全流程，无口白）:
     python3 mv.py --song 情歌
 带前奏口白:
-    python3 mv.py --song 情歌 --with-intro --tts-ref data/voices/girlish_sliced/xxx.wav
+    python3 mv.py --song 情歌 --with-intro --tts-ref data/voices/girlish_sliced/xxx.wav \
+        --tts-speed 0.9
 只重渲 / 只烧字幕（复用已有素材）:
     python3 mv.py --song 情歌 --stages render
     python3 mv.py --song 情歌 --stages subs
+    python3 mv.py --song 情歌 --with-intro --stages render,subs   # 口白版成片（可省 --tts-ref）
 强制重跑某阶段:
     python3 mv.py --song 情歌 --stages cues --force
 
@@ -170,6 +173,7 @@ class Cfg:
     tts: str = "gpt-ft"
     tts_ref: str = ""
     tts_ref_text: str = ""
+    tts_speed: float = 1.0   # 口白语速倍率（GPT-SoVITS 原生，<1 = 更慢，范围 0.6-1.65）
     first_lyric: float | None = None
     offset: float = 1.5
     margin: float = 0.6
@@ -429,6 +433,7 @@ def stage_intro(cfg: Cfg) -> None:
            "--base-audio", cfg.audio_wav,
            "--out-dir", cfg.mv_dir,
            "--tts", cfg.tts,
+           "--speed", f"{cfg.tts_speed:g}",
            "--ref-audio", cfg.tts_ref,
            "--offset", f"{cfg.offset:g}",
            "--margin", f"{cfg.margin:g}",
@@ -625,6 +630,9 @@ def main() -> None:
                          "需要 mv/intro.txt 与 --tts-ref")
     ap.add_argument("--tts", default="gpt-ft", choices=["gpt-ft", "gpt-zs", "voxcpm2"],
                     help="口白 TTS 模型（默认 gpt-ft 微调 girlish，SIM 最高）")
+    ap.add_argument("--tts-speed", dest="tts_speed", type=float, default=1.0,
+                    help="口白语速倍率（默认 1.0；GPT-SoVITS 原生走模型时长缩放、音色不变，"
+                         "0.6-1.65，<1 = 更慢。gpt-voxcpm2 不生效）")
     ap.add_argument("--tts-ref", default="",
                     help="口白参考音频（角色音色，3~10s）")
     ap.add_argument("--tts-ref-text", default="",
@@ -678,14 +686,17 @@ def main() -> None:
         args.with_intro = args.with_intro or ("intro" in stages)
         args.subs = args.subs and ("subs" in stages)
 
-    if args.with_intro and not args.tts_ref:
-        sys.exit("error: --with-intro 需要 --tts-ref <参考音频>（口白角色音色）")
+    if args.with_intro and "intro" in stages and not args.tts_ref:
+        sys.exit("error: --with-intro 需要 --tts-ref <参考音频>（口白角色音色）\n"
+                 "  （仅重渲/重烧字时 --stages render,subs --with-intro 可省略 --tts-ref："
+                 "口白素材已存在则复用）")
 
     cfg = Cfg(name=name, song=song, stages=stages,
               vocal=vocal, mix=mix, start=args.start, end=args.end,
               force=args.force, gpu=args.gpu,
               with_intro=args.with_intro,
               tts=args.tts, tts_ref=args.tts_ref, tts_ref_text=args.tts_ref_text,
+              tts_speed=args.tts_speed,
               first_lyric=args.first_lyric, offset=args.offset, margin=args.margin,
               speech_gain_db=args.speech_gain_db,
               psd=args.psd,
