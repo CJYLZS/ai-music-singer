@@ -3,15 +3,18 @@
 两条独立的流水线，前者产声、后者产画：
 
 ```
-① sing.py                                       ② MV 渲染
-歌曲.flac + 参考语音                        vocal_psvs.wav / mix.wav
-  └─ sep → ref-sep → f0-target → select            ├─ 选窗口   RMS 扫描
-     → ext → svs → select-svs → svc                ├─ 切片     align/audio
-     → eval → mix                                  ├─ cues     make_cues.py
-        ├─ vocal_psvs.wav 干声（口型用这个）        ├─ beats    beat_grid.py
-        └─ mix.wav    人声+伴奏（成片用这个）        ├─ 渲染     a25rig/render.sh
-                                                   └─ 字幕     get_lyrics.py → make_ass.py
-                                                        → data/video/*.mp4
+① sing.py                                       ② MV 渲染（入口 mv.py 分阶段流水线）
+歌曲.flac + 参考语音                        vocal_psvs.wav / mix.wav → data/songs/<歌名>/mv/
+  └─ sep → ref-sep → f0-target → select            ├─ slice    align.wav(16k) + audio.wav(44.1k)
+     → ext → svs → select-svs → svc                ├─ lyrics  get_lyrics.py（.lrc）
+     → eval → mix                                  ├─ cues    make_cues.py（口型时间轴）
+        ├─ vocal_psvs.wav 干声（口型用这个）        ├─ beats   beat_grid.py（节拍网格）
+        └─ mix.wav    人声+伴奏（成片用这个）        ├─ visemes split_visemes.py（口型 sprite）
+                                                   ├─ intro   intro_speech.py（可选前奏口白）
+                                                   ├─ render  a25rig/render.sh（渲片）
+                                                   └─ subs    make_ass.py + ffmpeg（KTV 字幕）
+                                                        → data/songs/<歌名>/mv/*.mp4
+```
 ```
 
 `sing.py` 本身的参数、调优结论、各引擎 A/B 见 `AGENTS.md`；本文件只讲**从它的产物做出 MV**。
@@ -92,6 +95,12 @@ python3 sing.py --ref data/voices/ref.wav --song data/songs/云烟成雨.flac \
 
 ---
 
+> **素材目录约定（2026-08 起）**：一首歌的全部 MV 中间素材**和成片**——前奏口白 txt、cues、
+> beats、align/audio 主轨、混音、口型、预览片、最终 mp4 等——一律放在 **`data/songs/<歌名>/mv/`**
+> 下。`mv.py` 只从那里读素材、成片也写回那里；某首歌"是否已备料"= 该目录里
+> `cues_intro.json`、`audio_intro.wav`、`beats.json`、`speech.wav` 是否都就位（`mv.py`
+> 会当场检查并提示缺什么）。别再往 `/tmp`、`.tmp/` 或 `data/video/` 放渲染产物。
+
 ## ① 选窗口
 
 扫 1s 步长 RMS，找有声秒数最多的连续窗口。整曲出片可跳过这步。
@@ -116,7 +125,7 @@ EOF
 | `audio.wav` | 44.1k stereo | **`mix.wav`** | 渲染 mux |
 
 ```bash
-D=/tmp/opencode/云烟成雨_100s; mkdir -p $D
+D=data/songs/云烟成雨/mv; mkdir -p "$D"
 ffmpeg -v error -ss 0 -t 100 -i data/songs/云烟成雨/vocal.wav -ar 16000 -ac 1 $D/align.wav -y
 ffmpeg -v error -ss 0 -t 100 -i data/songs/云烟成雨/mix.wav                  $D/audio.wav -y
 ```
@@ -147,13 +156,13 @@ GPT-SoVITS/.venv/bin/python listen_lipsync/make_cues.py \
 喂真歌词能对齐 **347 字**：
 
 ```bash
-D=/tmp/opencode/云烟成雨_full
+D=data/songs/云烟成雨/mv
 # 从缓存的增强 LRC 抽纯文本（只读本地，不联网）
 GPT-SoVITS/.venv/bin/python - <<'EOF'
 import sys; sys.path.insert(0, "listen_lipsync")
 from get_lyrics import read_enhanced
 lines, _ = read_enhanced("data/songs/云烟成雨.lrc")
-open("/tmp/opencode/云烟成雨_full/lyrics.txt", "w", encoding="utf-8").write(
+open("$D/lyrics.txt", "w", encoding="utf-8").write(
     "\n".join(l["text"] for l in lines) + "\n")
 EOF
 
@@ -263,7 +272,7 @@ GPT-SoVITS/.venv/bin/python listen_lipsync/split_visemes.py \
 
 ```bash
 a25rig/mouth_sheet.sh --psd data/pics/figure.psd \
-    --visemes data/pics/visemes --out data/video/mouth_sheet --zoom 4
+    --visemes data/pics/visemes --out data/songs/云烟成雨/mv/mouth_sheet --zoom 4
 ```
 
 输出 9 张单图 + `_sheet.png` 总览。它会冻结 sway/blink/rand/idle，保证画面里只有嘴不同。
@@ -284,34 +293,52 @@ GPT-SoVITS/.venv/bin/python singing/beat_grid.py \
 
 ## ⑥ 渲染
 
-前面那串环境变量**必须显式点名 NVIDIA 适配器**，否则选到 AMD 核显（比软渲染更慢，
-实测 17.3 → 38.3 fps）。Vulkan 必然回落 SwiftShader，所以走 ANGLE/GL。
+入口是 `python3 mv.py`（分阶段流水线，见文件头部文档；旧 `render.sh` 已并入它）。素材从
+`data/songs/<歌名>/mv/` 读（见上方素材目录约定），每阶段按"产物齐全且不比输入旧"自动复用
+（`--force` 重跑）。**日常出片直接跑**：
+
+```bash
+python3 mv.py --song 云烟成雨            # 默认全流程：slice→lyrics→cues→beats→visemes→render→subs
+python3 mv.py --song 云烟成雨 --stages render   # 只重渲（复用已有素材）
+python3 mv.py --song 情歌 --with-intro --tts-ref <参考音频>   # 带前奏口白（见 ⑥½）
+```
+
+> **⚠️ 沙箱环境跑不了渲染**：`render` 阶段要起 headless Chrome + Mesa D3D12 拿 GPU（ANGLE/GL），
+> 在受限沙箱里 `page.goto` 会 30s Navigation timeout（不是脚本 bug，见 AGENTS.md）。需要在能
+> 访问 GPU 的正常机器上跑，或给该命令提权执行。
+
+下面两段是渲染器原始参数，仅作底层参考（默认风格下 `mv.py --stages render` 已经拼好这套，
+换 `--bg`/`--char-scale` 等风格时才需要直接调 `a25rig/render.sh`）。注意那串环境变量
+**必须显式点名 NVIDIA 适配器**，否则会选到 AMD 核显（比软渲染更慢，实测 17.3 → 38.3 fps）；
+Vulkan 必然回落 SwiftShader，所以走 ANGLE/GL。
 
 基础版：
 
 ```bash
+D=data/songs/云烟成雨/mv
 MESA_LOADER_DRIVER_OVERRIDE=d3d12 GALLIUM_DRIVER=d3d12 MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA \
 A25_GL_ARGS="--use-gl=angle --use-angle=gl --ignore-gpu-blocklist" \
 a25rig/render.sh --psd data/pics/figure.psd \
-    --cues  /tmp/opencode/云烟成雨_100s/cues.json \
-    --sway  /tmp/opencode/云烟成雨_100s/beats.json \
-    --audio /tmp/opencode/云烟成雨_100s/audio.wav \
+    --cues  $D/cues.json \
+    --sway  $D/beats.json \
+    --audio $D/audio.wav \
     --visemes data/pics/visemes \
-    --video data/video/mv_云烟成雨_100s.mp4 \
+    --video $D/云烟成雨_100s.mp4 \
     --fps 30 --size 16:9 --bg data/pics/bg.jpg
 ```
 
 雨天版（玻璃水珠 + 落雨丝 + 角色放大右移）—— 注意**去掉 `--bg`**：
 
 ```bash
+D=data/songs/云烟成雨/mv
 MESA_LOADER_DRIVER_OVERRIDE=d3d12 GALLIUM_DRIVER=d3d12 MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA \
 A25_GL_ARGS="--use-gl=angle --use-angle=gl --ignore-gpu-blocklist" \
 setsid a25rig/render.sh --psd data/pics/figure.psd \
-    --cues  /tmp/opencode/云烟成雨_100s/cues.json \
-    --sway  /tmp/opencode/云烟成雨_100s/beats.json \
-    --audio /tmp/opencode/云烟成雨_100s/audio.wav \
+    --cues  $D/cues.json \
+    --sway  $D/beats.json \
+    --audio $D/audio.wav \
     --visemes data/pics/visemes \
-    --video data/video/mv_云烟成雨_100s.mp4 \
+    --video $D/云烟成雨_100s.mp4 \
     --fps 30 --size 16:9 \
     --char-scale 1.15 --char-x 0.62 --char-y 0.56 \
     --rain-glass data/pics/bg.jpg --streaks
@@ -342,7 +369,54 @@ setsid a25rig/render.sh --psd data/pics/figure.psd \
 
 ---
 
+## ⑥½ 前奏口白（可复用的说话语音开头）
+
+成片前，在**器乐前奏**里用角色音色说一段话。整条链路是 `listen_lipsync/intro_speech.py`
+一条命令（GPT-SoVITS venv），口白 txt / cues / beats / 混音等产物全落到该歌的
+`data/songs/<歌名>/mv/` 下（见上方素材目录约定）：
+
+```bash
+# 推荐：直接走 mv.py —— intro 阶段自动调 intro_speech.py（口白生成→口型合并→混音），
+# 成片用口白版 cues/audio，命名 <歌名>_intro.mp4，渲完默认接着烧字幕：
+python3 mv.py --song 情歌 --with-intro \
+    --tts-ref data/voices/girlish_sliced/ref-vocal.wav_0000064320_0000268160.wav \
+    --first-lyric 27.08 --offset 1.5 --margin 0.6 --speech-gain-db 4.0
+# 成片:            data/songs/情歌/mv/情歌_intro.mp4
+# 成片（带字幕）:  data/songs/情歌/mv/情歌_intro_lyrics.mp4（--no-subs 跳过烧字）
+
+# 底层手工命令（等价 mv.py 的 intro 阶段；需要单独重算口白/校验时用）：
+GPT-SoVITS/.venv/bin/python listen_lipsync/intro_speech.py \
+    --text data/songs/情歌/mv/intro.txt \
+    --song-cues data/songs/情歌/mv/cues.json \
+    --base-audio data/songs/情歌/mv/audio.wav \
+    --out-dir data/songs/情歌/mv/ \
+    --tts gpt-ft \
+    --ref-audio data/voices/girlish_sliced/ref-vocal.wav_0000064320_0000268160.wav \
+    --first-lyric 27.08 --offset 1.5 --margin 0.6 --speech-gain-db 4.0
+#   之后 python3 mv.py --song 情歌 --with-intro --tts-ref ... 出片（会复用已生成的口白素材）
+```
+
+要点：
+
+* **选模（2026-08 A/B，同一文案，eval_sim 相似度 + NISQA/SingMOS）**：
+  微调 girlish 模型 `gpt-ft`（SIM **0.8734**）> 基座零样本 `gpt-zs`（0.8406）>
+  VoxCPM2 零样本（0.7807）；MOS 三者在噪声内/结论不一，相似度上微调大幅领先且与歌声同源，
+  故默认 `gpt-ft`。A/B 产物留在 `mv/ab/`。
+* **硬约束（fail-closed）**：`dur ≤ first_lyric − offset − margin`，**口白绝不允许压到唱段**；
+  脚本打印 `offset / end / first_lyric / buffer`。生成后先目检 `mv/preview_intro.mp4`（或先渲
+  前 ~11s 低清预览）确认口型与语音对得上再全片。
+* **口型**：对生成的口白单独跑 make_cues（`--melodic-accent 0`，说话型逐字清晰），再并回前奏
+  区 `X(0,offset) + 口白段 + X(尾,first_lyric)`；唱歌段 cues 原样不动（合并后逐样本核对过）。
+* **混音**：口白按 `--speech-gain-db`（默认 +4dB）叠进 audio 的 `[offset, end)`，只动这一小段、
+  之后逐样本不变；同时写 16k mono `align_intro.wav`，让 cues 的 `soundFile` 与真实时间轴自洽。
+
+---
+
 ## ⑦ KTV 字幕（可选）
+
+**`mv.py` 的 `subs` 阶段已内置这一步**（渲完默认自动烧字 → `mv/<歌名>[_intro]_lyrics.mp4`；
+`--no-subs` 关闭）：复用 `mv/lyrics.ass`（没有则用 `make_ass.py` 现建），烧前 `fc-match SimHei`
+校验字体配置，防止"烧了但字幕静默消失"。下面是底层手工命令，仅在单独重烧字幕时用。
 
 烧在**已渲染好的视频**上，不参与 a25rig 渲染。这样改字幕只要重烧几秒，不用重渲整片。
 
@@ -351,16 +425,17 @@ setsid a25rig/render.sh --psd data/pics/figure.psd \
 GPT-SoVITS/.venv/bin/python listen_lipsync/get_lyrics.py data/songs/云烟成雨.flac
 
 # 2) 生成 ASS（--start/--end 必须与视频窗口一致）
+D=data/songs/云烟成雨/mv
 GPT-SoVITS/.venv/bin/python listen_lipsync/make_ass.py data/songs/云烟成雨.lrc \
-    -o /tmp/opencode/云烟成雨_100s/lyrics.ass \
+    -o $D/lyrics.ass \
     --size 1920x1080 --start 0 --end 100 --pos bc
 
 # 3) 烧进视频（字体走 FONTCONFIG_FILE，不往系统装字体）
-export FONTCONFIG_FILE=/tmp/opencode/fonttest/fc/fonts.conf
-ffmpeg -v error -y -i data/video/mv_云烟成雨_100s.mp4 \
-    -vf "ass=/tmp/opencode/云烟成雨_100s/lyrics.ass" \
+export FONTCONFIG_FILE=.tmp/fontconf/fonts.conf
+ffmpeg -v error -y -i $D/云烟成雨_100s.mp4 \
+    -vf "ass=$D/lyrics.ass" \
     -c:v libx264 -crf 18 -preset medium -c:a copy \
-    data/video/mv_云烟成雨_100s_lyrics.mp4
+    $D/云烟成雨_100s_lyrics.mp4
 ```
 
 画面上永远两行：**上行**是正在唱的句子（逐字扇光，唱过的字变色），**下行**是下一句预览
@@ -455,8 +530,8 @@ fc-match SimHei     # 期望 simhei.ttf: "SimHei" "Regular"
 
 ```bash
 cd /tmp/opencode && rm -rf lyrchk && mkdir lyrchk
-SUB=/home/rookie/voice/data/video/mv_云烟成雨_100s_lyrics.mp4
-CLN=/home/rookie/voice/data/video/mv_云烟成雨_100s.mp4
+SUB=/home/rookie/voice/data/songs/云烟成雨/mv/云烟成雨_100s_lyrics.mp4
+CLN=/home/rookie/voice/data/songs/云烟成雨/mv/云烟成雨_100s.mp4
 # 取第 1 句起唱后 +1/+4/+7s（首句起点由 .lrc 第一行时间决定，这里是 18s）
 for t in 19 22 25; do
   ffmpeg -v error -y -ss $t -i $SUB -frames:v 1 lyrchk/s$t.png
@@ -491,7 +566,7 @@ mean absdiff 最小），再比「字幕带（y≈900-1040）mean absdiff」与�
 ## ⑧ 验收
 
 ```bash
-V=data/video/mv_云烟成雨_100s.mp4
+V=data/songs/云烟成雨/mv/云烟成雨_100s.mp4
 ffprobe -v error -show_entries format=duration,size:stream=codec_name,width,height,r_frame_rate,channels \
     -of default=nw=1 $V     # 期望 100.0 / h264 1920x1080 30/1 / aac 2ch
 ```
@@ -500,7 +575,7 @@ ffprobe -v error -show_entries format=duration,size:stream=codec_name,width,heig
 
 ```bash
 cd /tmp/opencode && rm -rf chk && mkdir chk
-ffmpeg -v error -i /home/rookie/voice/data/video/mv_云烟成雨_100s.mp4 -vf fps=5 -q:v 2 chk/f_%04d.jpg
+ffmpeg -v error -i /home/rookie/voice/data/songs/云烟成雨/mv/云烟成雨_100s.mp4 -vf fps=5 -q:v 2 chk/f_%04d.jpg
 /home/rookie/voice/GPT-SoVITS/.venv/bin/python - <<'EOF'
 import numpy as np, glob, json
 from PIL import Image
@@ -541,7 +616,7 @@ EOF
 全曲版还要多查两项（100s 片段看不出来）：
 
 ```bash
-V=data/video/mv_云烟成雨_full_lyrics.mp4
+V=data/songs/云烟成雨/mv/云烟成雨_full_lyrics.mp4
 # 1) 帧数 × fps 必须等于时长：7223 / 30 = 240.767s
 ffprobe -v error -count_frames -select_streams v -show_entries stream=nb_read_frames -of csv=p=0 $V
 # 2) 音频不能中途断流 —— 分段 RMS 应全程在 -12..-20dB，不能出现 -99
@@ -622,9 +697,11 @@ for a in range(0, int(len(y)/sr), 40):
 | 脚本 | 阶段 | venv |
 |---|---|---|
 | `sing.py` | ⓿ 产声 | 系统 python3（内部各阶段自选 venv） |
+| **`mv.py`** | **② MV 流水线入口**（slice/lyrics/cues/beats/visemes/intro/render/subs） | 系统 python3（内部调各脚本自带 venv） |
 | `listen_lipsync/make_cues.py` | ③ 口型时间轴 | GPT-SoVITS |
 | `listen_lipsync/split_visemes.py` | ④ 口型 sprite | GPT-SoVITS |
 | `singing/beat_grid.py` | ⑤ 节拍网格 | GPT-SoVITS |
-| `a25rig/render.sh` | ⑥ 渲染 | node（自带 `driver/node_modules`） |
+| `a25rig/render.sh` | ⑥ 渲染（mv.py render 阶段调用） | node（自带 `driver/node_modules`） |
 | `listen_lipsync/get_lyrics.py` | ⑦ 抓词缓存 | GPT-SoVITS |
 | `listen_lipsync/make_ass.py` | ⑦ 生成 ASS | GPT-SoVITS（纯 stdlib） |
+| `listen_lipsync/intro_speech.py` | ⑥½ 前奏口白（mv.py intro 阶段调用） | GPT-SoVITS |

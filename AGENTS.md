@@ -77,7 +77,8 @@ voice/
 │                     重新获取: git clone --depth 1 https://github.com/gabrielmittag/NISQA.git tools/nisqa
 ├── a25rig/           Anime2.5DRig (MIT) fork + 离线渲染补丁: PSD → 逐帧 PNG（口型吃
 │                     make_cues.py 时间轴）. driver/ 是 WSL 内无头 Chrome 驱动.
-│                     入口 ./render.sh（必须用它，见「Anime2.5DRig 离线渲染」一节）
+│                     入口 a25rig/render.sh（mv.py render 阶段也在调；必须用它，
+│                     见「Anime2.5DRig 离线渲染」一节）
 ├── echomimic3/       EchoMimicV3 (AAAI'26, Apache-2.0): 单图 + 音频 → 说话/唱歌视频.
 │                     .venv = torch 2.6+cu124. 1.3B params, flash-pro 8-step, ≤768×768.
 │                     可吃 GPT-SoVITS 的 TTS 输出或 sing.py 的 SVC 干声。见「EchoMimicV3」一节
@@ -91,7 +92,9 @@ voice/
 ├── docs/             调研/实验文档（voice-beautify-survey.md、source-timbre-normalization-survey.md 等）
 ├── logs/             GPT-SoVITS training features + checkpoints
 ├── AGENTS.md         this file
-├── README.md         MV 出片流程（sing.py 产物 → cues → beats → a25rig 渲染），操作向
+├── README.md         MV 出片流程（sing.py 产物 → mv.py），操作向
+├── mv.py             MV 渲染流水线入口（分阶段：slice/lyrics/cues/beats/visemes/intro/render/subs，
+│                     复用已有素材、可续跑；见 README ② MV 渲染）
 └── eval_sim.py       speaker-similarity scoring (pitch-bucketed), see "Measuring similarity"
 ```
 
@@ -2290,10 +2293,16 @@ PSD 立绘 + `make_cues.py` 口型时间轴 → MV。上游是交互式浏览器
 **详细文档在 `a25rig/RENDER.md`**（含全部旗标、实测数字、物理推导），这里只记
 工作区级别的坑。
 
-- **入口必须是 `./render.sh`**，不能直接 `node driver/render.mjs`。wrapper 负责设
-  `LD_LIBRARY_PATH`：puppeteer 自带的 Chrome 需要 libnss3/libnspr4，本机无 root，
-  这些 `.so` 是 `apt-get download` + `dpkg-deb -x` 解到 `driver/nsslib/` 的。
-  直接跑 node 会报 `libnss3.so: cannot open shared object file`。
+- **渲染入口是 `mv.py`（workspace 根，分阶段流水线），底层必须走 `a25rig/render.sh` wrapper，**
+  不能直接 `node driver/render.mjs`。wrapper 负责设 `LD_LIBRARY_PATH`：puppeteer 自带的
+  Chrome 需要 libnss3/libnspr4，本机无 root，这些 `.so` 是 `apt-get download` +
+  `dpkg-deb -x` 解到 `driver/nsslib/` 的。直接跑 node 会报
+  `libnss3.so: cannot open shared object file`。
+- **`render` 阶段在受限沙箱里跑不了，表现是 `page.goto` 30s Navigation timeout**（不是脚本
+  bug）：headless Chrome + Mesa D3D12 拿 GPU（ANGLE/GL）需要系统级设备访问，沙箱内 `goto`
+  到 `../index.html` 一直等不到 load 就超时，随后 node 以 exit 1 退出。要在能访问 GPU 的正常
+  机器上跑，或给该命令提权执行（2026-08 实测提权后 2s 冒烟片 6.9s 出片）。`mv.py --stages render`
+  负责拼 `MESA_LOADER_DRIVER_OVERRIDE=d3d12 ...` 那套 env + `setsid`，文档不重复贴。
 - **puppeteer 脚本必须放在 `driver/`**（`node_modules` 所在处），否则
   `ERR_MODULE_NOT_FOUND: Cannot find package 'puppeteer'`。
 - **GPU 可用，但必须显式点名适配器**，否则选到 AMD 核显（比软渲染更慢）。
@@ -2467,6 +2476,37 @@ PSD 立绘 + `make_cues.py` 口型时间轴 → MV。上游是交互式浏览器
 - **fork 已推到 `CJYLZS/Anime2.5DRig` 分支 `offline-render`**（remote 名 `fork`，
   上游 `852wa/Anime2.5DRig` 为 `origin`）。`driver/node_modules/`、`driver/nsslib/`、
   `out/`、`frames/` 在 `.gitignore` 里。
+
+---
+
+# 前奏口白（`listen_lipsync/intro_speech.py`，2026-08）
+
+MV 成片前可在器乐前奏里用角色音色说一段话。**素材目录约定**：一首歌的全部渲染中间物**和成片**
+放 `data/songs/<歌名>/mv/`（口白 txt、cues、beats、audio、混音、口型、预览与最终 mp4，及
+`100s/`、`ab/` 子目录），`.tmp` 只留跨命令临时物、`data/video/` 不再放新产物。"是否已备料" =
+`mv/` 下 `cues_intro.json`/`audio_intro.wav`/`beats.json`/`speech.wav` 是否齐。渲染入口是
+`python3 mv.py`：`--with-intro --tts-ref <参考音频>` 自动带出 intro 阶段（调 intro_speech.py）
+并做口白版素材；成片写回 `mv/<歌名>_intro.mp4`，**默认渲完自动烧 KTV 字幕** →
+`mv/<歌名>_intro_lyrics.mp4`（复用 `mv/lyrics.ass`，缺则 `make_ass.py` 现建，烧前
+`fc-match SimHei` 校验字体配置，`--no-subs` 跳过烧字）。详见 README ⑥/⑥½/⑦。
+
+- **说话模型选型（2026-08 A/B，同一文案，2026-08）**：微调 girlish（`--tts gpt-ft`）> 基座
+  零样本（`gpt-zs`）> VoxCPM2（`voxcpm2`）。eval_sim（3s 窗 vs girlish 参考）：
+  `gpt-ft 0.8734` / `gpt-zs 0.8406` / `voxcpm2 0.7807` —— 说话→说话同域，天然高于 SVC 的
+  0.5-0.6。SingMOS 三者在 ±0.05 噪声内互博、NISQA-TTS 偏好 voxcpm2，**MOS 结论打架**；
+  MV 的主导判据是**相似度（音色同源 = 与歌声观感一致）**，故默认 `gpt-ft`。A/B 产物留 `mv/ab/`。
+- **硬约束在脚本里 fail-closed**：`dur ≤ first_lyric − offset − margin`，绝不压到唱段。
+  情歌首句 27.08s（重锚后），示例口白 5.68s @ offset 1.5 → end 7.18、buffer 19.9s。
+- **口白口型 = 单独跑 make_cues（`--melodic-accent 0` 说话型）再并回前奏区**：
+  `X(0,offset) + 口白段 + X(尾, first_lyric)`，唱歌段 cues 原样不动（混音侧可断言逐样本
+  不变）。别在唱歌参数（Ma=0.6）下生成 —— 短元音会被糊成唱歌腔。
+- **合并自检只认「相邻同起点」是崩塌**：相邻 cue `start == 前一个 end`（无缝衔接）是正常连接，
+  不是塌缩 —— 初版把后者误报为崩塌（见 `check_speech_cues`）。
+- **voxcpm2 在受限沙箱必须 `HF_HUB_OFFLINE=1`**：`from_pretrained` 每次都会重建
+  `~/.cache/huggingface/.../snapshots/<rev>` 指针，沙箱 home 只读即 EROFS；离线模式走
+  `refs/main` 命中既有缓存，不经网络也不写盘。
+- **GPT-SoVITS `infer.py` 的 cwd 必须是 `GPT-SoVITS/`**（模块导入要仓库根），所以
+  intro_speech 给它的文件路径全用绝对路径 —— 相对路径会写进 `GPT-SoVITS/.tmp/...` 而读不到。
 
 ---
 
