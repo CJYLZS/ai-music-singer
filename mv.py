@@ -629,7 +629,8 @@ def main() -> None:
                          "audio_intro.wav，成片命名 <song>_intro.mp4。"
                          "需要 mv/intro.txt 与 --tts-ref")
     ap.add_argument("--tts", default="gpt-ft", choices=["gpt-ft", "gpt-zs", "voxcpm2"],
-                    help="口白 TTS 模型（默认 gpt-ft 微调 girlish，SIM 最高）")
+                    help="口白 TTS 模型（默认 gpt-ft = girlish GPT e30 + talksing_s2mix50 "
+                         "SoVITS e12，吐字与高频清晰度最优；权重在 intro_speech.py 定义）")
     ap.add_argument("--tts-speed", dest="tts_speed", type=float, default=1.0,
                     help="口白语速倍率（默认 1.0；GPT-SoVITS 原生走模型时长缩放、音色不变，"
                          "0.6-1.65，<1 = 更慢。gpt-voxcpm2 不生效）")

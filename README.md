@@ -403,10 +403,19 @@ GPT-SoVITS/.venv/bin/python listen_lipsync/intro_speech.py \
 
 要点：
 
-* **选模（2026-08 A/B，同一文案，eval_sim 相似度 + NISQA/SingMOS）**：
-  微调 girlish 模型 `gpt-ft`（SIM **0.8734**）> 基座零样本 `gpt-zs`（0.8406）>
-  VoxCPM2 零样本（0.7807）；MOS 三者在噪声内/结论不一，相似度上微调大幅领先且与歌声同源，
-  故默认 `gpt-ft`。A/B 产物留在 `mv/ab/`。
+* **选模：默认 `gpt-ft` = girlish GPT `e30` + `talksing_s2mix50` SoVITS `e12`**（权重在
+  `listen_lipsync/intro_speech.py` 的 `GPT_WEIGHTS` 里定义）。SoVITS 于 2026-08 换成
+  「说话 50% + 唱歌 50% 混合数据、从 v2Pro 底模从头训练」的 S2，判据是**吐字与清晰度**
+  （长文本 436 字、GPT 固定、`--seed 1234` 配对）：CER **0.0505 → 0.0367**（超噪声底 0.0092，
+  替换错误 9→5）、4-8kHz 塌陷 **−4.27dB → −0.02dB**（LTAS L1 2.81 → 1.83）。
+  跨模型的老 A/B（`gpt-ft` 0.8734 > `gpt-zs` 0.8406 > VoxCPM2 0.7807）仍成立，产物在 `mv/ab/`。
+* **别拿 SIM 当选型主判据 —— 它已经饱和。** 同一锚点下真人**自己另一场录音**只有
+  **0.7538**、不同人地板 0.3567（`singing/eval_sim_ceiling.py` → `data/experiments/sim_ceiling.json`），
+  而各臂都在 0.72-0.79，即 SV 模型已分不出合成与真人。换 SoVITS 后 SIM 0.7880 → 0.7452 看着是
+  退步，实则两者都在天花板附近，那 0.04 只占可判别区间（0.397）的 10%。**判据优先级：吐字 CER >
+  语速语调自然 > SIM。**
+* **语气平是文本问题，不是 checkpoint 问题**：六个臂 F0 std 全在 2.21-2.37（真人 2.853）、
+  停顿数 24-27（真人 66），臂间差异远小于噪声底。停顿完全由标点决定 —— 见下面「断句靠标点」。
 * **语速 `--tts-speed`（GPT-SoVITS 原生，非后期变速）**：走 VITS 时长模型把 phoneme 时长缩放，
   **音色/音高不变**，比 ffmpeg atempo 自然。范围 0.6-1.65（WebUI 滑杆同款），<1 更慢；实测
   0.9 秒把 34 字口白从 ~6s 拉到 ~10s。仅 gpt-ft/gpt-zs 生效（voxcpm2 不走这条）。

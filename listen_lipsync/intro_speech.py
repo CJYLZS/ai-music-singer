@@ -49,10 +49,19 @@ GIRLISH = ROOT / "data/voices/girlish.list"
 
 # 候选 TTS 的权重（gpt 系走 GPT-SoVITS infer.py；voxcpm2 走 test_gen.py）
 GPT_WEIGHTS = {
+    # 2026-08 起 SoVITS 换成 talksing_s2mix50_e12（说话 50% + 唱歌 50% 混合数据、
+    # 从 v2Pro 底模从头训练的 S2）。GPT 仍是 girlish-e30 —— S2 训练不读取 S1 权重，
+    # 两者互不影响，所以只换 SoVITS 即可。实测（长文本 436 字，GPT 固定、seed 1234 配对）:
+    #   CER          0.0505 → 0.0367（−1.4 点，超 CER 噪声底 0.0092）
+    #   4-8k 塌陷    −4.27dB → −0.02dB（LTAS L1 2.81 → 1.83，口齿最直接的谱形签名）
+    #   SIM vs s01   0.7880 → 0.7452 —— 看着降了，但真人自己**跨录音场次**只有 0.7538、
+    #                不同人地板 0.3567（data/experiments/sim_ceiling.json），两臂都已在天花板
+    #                附近饱和，这 0.04 在 0.397 的可判别区间里只占 10%，听感无意义。
+    # e12/e16/e20 的 CER 与 S/D/I 逐位相同（e12 起饱和），取 L1 最低的 e12。
     "gpt-ft": dict(
         gpt=ROOT / "GPT-SoVITS/GPT_weights_v2Pro/girlish-e30.ckpt",
-        sovits=ROOT / "GPT-SoVITS/SoVITS_weights_v2Pro/girlish_e20_s440.pth",
-        label="gpt-ft (girlish fine-tuned v2Pro)",
+        sovits=ROOT / "GPT-SoVITS/SoVITS_weights_v2Pro/talksing_s2mix50_e12_s240.pth",
+        label="gpt-ft (girlish GPT e30 + talksing_s2mix50 SoVITS e12)",
     ),
     "gpt-zs": dict(
         gpt=ROOT / "GPT-SoVITS/GPT_SoVITS/pretrained_models"
@@ -117,7 +126,7 @@ def generate_speech(args, out_dir: Path) -> tuple[Path, int]:
             "--ref", str(ref_abs),
             "--text", text,
             "--out", str(out_abs),
-            "--seed", "42",
+            "--seed", str(args.seed),
         ], ROOT, out_dir / "tts.log", env_extra={"HF_HUB_OFFLINE": "1"})
         return speecw_path, sf.info(speecw_path).samplerate
 
@@ -131,6 +140,11 @@ def generate_speech(args, out_dir: Path) -> tuple[Path, int]:
         "--sovits", str(w["sovits"]),
         "--ref", str(ref_abs),
         "--speed", str(args.speed),
+        # AR 解码走 multinomial 采样，infer.py 不给 --seed 就完全不播种
+        # （inference_webui.py:118 的 set_seed(42) 是注释掉的）。实测同一权重重跑
+        # CER 极差可达 0.0092，口白会每次重渲都不一样、也无法与既有产物比对。
+        # voxcpm2 分支早已固定 seed 42，这里对齐它。
+        "--seed", str(args.seed),
         "-q",
     ]
     if ref_text:
@@ -280,6 +294,9 @@ def main() -> None:
     ap.add_argument("--margin", type=float, default=0.6, help="口白尾到首句的安全间距（秒）")
     ap.add_argument("--speech-gain-db", type=float, default=4.0, help="口白相对主轨的增益（dB）")
     ap.add_argument("--fade-ms", type=float, default=50.0)
+    ap.add_argument("--seed", type=int, default=42,
+                    help="TTS 采样种子（默认 42，与 voxcpm2 分支一致）。"
+                         "不固定则同一配置每次重渲结果都不同，无法复现或比对")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--force", action="store_true", help="重新生成口白（默认复用已有 speech.wav）")
     args = ap.parse_args()

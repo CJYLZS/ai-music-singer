@@ -75,6 +75,18 @@ voice/
 │                     见「SingMOS 自然度评测与 NSF 后处理」
 ├── tools/nisqa/      NISQA 语音质量/自然度评测（官方仓库浅克隆，权重内置在仓库里）.
 │                     重新获取: git clone --depth 1 https://github.com/gabrielmittag/NISQA.git tools/nisqa
+├── tools/emotion2vec/  emotion2vec+base（ModelScope iic/emotion2vec_plus_base，1.12GB）.
+│                     只放权重（.ms-cache），代码走 GPT-SoVITS venv 的 funasr.
+│                     服务 singing/eval_tts_prosody.py 的情感分布/ES 指标
+├── tools/stepaudio/  Step-Audio-EditX 3B（Apache-2.0，零样本克隆 + 情感/风格/语速编辑）.
+│                     自带 py3.12 venv（vLLM 0.27 + torch 2.13cu130）+ repo/ 浅克隆 + 8.3GB 权重.
+│                     run_stepaudio.py = clone/edit 封装，probe_ref_len.py = 参考长度探测.
+│                     **结论是否定的（三轮实测），见「前奏口白」节 Step-Audio 条**
+├── tools/indextts/   IndexTTS-2.5（0.8B，emo_vector 8 维 / emo_alpha / duration_factor）.
+│                     env.sh = 隔离环境变量，prepare_ckpt.py = 权重组装（主权重软链 +
+│                     辅助权重下载），run_indextts.py = 多臂推理封装（**每臂重播种**）.
+│                     py3.11 uv venv（torch 2.8+cu128）。峰值 VRAM 7.76GB.
+│                     **结论是否定的（一轮 7 臂），见「前奏口白」节 IndexTTS 条**
 ├── a25rig/           Anime2.5DRig (MIT) fork + 离线渲染补丁: PSD → 逐帧 PNG（口型吃
 │                     make_cues.py 时间轴）. driver/ 是 WSL 内无头 Chrome 驱动.
 │                     入口 a25rig/render.sh（mv.py render 阶段也在调；必须用它，
@@ -2518,6 +2530,168 @@ MV 成片前可在器乐前奏里用角色音色说一段话。**素材目录约
   - GPT-SoVITS infer.py 参考**强制 3~10s**（`参考音频在3~10秒范围外`），>10s 长句和 <3s 不可用。
   - 6s/8s/12s 多长度、多位置，全落在噪声带内，**当前 6.37s 生产切片已是最优工作点**，别再在
     「切哪段、切多长」上花时间。
+- **韵律/清晰度评测（`singing/eval_tts_prosody.py`，2026-08）—— CER/SIM/MOS 三项测不到
+  「语气」和「口齿」，这是补上的第四类指标。** 听感上的两个抱怨（语气不贴内容、部分段落
+  口齿不清）在既有四项里**结构性不可见**：没有任何一项测语调/停顿/语气；CER 是 ASR 的
+  **离散字判决**，语言模型能从含糊音里猜对字（e10 0.0275 已饱和），声学模糊被判决层吃掉。
+  新脚本一律出「vs 真人说话段」的**相对量**（绝对值无意义），七组：LTAS 谱形差、F0 统计
+  (半音域)、语速/停顿、emotion2vec ES、高频占比/centroid/flux/调制谱、F1-F2 元音散布。
+  - **真人基线必须取前 162s，不是 261s。** F0 细扫：165s 起 stable（相邻帧 <0.5 半音占比）
+    从 ~0.60 跳到 0.75-0.88、中位 F0 从 ~250Hz 升到 280-364Hz —— **162s 之后已经在唱**。
+    用 261s 会把唱段混进说话统计，F0 std / 语速 / LTAS 全被污染。仓库里
+    `eval_vox_ref_length.py` 写的 `TALK_LIMIT_S = 261.0` 是错的，`eval_zs_slice_scan.py`
+    的 162 是对的。
+  - **先量噪声底再解读，否则全是过度解读。** 把真人 162s 切 16 个 10s 窗测窗间 std 得到
+    每个指标的噪声底：F0std 0.379 / flat_frac 0.052 / hf2-8k 0.0045 / centroid 94.4 /
+    mod4-16 0.0438 / 音节率 0.633。对照 7 臂均值 vs 真人的差：**没有一项单独超过 1.5×
+    噪声底**（F0std 1.40× 边缘、hf2-8k 1.11× 边缘、centroid 1.16× 边缘、mod4-16 与音节率
+    在噪声内）。所以"口齿不清"**不是某一条指标的塌陷**，而是多条同向偏移的叠加 ——
+    单看任何一条都会得出"没问题"的错误结论。
+  - **LTAS 的逐带 dB 是"该带占全带比例"（18 带各自 <1，绝对值必为负），只有带间差值有
+    意义。** 分频段汇总必须用**能量份额之差**，不能用 dB 均值之差 —— 后者会被 -47dB 那种
+    极低带主导。第一版就踩了这个坑（"全负 = 全频段偏少"是错读）。修正后结构才清楚：
+    低频持平（+0.03dB）、**中高频全面塌陷（500-2k −1.63dB / 2-4k −1.94dB / 4-8k −1.47dB）**，
+    这才是"闷/糊"的谱形签名，且长文本 7 臂的 2-4k 一致落在 −1.73…−2.50dB。
+  - **"语气平"证据成立，但矛头指向生产臂而不是模型家族**：F0 std 真人 2.853 半音，长文本
+    7 臂 2.25-2.38，**生产短口白 prod 2.254 最低**；p10-p90 域宽真人 7.30 半音 vs 全臂
+    5.8-6.2（**域宽差 1.1-1.5 半音是全表最稳的一条**）。近平坦帧占比 prod 0.4506 vs 真人
+    0.3984，而长文本 7 臂 0.379-0.403 **与真人齐平** —— prod 这一条是短文本 + speed 0.9
+    的产物，不是 gpt-ft 的固有缺陷。
+  - ~~**emotion2vec 给出最锐利的一刀：`prod` 的情感分布是 100.0% neutral / 0.0% happy，
+    真人说话段是 57.4% neutral / 27.5% happy。这是全部指标里唯一远超噪声的信号**~~
+    **⚠️ 这一条是本脚本自身的测量假象，已推翻 —— 见下面「emotion2vec 分布的窗数陷阱」。**
+    修正后 `prod` 是 **62.4% neutral / 37.6% happy**（真人 68.6%/23.5%，ES 0.9833），
+    差距很小，"语气不贴合"在这个指标上**不成立**。当时那"1.000 vs 0.574"完全由
+    **窗数**造成：prod 10.28s 在 win=6/hop=6 下只有 1 窗。
+  - ~~**⚠️ ES 余弦与情感分布不同向，只看 ES 会得到反结论**（prod ES 0.9083 垫底却
+    100% neutral；zs ES 0.9632 最低却分布最接近真人）~~ —— **"不同向"是上一条那个
+    窗数假象的推论，一起失效**。修正取窗后 ES 与分布**同向**：prod ES 0.9833 且分布
+    最接近真人，IndexTTS 各臂 ES 0.36-0.79 且分布全部过冲 happy。ES 仍受音色主导
+    （所以不能单看），但它不再与分布矛盾。
+  - **停顿数不是模型问题，是标点问题（差点误判）。** prod 只有 2 个停顿 vs 真人 66 个，
+    看着像模型不会断句；但**同文本 7 个短臂全是 2 个停顿**（zs 5 个），而长文本 7 臂是
+    23-52 个 —— **停顿完全由文本标点决定，与模型/epoch 无关**。印证既有的"`～` 不给停顿、
+    要停顿用 `。！？`"那条，且说明改语气要先改文本，不是先换模型。
+  - **元音散布 / flux / 调制谱三条"清晰度"指标反而全臂优于真人**（logarea 0.143-0.159 vs
+    0.135、flux 0.076-0.087 vs 0.076、mod4-16 0.41-0.50 vs 0.45）。所以口齿问题**不是
+    构音幅度不足**，而是高频能量塌陷（LTAS 2-8k）—— 两类机制要分开看，别把元音空间当
+    万能清晰度代理。
+  - 用法：`GPT-SoVITS/.venv/bin/python singing/eval_tts_prosody.py --prod --arms-long
+    --ref-sec 162 --out <报告.json>`（`--arms-short` 短口白臂、`--no-emo` 跳过 1.1GB 权重、
+    `--no-vowel` 跳过 parselmouth）。emotion2vec 权重走 **ModelScope**
+    `iic/emotion2vec_plus_base`，落在 `tools/emotion2vec/.ms-cache`（**不能进 `~/.cache`，
+    沙箱下只读，会报 `Errno 30 Read-only file system`**）；长音频**必须分窗**取嵌入，整条
+    162s 送 utterance 粒度会把分布平均成 neutral，等于没测。
+  - **⚠️⚠️ emotion2vec 分布的窗数陷阱：短音频的"情感分布"是假的，本节曾据此得出并写下
+    一个错误结论（`singing/probe_emo_window.py` 三问实测，2026-08）。**
+    emotion2vec 的 utterance softmax **本身就近 one-hot** —— 真人 162s 的 27 个 6s 窗里
+    **16/27 是 top1>0.99**，中位 top1 = 0.9994。所以"分布"不是模型输出的软概率，而是
+    **窗级 argmax 的经验频率，完全由窗数撑起来**：
+    | | 真人 162s | prod 10.28s |
+    |---|---|---|
+    | win=6/hop=6（旧协议） | 27 窗 → 57.4% neutral | **1 窗 → 100% neutral** |
+    | win=3/hop=0.5（现协议） | 319 窗 → 68.6% neutral | **15 窗 → 62.4% neutral** |
+
+    旧协议下 8-10s 的 TTS 输出只有 **1 窗**，分布结构上只能取 0 或 1，与真人的 27 窗**不是
+    同量纲**。而真人窗级 argmax 里 neutral 本身占 0.556 —— 即"prod 100% neutral"这个观测
+    的显著性是 **p≈0.56，纯噪声**。修复：`EMO_WIN=3.0` / `EMO_HOP=0.5`（重叠取窗），并在
+    报告里打出窗数、`<5 窗` 时直接告警。同时扫过 7 组窗长/步长确认真人分布随窗长只在
+    0.60-0.69 间漂移，不是敏感参数 —— **敏感的只有窗数**。
+    **可迁移的教训**：任何"占比/分布"类指标，先问"这个分布由多少个独立样本构成"。窗数
+    不同的两条音频不能直接比分布，这与本文件反复出现的"未播种采样"是同一类陷阱 ——
+    区别在于未播种至少会在重跑时露出方差，而窗数退化**每次都给出同一个稳定的错误值**，
+    更难发现。
+- **Step-Audio-EditX（3B，`tools/stepaudio/`，2026-08）—— 三轮实测全部负面，路线关闭。**
+  选它的理由是它是唯一能对**已生成音频**做情感/风格后处理的开源模型，本以为可以「不动
+  gpt-ft 音色只补语气」。**这个前提没有成立**：音色代价是过一遍
+  tokenizer→LLM→CosyVoice 重合成链的**架构固定成本**，与编辑标签无关。
+  SIM 一律用 ERes2NetV2 vs `ref_talk_sing` 前 162s 说话段，`prod`（现状 gpt-ft）= **0.8621**：
+
+  | 臂 | SIM | ΔSIM | neutral | happy | 备注 |
+  |---|---|---|---|---|---|
+  | **prod（现状）** | **0.8621** | — | 1.000 | 0.000 | 语气平但音色最像 |
+  | `emotion happy` ×3 | 0.7887-0.7960 | **−0.066…−0.073** | 0.000 | 1.000 | 语气有效但过冲 |
+  | `style gentle` ×2 | 0.7998-0.7999 | −0.062 | 0.994-0.999 | 0.001 | **纯亏：语气没动** |
+  | `style comfort` ×2 | 0.7911-0.8073 | −0.055…−0.071 | 1.000 | 0.000 | **纯亏：语气没动** |
+  | `style warm` ×2 | 0.7982-0.8006 | −0.062…−0.064 | **0.042 / 0.998** | **0.817 / 0.002** | **同标签方向相反** |
+  | `style sweet` ×2 | 0.7934-0.8015 | −0.061…−0.069 | 0.000 | 1.000 | 过冲 |
+
+  - **情感控制本身是有效的**：emotion2vec 分布 100% neutral → 100% happy，F0 std
+    2.254 → 2.52-2.98（真人 2.853），"语气平"确实被解决。**但代价 0.06-0.07 是本工作区
+    所有 prompt 调参幅度（±0.01）的 6-7 倍**，而音色同源是 MV 的主导判据。
+  - **8 个 style 采样的 ΔSIM 全落在 −0.055…−0.073，和 `emotion happy` 实质相同** —— 这就是
+    "代价在架构里不在参数里"的证据，调标签强度救不了。同构于 PC-NSF 那条：即便 0 语义
+    改动，过一遍 vocoder 也掉 SIM。
+  - **强度不可控且不可复现**：拿不到中间态（真人是 27.5% happy），只有"完全不动"或
+    "跳到 82-100%"两种结果；`warm` 两个采样一个 0.817 happy 一个 0.002，**同标签同输入
+    方向相反**。根因是 `tts.py::_generate` 用 `temperature=0.7` 且**上游从不播种** ——
+    与 CFM 未播种、FunASR VAD 未播种同一类陷阱，任何 A/B 必须 `--n 3` 以上。
+  - **零样本克隆：能吃 120s 长参考（远超 GPT-SoVITS 强制的 3~10s），但音色仍不及现状。**
+    `preprocess_prompt_wav` **无任何时长截断**，`wav2token` 分块编码全长；真正的约束是
+    **token 预算**（约 41.6 token/s，与生成共享 `max_model_len`）。7 级阶梯实测：
+
+    | 参考 | input tokens | 输出时长 | CER | 判定 |
+    |---|---|---|---|---|
+    | 6/15/30/60/90s | 287…3985 | 8.3-15.0s | 0.000-0.056 | 可用 |
+    | **120s** | **5330** | **9.96s** | **0.0000** | 可用，**但须 `max_model_len 16384`** |
+    | 150s | 6652 | 36.96s | **6.5000** | **失控** |
+
+    SIM vs 162s 说话段随参考长度基本走平且非单调：6s 0.7357 → 60s **0.8065**（峰）→
+    90s 0.7694 → 120s 0.7959，**全部低于 prod 的 0.8621**。所以「长参考」这个选它的
+    理由也没兑现 —— 能吃进去但并没有更像。
+  - **⚠️ 失败模式是复读而不是报错，判据必须是 CER。** 120s 在默认 `max_model_len=8192`
+    下同样失控（输出 60.36s、CER 8.25），开到 16384 才恢复（9.96s、CER 0.0000）：6652
+    input tokens 后只剩 1540 给生成，余量不足就退化成 `assistant` 特殊 token 复读。
+    ASR 转写是 "assistant assistant..."，而流程 `exit=0`、产物存在、时长只是"偏长"——
+    **能加载 ≠ 能用**。
+  - **别拿公开榜选它**：某 2026 榜把它列第一、称中文情感准确率 81.6%。这与实测不矛盾
+    但会误导 —— 它测"情感改对了吗"（我们实测确认改对了），而问题在音色代价与强度
+    不可控，榜单指标不覆盖这两项。同构于"只盯 SIM 会被骗"。
+  - **CER 在短口白区完全失效**：36 字文本上 prod 与 6 个 Step-Audio 臂 **CER 全为 0.0000**，
+    分不出任何差异。短文案选型不要用 CER（印证既有的"短句区不出吐字差"）。
+- **IndexTTS-2.5（0.8B，`tools/indextts/`，2026-08）—— 一轮 7 臂即定论，路线关闭；且它顺带
+  证伪了整个换模型计划的前提。** 选它的理由是 `emo_vector` 8 维连续可调 + 音色/情感解耦
+  （SeedTTS-zh SS 0.865），本以为能避开 Step-Audio 的重合成音色代价。**代价确实存在，
+  而且各项指标全面劣于现役 prod**（`--ref data/voices/ref_talk_sing.wav --ref-sec 162`，
+  seed 1 固定、7 臂配对）:
+
+  | 臂 | SIM whole | ES | neutral | happy | F0 med(Hz) | 2-8k 占比 |
+  |---|---|---|---|---|---|---|
+  | 真人 162s | — | — | 0.686 | 0.235 | 249.6 | 0.0131 |
+  | **prod（现役 gpt-ft）** | **0.9137** | **0.9833** | **0.624** | **0.376** | 253.3 | 0.0085 |
+  | idx_base（不给情感向量） | 0.8440 | 0.7945 | 0.233 | **0.767** | 256.9 | 0.0061 |
+  | idx_c04（calm=0.4，idx 最佳） | 0.8393 | 0.6005 | 0.049 | 0.951 | 275.4 | 0.0149 |
+  | idx_h08（happy=0.8） | 0.7628 | 0.3581 | 0.000 | 1.000 | **314.5** | **0.0620** |
+
+  - **`base` 臂在完全不给 `emo_vector` 时就已经 happy 0.767**（真人 0.235）。所以按原计划
+    扫 `happy=0.2…0.8` 是**往过冲方向加码**，ES 从 0.79 单调掉到 0.36 —— 扫点方向错了，
+    而错的原因是上面那个被证伪的"prod 100% neutral"。
+  - **情感强度上去的同时亮度跟着爆**：`happy` 0→0.8 让 F0 median 256.9→314.5Hz（真人 249.6）、
+    2-8k 占比 0.0061→0.0620（真人 0.0131，**5 倍**）、LTAS 中高频 +6~+8.5dB。这不是"更清晰"，
+    是亮度过冲；**`emo_vector` 不是纯语气旋钮，它同时搬动音高与谱形**。
+  - SIM 代价 −0.07（0.9137→0.844）与 Step-Audio 的 −0.066…−0.073 是**同一量级**，尽管两者
+    架构完全不同（vLLM+CosyVoice 重合成 vs GPT+s2mel+BigVGAN）。两次独立命中同一数字，
+    支持"换任何外部 TTS 都要先付一笔音色过路费"这个更一般的判断 —— 而现役 gpt-ft 是在
+    本人素材上微调的，这笔费它不付。
+  - **工程上倒是最顺的一个**：纯 PyTorch，无 vLLM，没碰到 Step-Audio 那轮的 UVA / flashinfer /
+    attention backend 任何一个坑。峰值 VRAM **7.76GB/16376MiB**（Step-Audio 是 12.85GB），
+    全精度即可，`use_bf16` 都不必开。加载 50-180s，单臂推理 2.5-5s。
+  - **`normalize_emo_vec` 只被 `webui.py` 调用，`infer()` 不会自动应用** —— 直接传向量就是
+    原始强度。融合式是 `emovec = emovec_mat + (1 − sum(vec)) · emovec_ref`
+    （`infer_v2_5.py:768`），所以 **`sum(vec) > 1` 会给参考音色的情感分量一个负权重**；
+    `run_indextts.py` 对此直接报错。
+  - **上游默认 `do_sample=True, temperature=0.8, num_beams=3` 且不播种。** `run_indextts.py`
+    每臂前重播种，实测同参数两臂 **md5 完全一致** —— 这是 Step-Audio 那轮做不到的（那边
+    `temperature=0.7` 从不播种，同一 `style warm` 标签能给出 0.817 vs 0.002 的相反方向）。
+    任何 IndexTTS A/B 都必须走这个封装，别直接调 `infer()`。
+  - 用法：`source tools/indextts/env.sh` 后
+    `tools/indextts/.venv/bin/python tools/indextts/run_indextts.py --ref REF.wav
+    --text-file intro.txt --out-dir OUT --arm base --arm 'h04:happy=0.4' --seed 1`。
+    权重组装见 `tools/indextts/prepare_ckpt.py`（主权重软链 + 4 份辅助权重下载到
+    `checkpoints/hf_cache/`）。**BigVGAN 不在 ModelScope**（`nvidia/bigvgan_v2_22khz_80band_256x`
+    返回 404），会回落 hf-mirror；且回落路径只下 `bigvgan_generator.pt`、**漏掉
+    `config.json`**，要手工补。w2v-bert-2.0 的 ModelScope 镜像还会多带一个 2.2GB 的
+    `conformer_shaw.pt`（推理不需要，可删）。
 - **语速永远是模型原生 `--tts-speed`（GPT-SoVITS speed，0.6-1.65，<1 慢），不要 ffmpeg atempo。**
   它走 VITS 时长模型把 phoneme 时长缩放（音色/音高不变、节奏自然），而 atempo 是时间拉伸会出
   轻微伪影。实测 0.9 把 34 字口白 7.26s→9.72s（speed 1.0→0.8）量级符合 1/rate。仅 gpt 系生效；
@@ -2729,9 +2903,47 @@ uv run python infer.py --ref path/to/ref.wav --ref-text "参考音频里说的�
 # Sampling / speed / language; -q silences upstream library chatter
 uv run python infer.py -t "测试文本" -o out.wav \
     --lang 中英混合 --top-k 15 --top-p 1.0 --temperature 1.0 --speed 1.0 -q
+
+# 做任何 A/B 都必须固定 --seed（默认 -1 = 不播种），否则差异被采样噪声淹没
+uv run python infer.py -t "测试文本" -o out.wav --seed 1234
 ```
 
 `--lang` / `--ref-lang` take the Chinese literals (`中文`, `英文`, `日文`, `粤语`, `韩文`, `中英混合`, `多语种混合`) because the script forces `language=zh_CN` — see the `dict_language` gotcha below.
+
+##### 两个会让 TTS A/B 静默失效的缺陷（2026-08 修复，都在 `infer.py`）
+
+- **`change_sovits_weights` 是生成器函数，直接调用等于什么都没做 —— 换 `--sovits` 而输出
+  逐位不变。** `inference_webui.py:262` 起的函数体内有 `yield`，所以 `change_sovits_weights(...)`
+  只创建生成器对象，函数体一行都不执行；SoVITS 权重静默停留在模块导入时的默认值。
+  实测 6 个不同权重（girlish_e15_s330 + talksing_s2mix50 的 e4/e8/e12/e16/e20）输出
+  **md5 完全相同**，CER 连 S/D/I 都逐位一致 —— 这个"六臂完全相同"就是唯一的告警信号，
+  不看 md5 只看指标会直接得出"混唱歌无效"的错误结论。`change_gpt_weights` 是普通函数，
+  不受影响，所以 GPT 侧的扫点一直是真的，只有 SoVITS 侧是假的。
+  修复要**同时**满足两个条件，缺一不可：
+  1. **传语言参数**。`:296` 的 `yield` 在 `prompt_language is not None and text_language
+     is not None` 守卫**内部**，`:378` 的 `yield` 在守卫外却引用守卫内才赋值的
+     `prompt_text_update` —— 不传语言参数时唯一可达的 yield 必然抛
+     `UnboundLocalError: local variable 'prompt_text_update' referenced before assignment`。
+  2. **耗尽生成器**（`for _ in ...: pass`）。传了语言参数后 `:296` 会先 yield，而
+     `load_state_dict` 在 `:357`，所以只 `next()` 一次权重仍未加载。
+  验收判据：日志出现 `loading sovits_v2Pro <All keys matched successfully>`，且不同权重的
+  输出 md5 互不相同。
+- **推理侧完全未播种，单枪扫点的结论不可信。** `inference_webui.py:118` 的 `set_seed(42)`
+  是**注释掉的**，AR 解码走 multinomial 采样（`t2s_model.py:716,903`，
+  `temperature=0.6/top_k=20/top_p=0.6`）。已加 `--seed`（默认 `-1` 保持上游随机行为；
+  同 seed 两次输出 md5 一致）。噪声底实测（长文本 436 字，固定 SoVITS 只换 GPT，每臂 3 枪）:
+
+  | arm | r1 | r2 | r3 | 极差 | 3 枪均值 |
+  |---|---|---|---|---|---|
+  | gpt-e5 | 0.0344 | 0.0344 | 0.0298 | 0.0046 | 0.0329 |
+  | gpt-e20 | 0.0275 | 0.0275 | 0.0321 | 0.0046 | 0.0290 |
+  | gpt-e30 | 0.0298 | 0.0206 | 0.0206 | **0.0092** | **0.0237** |
+
+  **CER 噪声底 = 0.0092**。单枪扫点报出的 "gpt-e20 = 0.0161 最优" 是 12 次测量里的最低值，
+  纯属采样运气；按均值排序 e30 最好，**与单枪结论相反**。这与本文件已记录的 CFM 未播种、
+  FunASR VAD 非确定性是同一类陷阱，区别在于这次在**推理侧**。
+  推论：`eval_tts_ckpts.py` 那张 7 臂表（e5…e30 + zs）是单枪且每臂同时换 GPT 与 SoVITS，
+  **既有噪声又有混淆，不能用来选 S1**；固定 SoVITS 只扫 GPT 用 `singing/eval_s1_ckpts.py`。
 
 ### Packaging a trained voice for reuse
 
@@ -2845,6 +3057,86 @@ Pretrained weights, G2PWModel, UVR5 weights, and other assets must be downloaded
 - **Reference audio must be 3–10s or inference dies.** `inference_webui.py:857` raises `OSError: 参考音频在3~10秒范围外，请更换！`. Slice filenames encode sample offsets at the *source* rate, so the implied duration does not match the resampled file — always confirm with `ffprobe -show_entries format=duration` instead of doing arithmetic on the filename.
 - **Hand-edited ASR transcripts must land in `data/voices/<name>.list`.** `stage_asr` writes its raw output to `data/voices/<name>_asr/<name>_sliced.list` and then copies a filtered version to `data/voices/<name>.list`; the `text` stage reads **only** the latter. Editing the `_asr/` copy has no effect and silently trains on uncorrected text.
 - **The ONNX `libcublasLt.so.12` error during inference is harmless.** G2PW's CUDA provider fails to load and falls back to CPU; audio is still produced. Do not chase it.
+- **`.venv` 里的 `users.pth` 可能指向错误的层级，症状是 `ModuleNotFoundError: No module named 'text'`。**
+  `webui.py:50` 用 `now_dir` 写这个文件，所以从 workspace 根（而不是 `GPT-SoVITS/`）跑过一次
+  `webui.py`，里面就会变成 `/home/rookie/voice/GPT_SoVITS` 这种漏掉 `GPT-SoVITS/` 一层的路径。
+  `train.py` 的子进程带 `-s`（不加载 site-packages 的 `sys.path` 注入以外的东西），于是
+  `1-get-text.py` 的 `from text.cleaner import clean_text` 直接失败。正确内容应是
+  `/home/rookie/voice/GPT-SoVITS` 及其 `GPT_SoVITS`/`tools` 子目录。手工跑单个
+  `prepare_datasets/` 或 `tools/` 脚本时同理，需要 `PYTHONPATH=<repo>:<repo>/GPT_SoVITS`。
+
+## S2 混入唱歌素材（2026-08，实验3）：吐字与高频清晰度是真实收益，SIM 的"下降"是刻度错觉
+
+目标是"用唱歌素材增强说话音色"。**结论与假设不同**：收益全在吐字与高频，歌唱域音色反而没改善。
+
+数据集 `talksing_s2mix50`（`singing/build_s2_mix.py`，可配比例与段长）：说话 158.5s（复用
+`girlish_sliced` 已人工校对的 22 条）+ 唱歌 155.1s（33 条），50.5/49.5。**切分必须用唱歌流水线的
+`w_select.fine_cands` 两级切分，不要用 slicer2** —— slicer2 不控上限，把唱段切出 40.9s 的片段，而
+`DistributedBucketSampler` 最高边界 1900 帧 = 38s，超出的样本被 **静默丢弃**（`data_utils.py:1001`
+的 `idx_bucket != -1`）。`fine_cands` 长度闭合在 `[min,max]`，取 `[3,6]s` 正好压进 bucket0
+（0.64-6.00s），实测 0 条越界。S2 从 v2Pro 底模**从头**训练（新 `--name` 目录里没有 G/D，
+`s2_train.py:224` 的 except 分支自然走 `pretrained_s2G/D`；日志确认
+`loaded pretrained s2Gv2Pro.pth <All keys matched successfully>`），20 epoch / batch 6 / 204s。
+
+GPT 固定 `girlish-e30`、只换 SoVITS、`--seed 1234` 全臂配对，长文本 436 字：
+
+| arm | CER | ΔCER | S | D | LTAS L1↓ | 4-8k 塌陷 | SIM vs s01 | SingMOS |
+|---|---|---|---|---|---|---|---|---|
+| exp1 基线 (girlish_e15_s330) | 0.0505 | — | 9 | 11 | 2.81 | **−4.27dB** | 0.7880 | 4.588 |
+| mix_e4 | 0.0413 | −0.0092 | 6 | 11 | 2.38 | −4.04 | 0.7234 | 4.465 |
+| mix_e8 | 0.0390 | −0.0115 | 6 | 10 | 2.46 | −2.34 | 0.7330 | 4.562 |
+| **mix_e12（选定）** | **0.0367** | **−0.0138** | **5** | 10 | **1.83** | **−0.02dB** | 0.7452 | **4.620** |
+| mix_e16 | 0.0367 | −0.0138 | 5 | 10 | 2.45 | −2.00 | **0.7596** | 4.579 |
+| mix_e20 | 0.0367 | −0.0138 | 5 | 10 | 2.85 | −3.46 | 0.7491 | 4.562 |
+
+- **CER −1.4 点超过噪声底 0.0092**，替换错误 S 9→5，吞字 D 基本不动。**e12 起完全饱和**
+  （e12/e16/e20 的 CER 与 S/D/I 逐位相同），所以没必要训到 20 epoch。
+- **清晰度是最干净的信号，且与 CER 独立互证**：4-8k 塌陷 −4.27dB → **−0.02dB**（对齐真人），
+  LTAS L1 2.81 → 1.83，绝对量同向（4-8k 占比 0.00117→0.00308 vs 真人 0.00312、centroid
+  1068→1269 vs 1292、rolloff95 3680→4210 vs 4237）。这就是本文件"口齿不清 = 中高频塌陷"
+  那条签名的正向确认 —— 唱歌素材带来的高频/共鸣信息**体现在清晰度而非 SIM 上**。
+- **语气平没救，且臂间不可分辨**：F0 std 全臂 2.21-2.37 vs 真人 2.853（1.3× 噪声底 0.379，
+  差距真实），但臂间极差 0.155 远小于噪声底；p10-p90 域宽 6.0-6.4 vs 7.30。停顿数 24-27 vs
+  真人 66，与既有结论一致 —— **停顿完全由文本标点决定**，改语气要先改文本不是换 checkpoint。
+- **三个 MOS 互相打架**（SingMOS 选 e12、NISQA 选 base、NISQA-tts 选 e20），不作判据。
+
+### SIM 必须先标定天花板才能解读 —— `singing/eval_sim_ceiling.py`
+
+上表 SIM 的 0.7880 → 0.7452 看着是退步，**实际两臂都已在天花板附近饱和**。同一锚点（s01 6.37s）、
+同一协议（ERes2NetV2 / 3s 非重叠窗 / 余弦）测真人自己：
+
+| 对象 | mean | median | p10 |
+|---|---|---|---|
+| 真人 same-take（旧参考其余片段） | 0.7940 | 0.8071 | 0.6989 |
+| **真人 cross-take（新录音说话段，天花板）** | **0.7538** | 0.7534 | 0.6961 |
+| 真人 cross-domain（新录音唱歌段） | 0.5834 | 0.5998 | 0.4755 |
+| 不同人地板（5 首歌主唱均值） | **0.3567** | — | — |
+
+- **基线 0.7880 高于真人自己的跨场次分数 0.7538**，已贴近 same-take 上界 0.7940 —— 这个 SV 模型
+  分不出"合成 vs 同一人另一场录音"。本文件早先记录的 `zs 0.7553 vs 本人切片 0.7511` 是同一现象。
+- 可判别区间是 0.7538 − 0.3567 = **0.397**，臂间那 0.065 只占 **16%**；最差的 mix_e4（0.7234）
+  离天花板仅 0.030，离地板还有 0.367。**0.72 以上在听感上够用**。
+- **cross-domain 才是真落差**：真人自己的唱歌段对说话锚点只有 0.5834，比说话段低 0.17（同人同
+  场次，仅发声方式不同）。所以上一轮"混唱歌后 `SIM_sing` 从 0.5497 掉到 0.5056-0.5334"不该按
+  字面读 —— 那一列的分母本身就低。
+- **教训**：任何"SIM = 0.75 够不够"的问题，先花 2 分钟跑 `eval_sim_ceiling.py` 量天花板与地板，
+  否则无法判断一个差值是真实退化还是饱和区抖动。这与本文件"不同锚点下 SIM 绝对值不可比、必须
+  双向检验"是同一条方法论。
+
+### 三条附带结论
+
+- **S2 训练完全不读 S1 权重**（`s2_train.py` 里没有任何 S1/GPT/T2S 引用）。两者的唯一耦合是
+  `3-get-semantic.py` 用 `pretrained_s2G`（底模）+ `freeze_quantizer: true` 生成 semantic token，
+  方向与"S1 影响 S2"相反。所以"先选最好的 S1、再拿它训 S2"在代码上没有传导路径 —— 换任何 S1
+  epoch，S2 的训练结果逐位相同。S1 的选择只在**推理配对**时生效，可与 S2 训练并行做。
+- **不训 S1 也必须校对唱歌标注**：S2 的 `TextEncoder` 仍吃 phoneme 序列
+  （`models.py:957` `enc_p(quantized, y_lengths, text, text_lengths, ge512)`，内部经 `MRTE` 与
+  SSL 对齐）。唱歌 ASR 的错误率远高于说话 —— 33 条里剔了 9 条：拖腔导致的机械叠字
+  （`结了结了时间时间。时间。嗯。`）、切点落词中的句首残缺（`的温存,…`）、明显误识
+  （`我嘟的一声,切的比你说分手`）。字/秒可作为筛选量：唱歌中位 ~1.8 vs 说话 4.04，
+  `<1.0` 的基本都是 ASR 漏字或纯拖腔。
+- **唱歌段边界是 165.166s**（`ref_talk_sing.wav`）：`ref_sing_only.wav` 就是它从该点起的同一段
+  录音，互相关峰 49σ、与时长差 165.54s 吻合。说话段用 0-162s（本文件既有口径）。
 
 ## Small-dataset training gotchas (source-verified)
 
