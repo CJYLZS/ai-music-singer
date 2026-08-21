@@ -74,3 +74,32 @@ venv/
 # source-norm 实验（源音色归一化预处理）
 /.tmp/
 /tools/source_norm/.venv/
+
+# ---- 鼻音调研素材与缓存（非代码，doc/PDF/草稿/临时 session）----
+/.nasref/
+/.nasresearch/
+/.npm-cache/
+/natmos_report.json
+
+# ---- 工具权重缓存（封装脚本与上游 repo 仍跟踪，见 a25rig 同款策略）----
+# emotion2vec：本工作区只放权重缓存（.ms-cache），代码走 GPT-SoVITS venv 的 funasr
+/tools/emotion2vec/
+# indextts：保留 env.sh / prepare_ckpt.py / run_indextts.py 与 repo/（独立 git 上游），
+# 忽略权重与各类缓存/venv。
+/tools/indextts/checkpoints/
+/tools/indextts/.ms-cache/
+/tools/indextts/.torch-home/
+/tools/indextts/.venv/
+/tools/indextts/.uv-cache/
+/tools/indextts/.uv-python/
+/tools/indextts/.numba-cache/
+/tools/indextts/.triton-cache/
+/tools/indextts/.xdg-cache/
+/tools/indextts/.xdg-config/
+/tools/indextts/.hf-home/
+/tools/indextts/.mpl/
+/tools/indextts/.clone*.log
+!/tools/indextts/env.sh
+!/tools/indextts/prepare_ckpt.py
+!/tools/indextts/run_indextts.py
+!/tools/indextts/repo/
