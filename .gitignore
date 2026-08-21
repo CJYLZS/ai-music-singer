@@ -102,4 +102,6 @@ venv/
 !/tools/indextts/env.sh
 !/tools/indextts/prepare_ckpt.py
 !/tools/indextts/run_indextts.py
-!/tools/indextts/repo/
+# repo/ 是独立 git 上游（IndexTTS-2.5），不当 gitlink 跟踪，获取方式见 AGENTS.md；
+# 与 a25rig 同策略：本仓库只留封装脚本。
+/tools/indextts/repo/
