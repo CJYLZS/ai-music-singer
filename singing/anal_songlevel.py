@@ -29,7 +29,7 @@ def parse_eval(song):
                     corr_pitch_sim=np.nan)
     t = open(p, errors='replace').read()
     m = re.search(r'overall SIM:\s*mean=([\d.]+)\s+median=([\d.]+)', t)
-    c = re.search(r'corr\(pitch distance, SIM\)\s*=\s*(-?[\d.]+)', t)
+    c = re.search(r'corr\(pitch distance, SIM\)\s*=\s*([+-]?[\d.]+)', t)
     return dict(sim_mean=float(m.group(1)) if m else np.nan,
                 sim_median=float(m.group(2)) if m else np.nan,
                 corr_pitch_sim=float(c.group(1)) if c else np.nan)
