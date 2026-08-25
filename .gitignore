@@ -8,6 +8,11 @@
 /tools/voxcpm2/
 /tools/hifiglot/
 /tools/vevo2/
+/tools/yingmusic_singer/
+# SOFA / GAME 也是上游浅克隆 + 权重（各 2.9G / 5.5G）。SOFA 的对齐器仍在用，
+# GAME 是否定结论（见 docs/svs-manual-calibration.md），获取方式见 AGENTS.md。
+/tools/sofa/
+/tools/game/
 /echomimic3/
 # a25rig 是 CJYLZS/Anime2.5DRig 分支 offline-render，单独提交到它自己的 remote。
 # 不做 submodule：没有 .gitmodules 的裸 gitlink 对 clone 的人毫无用处，
@@ -35,6 +40,9 @@
 /batch_run*.log
 /check_batch_progress.sh
 /listen_*/
+# singing/probe_*.py 与各次诊断实验渲染出来的音频（脚本与结论入库，wav 不入库）
+/diag_*/
+/regprompt_*/
 # 单次实验的驱动脚本：歌名/参考/输出名全部硬编码，换歌要整个重写，
 # 复现所需的信息在 docs/ 的报告里。对应的评测脚本 singing/eval_*.py 是通用的（带
 # --song/--lengths），入库；驱动脚本不入库。

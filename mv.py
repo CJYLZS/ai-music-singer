@@ -537,7 +537,7 @@ def stage_subs(cfg: Cfg) -> None:
     run(["ffmpeg", "-v", "error", "-y", "-i", cfg.video_path,
          "-vf", f"ass={cfg.ass_path}",
          "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-c:a", "copy",
-         cfg.subvideo_path], stage="subs", timeout=7200)
+         cfg.subvideo_path], stage="subs", timeout=7200, env=fenv)
     ds = duration(cfg.subvideo_path)
     log.info(f"  -> {cfg.subvideo_path}  ({ds:.2f}s, 源 {dur:.2f}s)")
 

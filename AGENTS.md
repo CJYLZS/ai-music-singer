@@ -62,12 +62,16 @@ voice/
 ├── tools/pcnsf_hifigan/  PC-NSF-HiFiGAN 44.1k weights (config.json + model.ckpt), 2025.02 release
 ├── tools/yingmusic/  YingMusic-SVC (zero-shot SVC, seed-vc fork + F0-aware timbre adaptor).
 │                     .venv = torch 2.6+cu124. Experimental; see "SVC engine A/B" below.
-├── tools/voxcpm2/    VoxCPM2 TTS (voice design + style-controlled cloning) 与本轮移调实验脚本.
-│                     .venv = torch 2.6+cu124. 结论是否定的，见「参考素材音域扩展」一节
-├── tools/vevo2/      Vevo2 (Amphion) 零样本 SVC，speech+singing 联合 tokenizer.
-│                     .venv = torch 2.6+cu124. 结论是否定的（whisper 30s 硬顶），见 SVC engine A/B #2
-├── tools/hifiglot/   HiFi-Glot 显式共振峰合成（F1-F4 可控）.
-│                     .venv = torch 2.6+cu124. 结论是否定的，见「共振峰」一节
+├── tools/yingmusic_singer/  YingMusic-Singer-Plus (零样本 SVS，annotation-free melody).
+│                     .venv = torch 2.6+cu124. 见「YingMusic-Singer-Plus」一节
+│  ⚠️ 以下 5 个目录（voxcpm2 / vevo2 / hifiglot / stepaudio / indextts）**已从磁盘删除**
+│     以回收空间 —— 全部是已否决的方案，条目保留是为了不重复踩坑。要复现按各节说明重装。
+├── tools/voxcpm2/    (已删) VoxCPM2 TTS (voice design + style-controlled cloning).
+│                     结论是否定的，见「参考素材音域扩展」一节
+├── tools/vevo2/      (已删) Vevo2 (Amphion) 零样本 SVC，speech+singing 联合 tokenizer.
+│                     结论是否定的（whisper 30s 硬顶），见 SVC engine A/B #2
+├── tools/hifiglot/   (已删) HiFi-Glot 显式共振峰合成（F1-F4 可控）.
+│                     结论是否定的，见「共振峰」一节
 ├── tools/stems4.py   4-stem separation (drums/bass/other/vocals) via BS-RoFormer 4stems_ft.
 │                     Uses GPT-SoVITS venv + uvr5 weights; see "Separation notes".
 ├── tools/singmos/    SingMOS naturalness MOS 打分（score_naturalness.py）+ 指标敏感性探针
@@ -87,6 +91,16 @@ voice/
 │                     辅助权重下载），run_indextts.py = 多臂推理封装（**每臂重播种**）.
 │                     py3.11 uv venv（torch 2.8+cu128）。峰值 VRAM 7.76GB.
 │                     **结论是否定的（一轮 7 臂），见「前奏口白」节 IndexTTS 条**
+├── tools/sofa/       SOFA 歌声强制对齐器（qiuqiao/SOFA v1.0.3）：wav + 无调拼音 .lab
+│                     → 音素级时间戳。py3.10 venv（torch 2.13cu130 + torchaudio 2.11
+│                     + torchcodec + librosa≥0.11，三个坑见 docs/svs-manual-calibration.md）.
+│                     权重必须对上代码版本：weights/SOFA_model_mandarin_byBaiShuo（v2.1,
+│                     CC-BY-NC-SA）；官方 v0.0.1 是重构前架构，装不上.
+│                     原用途（替 SVS 的 ASR 词时间轴）随 SVS 路线一起废弃，但**对齐
+│                     器本身是好的**（坏休止 28.3s→3.5s）：字幕/口型/按句切段可复用
+├── tools/game/       GAME (openvpi) 音符转写。**结论是否定的**：音准/边界与 ROSVOT
+│                     打平，端到端更差（GPE 42.7 vs 37.9 / CER 0.43 vs 0.13），
+│                     标注风格与 SoulX 训练集失配。见 docs/svs-manual-calibration.md
 ├── a25rig/           Anime2.5DRig (MIT) fork + 离线渲染补丁: PSD → 逐帧 PNG（口型吃
 │                     make_cues.py 时间轴）. driver/ 是 WSL 内无头 Chrome 驱动.
 │                     入口 a25rig/render.sh（mv.py render 阶段也在调；必须用它，
@@ -98,8 +112,12 @@ voice/
 │                     split_visemes.py（九宫格→9 张 sprite）、get_lyrics.py（抓词缓存
 │                     成同名 .lrc）、make_ass.py（→ 双行滚动 KTV 字幕）。GPT-SoVITS venv
 ├── singing/          sing.py 的 worker 脚本（w_*.py = 各阶段，eval_*.py = 各评测协议）.
-│                     w_select_svs.py 从 SVS 输出选 prompt、eval_dual.py 双锚点评测，
-│                     两者只服务 --svc-prompt svs 臂（素材音域不足时的备选，非默认）
+│                     probe_*.py = 一次性诊断实验（不进流水线，各自 docstring 写假设）.
+│                     **svs_*.py 全部属于已放弃的 SVS 路线**（见 docs/
+│                     svs-manual-calibration.md 顶部的否决说明），保留是因为
+│                     svs_edit.py（metadata↔MIDI 无损往返，8/8 逐字段等价）与
+│                     svs_qc.py 在出现真正吃乐谱的模型时可复用；不要再往这条路投入.
+│                     w_select_svs.py / eval_dual.py 只服务 --svc-prompt svs 臂（非默认）
 ├── data/             Shared audio. voices/ = speaker source material; songs/ = songs, stems, SVC output
 ├── docs/             调研/实验文档（voice-beautify-survey.md、source-timbre-normalization-survey.md 等）
 ├── logs/             GPT-SoVITS training features + checkpoints
@@ -1404,6 +1422,18 @@ HQ-SVC = 解耦 codec + EVA 模块 + DDSP/diffusion 渐进生成，主打低资�
 - **HQ-SVC loses ~0.08 mean SIM to SoulX in both protocols** — worse timbre similarity — but its windows are *more internally consistent* (drift 0.0748 vs 0.0957, best worst-case). It sounds "stable but off-timbre"; SoulX sounds closer to the ref with more local jumps. For speech→singing cross-domain this confirms zero-shot SVC quality is still dominated by pretraining scale (SoulX: 42k hours; HQ-SVC: <80h). **Eliminated by ear (2026-08): the timbre gap is clearly audible on the full song; do not wire HQ-SVC into `sing.py`.** Keep the A/B files only as reference data.
 - Its selling point is **low-resource training** (single consumer GPU, <80h data), not zero-shot inference quality — training code was still not released as of 2026-08, so it's inference-only for now.
 - Setup gotchas (repo dir + weights removed 2026-08 to free 15G; re-download if ever needed): ships a ready-made conda env `environment.tar.gz` (4.7GB → unpack to `venv/`, torch 2.0.1+cu118, python3.9); weights on HF `shawnpi/HQ-SVC` (`utils/pretrain/*`: 250000_step_val_loss_0.50.pth 241M + ns3_facodec_* 450M + rmvpe 368M + nsf_hifigan 57M). `utils/pretrain/nsf_hifigan/` needs `config.json` copied from `configs/hifigan_config.json` (not shipped in place). `LD_LIBRARY_PATH` must be unset before running (`unset LD_LIBRARY_PATH`). Local CLI wrapper: `tools/HQ-SVC/cli_infer.py` (source + 1..N targets, `--shift 0` to keep melody; sys.path must use `append`, not `insert`, or `utils` shadows itself). RTF ≈ 0.05 on 16GB (10 diffusion steps).
+
+### YingMusic-Singer-Plus (tools/yingmusic_singer/, 2026-08): 零样本 SVS，免 MIDI 转录 — 环境已搭好，待 A/B
+
+ASLP@NPU + GiantNetwork 的全扩散 SVS（[arXiv 2603.24589](https://arxiv.org/abs/2603.24589)）。输入 = 音色参考干声 + 原唱旋律干声 + 歌词文本，**不需要 MIDI 转录**——SOME 编码器直接从原唱音频在线提取帧级音高/边界条件，正好绕开 SoulX score 模式的 ROSVOT 转录误差瓶颈。架构：Stable Audio 2 VAE（44.1kHz 立体声，2048× 下采样 ≈21.5 帧/s）+ SOME 编码器 + 中英 IPA 分词器 + F5-TTS 式 DiT-CFM（22 层/dim1024），共 ~727M 参数。输出时长严格等于 melody 音频时长。
+
+- Setup：uv venv py3.10 + torch 2.6.0+cu124（与 SoulX venv 同代，但独立安装）；依赖按 requirements.txt pin 装。权重走 ModelScope `ASLP-lab/YingMusic-Singer-Plus`（HF 同仓库重定向，~29MB/s）：`download_weights.sh` = 固定 .part 名 + curl -C - 续传 + sha256 校验（echomimic3 模式）。最小推理集只有 **model.safetensors 2.9GB**——它是 ModelHubMixin 整体 state_dict，含 CFM+VAE+SOME 全部组件；单独的 VAE/SOME ckpt 是训练路径用的（也下了，共 4GB）。
+- 入口 `run_infer.py`（本地写的精简 CLI）：CWD 必须是仓库根（`src.*` 导入），模型从本地 `hf_local/`（config.json + safetensors 软链）加载，不走 HF hub。冒烟已通：官方 ZH_01 example，输出 6.69s 与 melody 6.67s 一致，fp32 RTFx **3.08×** @4070 Ti SUPER，无 flash-attn 也正常（自动退 SDPA）。
+- 上游三个坑（README 与代码脱节）：① README 的入口 `infer.py`/`batch_infer.py` 不存在，真实入口是 `infer_api.py`/`app_local.py`/`inference_mp.py`；② `initialization.py --task infer` 只下 MelBandRoformer，而 config 里 VAE/SOME 指向本地 `ckpts/` 相对路径，首跑会缺文件；③ espeak-ng 系统依赖用 pip 包 `espeakng-loader` 免 root 解决——必须设 `PHONEMIZER_ESPEAK_LIBRARY` 和 **`ESPEAK_DATA_PATH`**（指向包含 espeak-ng-data 的父目录），后者绕开 so 里烧死的构建机路径，且要在 import src.* 之前设。
+- 关键参数默认 seed=666 / cfg=3.0 / nfe=32（固定种子可复现）；歌词用 `|` 分句；`lrc_align_mode=sentence_level` 把每句均匀铺在 span 上（DiffRhythm 式）。注意 SoulX 的"cfg 默认 3 太高"结论**不能直接搬**——那是 mel-CFM 条件是 whisper 特征的机制，这里是 latent-DiT + 音高条件，需单独扫。
+- 待验证的两个核心问题：① timbre_ref 官方示例全是唱歌片段，**说话参考（prompt.wav）能否当音色锚**是对我们最关键的实验点（g2p 只需要 ref_text 文本，说话参考理论可用）；② 无内置分段，250s+ 整曲一次生成的显存/质量要实测，大概率要借 `svs_song.py` 的段级思路自己切再拼。
+- 协议：主体 CC BY 4.0，VAE 部分继承 Stability AI Community License（**非商业**）。社区情报（issue #2）：有人用 GAME 提取 MIDI 条件微调此模型可纯乐谱生成 ~50s；其听感评价"SoulX SVS 弱于本模型、SoulX SVC 弱于 Seed-VC"（主观，未复现）。
+
 
 ### Reference material pitch extension (2026-08): TTS voice design vs neural vocoder transposition
 

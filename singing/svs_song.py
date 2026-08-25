@@ -33,8 +33,15 @@ import numpy as np
 
 
 def build_meta(wav: str, save_dir: str, language: str, device: str,
-               max_merge_ms: int, tag: str) -> tuple[str, str]:
-    """跑 SoulX 预处理，返回 (metadata_path, cut_wav_dir)。"""
+               max_merge_ms: int, tag: str, sofa: bool = False
+               ) -> tuple[str, str]:
+    """跑 SoulX 预处理，返回 (metadata_path, cut_wav_dir)。
+
+    `sofa=True` 时在预处理之后**原地**把词时间轴换成 SOFA 的（默认对 target 开）：
+    上游的音符边界被 `regulate_real_note_itv` 吸附到 ASR 词时间上，那是校准待办的
+    主要来源。实测爱笑的眼睛待办 104→49 条、必改 30→9 条，详见
+    docs/svs-manual-calibration.md。原 metadata 备份成 `metadata_asr.json`。
+    """
     from preprocess.pipeline import PreprocessPipeline
     import librosa
     import soundfile as sf
@@ -58,6 +65,12 @@ def build_meta(wav: str, save_dir: str, language: str, device: str,
         )
         pipe.run(mono, vocal_sep=False, max_merge_duration=max_merge_ms,
                  language=language)
+
+    if sofa and not os.path.exists(os.path.join(save_dir,
+                                                "metadata_asr.json")):
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import svs_v3_build
+        svs_v3_build.refine(meta_path, language=language, device=device)
 
     with open(meta_path, encoding="utf-8") as f:
         metas = json.load(f)
@@ -151,6 +164,11 @@ def main() -> None:
     ap.add_argument("--cfg", type=float, default=None,
                     help="CFM 的 CFG 引导强度。不给则用 config.infer.cfg（上游 3.0）")
     ap.add_argument("--max-merge-ms", type=int, default=20000)
+    ap.add_argument("--target-meta", default="",
+                    help="用指定的 metadata 当乐谱（手工校准后的 tuned 臂）")
+    ap.add_argument("--no-sofa", action="store_true",
+                    help="不用 SOFA 重做词时间轴（默认开，见 docs/"
+                         "svs-manual-calibration.md；待办 104->49 条）")
     ap.add_argument("--limit-segments", type=int, default=0,
                     help=">0 只跑前 N 段（先验证流程再跑整首）")
     ap.add_argument("--sr", type=int, default=24000)
@@ -169,9 +187,19 @@ def main() -> None:
     os.makedirs(args.out_dir, exist_ok=True)
 
     # ---- 1. 目标侧: 从原唱干声自动转录 MIDI + 歌词 ----
-    tgt_meta_path, tgt_dir = build_meta(
-        src, os.path.join(args.out_dir, "target"), args.language,
-        args.device, args.max_merge_ms, "target")
+    if args.target_meta:
+        # 手工校准后的 metadata（svs_edit.py import 的产物）。仍要跑 build_meta，
+        # 因为切段 wav / *_f0.npy / mono.wav 是合成的必要输入，只是最后换掉乐谱。
+        build_meta(src, os.path.join(args.out_dir, "target"), args.language,
+                   args.device, args.max_merge_ms, "target",
+                   sofa=not args.no_sofa)
+        tgt_meta_path = args.target_meta
+        tgt_dir = os.path.join(args.out_dir, "target")
+        print(f"[target] 改用手工校准的乐谱: {tgt_meta_path}")
+    else:
+        tgt_meta_path, tgt_dir = build_meta(
+            src, os.path.join(args.out_dir, "target"), args.language,
+            args.device, args.max_merge_ms, "target", sofa=not args.no_sofa)
 
     # ---- 2. prompt 侧 ----
     import librosa
