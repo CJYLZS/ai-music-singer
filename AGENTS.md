@@ -3320,7 +3320,40 @@ Non-obvious behaviors that materially change how training should be configured:
 - **webui's own defaults are the sane baseline**, not the values in the config templates. `webui.py:124-127` for non-v3/v4: `default_sovits_epoch = 8`, `save_every = 4`, `max_sovits_epoch = 25`. The `epochs: 100` sitting in `s2v2Pro.json` is not a recommendation.
 - **v2Pro vs v2ProPlus differ only in vocoder width.** Configs differ by two lines (`upsample_initial_channel` 512→768, first kernel 16→20); all 19M extra params are in the decoder (14.9M→33.8M), and both share the same GPT base (`s1v3.ckpt`). They take identical code paths (`models.py:623` `v2pro_set`). Expect no gain on timbre or prosody — only potentially on waveform quality, and only if the source material actually has high-frequency content to reconstruct.
 
-## 漏音检测与局部修复（2026-08，雨爱实测）
+## 主歌低音段与泄漏：2026-08 定位 + 最小验证方案
+
+用户观察「副歌好、主歌/导歌差；情歌/云烟成雨最好」→ 三路调查落档：
+跨歌数据 `docs/song-quality-analysis.md`，低音段实验补打分
+`docs/lowregister-rescore.md`（四个 probe 当时只渲染没记结论，08-25 补测），
+文献调研结论在下面短清单。要点先行：
+
+1. **主歌差是真的但只对自然度**：低音三分位 ΔMOS +0.29（12/14 歌正），
+   集中在冬眠/云烟成雨/陪你看星星；绿色/爱的回归线反向。**泄漏与音区无关**
+   （Δexcess≈0）——「弱化原唱特征」救的是泄漏，救不了主歌自然度，两条杠杆要分开。
+2. **低音差的真因不是缺低 F0，是低音区缺唱歌域素材**（亲亲 34-54s 补打分）：
+   音域对齐的 prompt 只有 +0.029 A；把 prompt 里低音区的说话素材换成唱歌素材
+   （singlow）+0.135 A、MOS 零代价；PC-NSF **向下**移调补带（downext，34s
+   med 230Hz）+0.151 A、C 全场最低、MOS 打平 —— 最佳性价比。
+   pitchauto(+12) 最大 +0.223 但 MOS −0.26。全部 CER 边际（零吞字）。
+3. **混响尾巴前提坐实**：湿 lead 句尾 +300ms 不降反升 +1.4dB；RMVPE 把
+   **30% 的有声帧**落在尾巴上。tailgate（F0 置零）方向全对（excess −57%，
+   win 83→100%）但它静音了区间 24%，SingMOS −0.55 —— 药方太猛不可上线，
+   正确形态是对 lead 做 WPE/de-echo（不碰 F0 不静音）。
+4. **probe 基线有结构性缺陷**：probe 只转 22s 隔离切片（PAD=2s），没有全曲
+   分段上下文，base A=0.6134 vs 成品同区间切片 0.7404（差 0.127）。臂间对比
+   有效，绝对增益不能外推到流水线；上流水线前必须先复现 base=成品。
+
+**文献短清单**（详见对话记录）：推理期扰动冻结 whisper 无先例（NANSY/
+ContentVec/FreeVC 的信息扰动全是训练侧）；换内容编码器/层对 CFM 是 OOD
+（mean-shift 同类）；StreamVC 显式白化 F0 —— 我们的连续 RMVPE 微韵律是
+第二条没查过的泄漏通道；RVC FAQ 把 index_rate 定义成防泄漏旋钮、so-vits
+cluster 同族。**最小验证排序**：① downext 进 w_ext.py（现在只填高带）→
+冬眠/去有风/亲亲验证；② lead 先 WPE/de-echo 再进特征（triad excess 按
+句尾分桶看）；③ kNN 簇心替换 / 按段自适应 α（各一晚）。长线：whisper 末层
+LoRA adapter + GRL 判别器 + 对原特征蒸馏（CFM 冻结，唯一可能 >+0.02 的项）。
+已否决勿重跑：mean-shift、换编码器、时序连续性重选、继续扩池、F0 门控上线。
+
+
 
 **检测：1s 单模型逐窗不可靠，必须 3s + 双模型共识 + 持续性。** 同一协议（窗口 vs
 全局锚点、excess/margin、5 个 impostor）下 ERes2NetV2 与 CAMPPlus（`eval_leak_campplus.py`，
