@@ -254,6 +254,9 @@ class Cfg:
     # 雨爱配对 A/B（新素材, 统一锚点, seed 1234）：+0.0398 (55/69, p<1e-4)，旧锚点复核
     # +0.0321 (56/69) 方向一致；建议移调 +6 -> +2，覆盖 37% -> 88.2%。
     anchor_min_ratio: float = 1.0
+    ext_low_fill: float = 0.0   # >0: 预留 N 秒强制填 prompt 低音区（唱歌域素材），
+    # 见 docs/lowregister-rescore.md —— 主歌低音差的真因是低音区只有说话素材，
+    # downext prompt 实测 A +0.151 且 MOS 零代价。默认 0 = 关（旧行为）。
     ext_max_shift: int = 8   # ext 单段最大移调半音。原默认 5，2026-08 A/B 3首
     # 结论：ms=8 在复用未饱和的歌上解锁新源段（1.37-1.41×→1.10×），在饱和的歌上
     # 扩展高音格覆盖，3/3 全正（+0.003-0.007，p<0.01）。见 AGENTS.md「ext 移调上限扩展」。
@@ -651,6 +654,7 @@ def stage_ext(cfg: Cfg) -> None:
          "--seedvc-dir", seedvc_out,
          "--shifter", cfg.ext_method,
          "--anchor-min-ratio", str(cfg.anchor_min_ratio),
+         *(["--low-fill-sec", str(cfg.ext_low_fill)] if cfg.ext_low_fill > 0 else []),
          "--max-shift", str(cfg.ext_max_shift),
          "--div-weight", str(cfg.ext_div_weight),
          "--max-sec", str(cfg.max_sec),
@@ -1144,6 +1148,11 @@ def main() -> None:
                     help="ext 阶段单段最大移调半音数（默认 8）。2026-08 A/B 3 首歌：ms=8 vs ms=5 全正 "
                          "(+0.003-0.007, p<0.01)，机制是解锁低音段参与高音格竞争，唯一源段 17→21，"
                          "复用 1.37×→1.10×。见 AGENTS.md「ext 移调上限扩展」")
+    ap.add_argument("--ext-low-fill", type=float, default=0.0,
+                    help=">0 时从 ext 预算里预留 N 秒强制填 prompt 低音区（唱歌域素材，"
+                         "PC-NSF 向下移调）。主歌低音差的真因是低音区只有说话素材 —— "
+                         "亲亲 34-54s 实测 downext prompt A +0.151 / MOS 零代价，"
+                         "见 docs/lowregister-rescore.md。默认 0 = 关")
     ap.add_argument("--select-method", default="greedy",
                     choices=["cov_anchor", "cov_only", "satisfice", "greedy"],
                     help="prompt 选段求解器（默认 greedy = 两阶段贪心）。cov_anchor/cov_only/"
@@ -1314,6 +1323,7 @@ def main() -> None:
               gain_alpha=args.gain_alpha,
               semitone_shift=args.semitone_shift, ext_method=args.ext_method,
               anchor_min_ratio=args.anchor_min_ratio,
+              ext_low_fill=args.ext_low_fill,
               ext_max_shift=args.ext_max_shift,
               ext_div_weight=args.ext_div_weight,
               ext_exclude_anchor=args.ext_exclude_anchor,

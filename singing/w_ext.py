@@ -196,6 +196,15 @@ def main() -> None:
                          "详见 singing/ext_milp.py")
     ap.add_argument("--cov-target", type=float, default=0.90,
                     help="--select-method satisfice 时的覆盖率目标（默认 0.90）")
+    ap.add_argument("--low-fill-sec", type=float, default=0.0,
+                    help=">0 时从总预算里预留 N 秒，主填带循环之后强制填进「锚点中位 F0 "
+                         "-(--low-cut-st) 半音以下」的频段格（按歌曲在这些格的时间占比分配）。"
+                         "动机：主歌低音段差的真因是 prompt 低音区只有说话素材——"
+                         "亲亲 34-54s 补打分实测 downext prompt A +0.151 且 MOS 零代价"
+                         "（docs/lowregister-rescore.md）。锚点相应裁短以腾出预算")
+    ap.add_argument("--low-cut-st", type=float, default=2.0,
+                    help="低音格判定：格中心低于 锚点medF0 × 2^(-N/12) 才参与低音填充"
+                         "（默认 2.0 半音）")
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
     max_shift = args.max_shift
@@ -244,7 +253,11 @@ def main() -> None:
                        sr_out, F0Extractor, librosa, sf)
 
     # ---- 1. 原始 prompt 作锚点，必要时裁剪到 anchor_min_ratio ----
+    # 低音填充预留：先于锚点 cap 计算预留量，把锚点裁短以腾出预算。
+    low_fill = max(0.0, min(args.low_fill_sec, args.max_sec - 5.0))
     anchor_cap = args.max_sec * args.anchor_min_ratio
+    if low_fill > 0:
+        anchor_cap = min(anchor_cap, args.max_sec - low_fill)
     if anchor_dur > anchor_cap:
         keep = int(anchor_cap * sr_out)
         anchor = anchor[:keep]
@@ -301,24 +314,13 @@ def main() -> None:
     used_copies: dict[tuple[int, int], bool] = {}
     used_src: dict[int, int] = {}      # 源段 idx -> 已用次数（多样性惩罚用）
     used_sec = 0.0
-    order = np.argsort(-need_sec)             # 缺口大的格先填
+    filled_by_grid: dict[int, float] = {}
 
-    for gi in order:
-        if need_sec[gi] < 0.01:
-            continue
+    def grid_avail(gi: int) -> list[tuple]:
+        """该格的候选按「落格优先 + 移调量小 + 离格中心近」预排序的候选表。"""
         g_lo = grids[gi]
         g_hi = g_lo * 2 ** (GRID_SEMI / 12)
         g_center = float(np.sqrt(g_lo * g_hi))
-        filled = 0.0
-        # 该格的候选按「移调量 + 复用惩罚」升序。
-        # 移调越小音色损失越小（AGENTS.md 逐段扫点: 0.014-0.020 SIM/半音，且每个
-        # 输出音高桶内 corr(|shift|,SIM) 都在 -0.76..-0.99）——但只按 |shift| 排会把
-        # 素材池锁死在 med 最高的极少数段上: 实测绿色池有 143 段/95.6s，med>=290Hz
-        # 的只有 15 段/7.7s，要填 13s 预算必然复用 2.2x，28 个移调段只来自 13 个源段。
-        # div_weight 把「复用一次同源段」折算成等价半音数，让算法可以用更大的移调换
-        # 更多不同的源段（音素多样性）。0 = 旧行为。
-        # 落不进本格的段允许"尽力靠近"（钳到 max_shift 后取最接近），否则素材
-        # med 上限不足时高音格会完全空掉——实测 440-494Hz 格因此只补到 0.3s/2.1s。
         avail = []
         for c in pool:
             raw = 12 * np.log2(g_center / c["med"])
@@ -329,30 +331,73 @@ def main() -> None:
             inside = g_lo <= reached < g_hi
             avail.append((0 if inside else 1, abs(sh),
                           abs(12 * np.log2(reached / g_center)), c, sh))
-        # 贪心逐个取：复用惩罚随 used_src 变化，故每次重算 cost 而非一次性排序
-        while filled < need_sec[gi] and used_sec < budget and avail:
-            best_i, best_key = None, None
-            for i, (ins, ash, dist, c, sh) in enumerate(avail):
-                if (c["idx"], sh) in used_copies:
-                    continue
-                if used_sec + c["dur"] > budget:
-                    continue
-                # 排序键: 先要"落进本格"的，再按 移调量+复用惩罚+锚点重复惩罚、离格中心近。
-                # 锚点惩罚只在同格内比较时起作用（ins 优先级更高），所以高音格里
-                # 只有锚点段能 inside 时它仍会被选中 —— 这正是分层的关键。
-                key = (ins, ash + args.div_weight * used_src.get(c["idx"], 0), dist)
-                if best_key is None or key < best_key:
-                    best_key, best_i = key, i
-            if best_i is None:
-                break
-            _, _, _, c, sh = avail.pop(best_i)
-            used_copies[(c["idx"], sh)] = True
-            used_src[c["idx"]] = used_src.get(c["idx"], 0) + 1
-            plan.append((c, sh, int(gi)))
-            filled += c["dur"]
-            used_sec += c["dur"]
-        if filled > 0:
-            print(f"  格 {g_lo:.0f}-{g_hi:.0f}Hz: 需 {need_sec[gi]:.2f}s 实补 {filled:.2f}s")
+        return avail
+
+    def greedy_fill(needs: dict[int, float], sec_cap: float) -> float:
+        """对 {格idx: 待补秒} 从大缺口到小缺口逐格贪心填充，返回实补总秒数。
+
+        贪心逐个取：复用惩罚随 used_src 变化，故每次重算 cost 而非一次性排序。
+        排序键: 先要"落进本格"的，再按 移调量+复用惩罚、离格中心近。
+        """
+        total = 0.0
+        for gi in sorted(needs, key=lambda g: -needs[g]):
+            need = needs[gi]
+            if need < 0.01 or total >= sec_cap - 1e-9:
+                continue
+            filled = 0.0
+            avail = grid_avail(gi)
+            while filled < need and total < sec_cap and avail:
+                best_i, best_key = None, None
+                for i, (ins, ash, dist, c, sh) in enumerate(avail):
+                    if (c["idx"], sh) in used_copies:
+                        continue
+                    if total + c["dur"] > sec_cap:
+                        continue
+                    key = (ins, ash + args.div_weight * used_src.get(c["idx"], 0), dist)
+                    if best_key is None or key < best_key:
+                        best_key, best_i = key, i
+                if best_i is None:
+                    break
+                _, _, _, c, sh = avail.pop(best_i)
+                used_copies[(c["idx"], sh)] = True
+                used_src[c["idx"]] = used_src.get(c["idx"], 0) + 1
+                plan.append((c, sh, int(gi)))
+                filled += c["dur"]
+                total += c["dur"]
+            if filled > 0:
+                filled_by_grid[gi] = filled_by_grid.get(gi, 0.0) + filled
+                print(f"  格 {grids[gi]:.0f}-"
+                      f"{grids[gi] * 2 ** (GRID_SEMI / 12):.0f}Hz: "
+                      f"需 {need:.2f}s 实补 {filled:.2f}s")
+        return total
+
+    # 主填带：缺口大的格先填；预留低音预算后主循环只能花 budget-low_fill
+    main_cap = budget - (low_fill if low_fill > 0 else 0.0)
+    used_sec += greedy_fill({gi: float(need_sec[gi]) for gi in range(len(grids))},
+                            main_cap)
+
+    # 低音填充（--low-fill-sec > 0 时）：把预留预算强制填进锚点音域以下的格。
+    # 分配权重 = 歌曲在这些格的时间占比；已由主循环补过的格扣减。
+    if low_fill > 0:
+        av_f0 = anchor_f0[anchor_f0 > 0]
+        a_med = float(np.median(av_f0)) if len(av_f0) else float(np.median(tv))
+        cut_hz = a_med * 2 ** (-args.low_cut_st / 12)
+        centers = [float(np.sqrt(g * g * 2 ** (GRID_SEMI / 12))) for g in grids]
+        low_gis = [gi for gi in range(len(grids))
+                   if centers[gi] < cut_hz and song_pct[gi] > 0.005]
+        print(f"\n  低音填充: 锚点 med {a_med:.0f}Hz → 格中心 <{cut_hz:.0f}Hz "
+              f"共 {len(low_gis)} 格")
+        cap_low = min(low_fill, budget - used_sec)
+        if not low_gis or cap_low < 0.01:
+            print("  低音填充: 无目标格或无预算，跳过")
+        else:
+            w = np.array([song_pct[gi] for gi in low_gis], dtype=float)
+            w /= max(w.sum(), 1e-9)
+            needs_low = {gi: max(0.0, cap_low * wi - filled_by_grid.get(gi, 0.0))
+                         for gi, wi in zip(low_gis, w)}
+            got = greedy_fill(needs_low, cap_low)
+            used_sec += got
+            print(f"  低音填充: 目标 {cap_low:.2f}s 实补 {got:.2f}s")
 
     return _render(args, plan, anchor, anchor_f0, anchor_dur, used_sec,
                    sr_out, F0Extractor, librosa, sf)
