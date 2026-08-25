@@ -34,13 +34,15 @@ SVC_BASE = "--device cuda:0 --model_path {m} --config {c} --prompt_wav_path {pw}
            "--target_wav_path {tw} --prompt_f0_path {pf} --target_f0_path {tf} " \
            "--save_dir {sd} --pitch_shift 0 --n_steps 32 --cfg 0.5 --rescale_cfg 0.75 " \
            "--max_seg_sec 28.0 --num_overlaps 1 --knn_alpha 0.2 --knn_k 4 " \
-           "--knn_pool_wav {pool} --fp16"
+           "--knn_pool_wav {pool} --seed {seed} --fp16"
 
 
 def run(cmd: list[str], tag: str) -> None:
     print(f"[{tag}] " + " ".join(cmd), flush=True)
-    proc = subprocess.run(cmd, cwd=str(SOULX), capture_output=True, text=True,
-                          encoding="utf-8", errors="replace")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(SOULX)
+    proc = subprocess.run(cmd, cwd=str(SOULX), env=env, capture_output=True,
+                          text=True, encoding="utf-8", errors="replace")
     tail = "\n".join((proc.stdout or "").splitlines()[-8:])
     print(tail, flush=True)
     if proc.returncode != 0:
@@ -53,6 +55,8 @@ def main() -> None:
     ap.add_argument("--low-fill", type=float, default=12.0,
                     help="arm B 的低音填充秒数（w_ext --low-fill-sec）")
     ap.add_argument("--max-sec", type=float, default=45.0)
+    ap.add_argument("--seed", type=int, default=1234,
+                    help="CFM 种子，双臂共用保证配对")
     ap.add_argument("--ref-clone", default="",
                     help="kNN 池（默认从 sing.py 逻辑：ref_clean 或 ref_talk_sing）")
     args = ap.parse_args()
@@ -75,7 +79,7 @@ def main() -> None:
              *SVC_BASE.format(m=MODEL, c=CONFIG,
                               pw=d / "prompt_ext.wav", tw=d / "sep2" / "lead.wav",
                               pf=d / "prompt_ext_f0.npy", tf=d / "target_f0.npy",
-                              sd=a_dir, pool=pool).split()],
+                              sd=a_dir, pool=pool, seed=args.seed).split()],
             f"{s}/A 基线")
 
         # ---- arm B：低音填充 prompt ----
@@ -99,7 +103,7 @@ def main() -> None:
              *SVC_BASE.format(m=MODEL, c=CONFIG,
                               pw=low_wav, tw=d / "sep2" / "lead.wav",
                               pf=d / "prompt_lowfill_f0.npy", tf=d / "target_f0.npy",
-                              sd=b_dir, pool=pool).split()],
+                              sd=b_dir, pool=pool, seed=args.seed).split()],
             f"{s}/B 低填")
 
 
