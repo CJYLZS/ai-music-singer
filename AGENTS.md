@@ -3445,3 +3445,46 @@ campplus 0.112），α0.4 修复代价 4 吞字，不值。SIM 全版本不降�
 最后一页 0.8018→0.8034），区域 excess 0.04-0.09 → 0.001-0.035。**修复版已替换
 vocal.wav（原版备份 vocal_raw.wav），`--bars` 需先跑 `beat_grid.py` 生成节拍网格
 （full mix 输入，80 BPM 档 resid p90 ~14ms）。**
+
+## 段落级 SVC（segprompt）— 每段配音域匹配的唱歌参考 + 段间冗余
+
+**2026-08：已成为 `sing.py` 的默认 `--svc-prompt segprompt`。** 输出标准
+`vocal.wav`（下游 mix/评测直接吃），旧整曲单 prompt 退为 `--svc-prompt ext`
+（输出 `vocal_ext.wav`）。sing.py 集成：`stage_svc` 分流到
+`singing/run_segprompt.py`（参数 `--segprompt-*`），kNN pool 默认用 ref_clean
+（`--segprompt-pool-wav` 可覆盖）。亲亲实测 vs base：CER 0.150→0.129（−2.1 点）、
+SingMOS 3.949→4.055（+0.106）、drift 0.0732→0.0662、worst 窗 0.372→0.303，
+SIM 持平（0.7468→0.7493，噪声内）。
+
+`singing/w_segprompt.py`（切分/选段，纯逻辑不跑推理）+ `singing/run_segprompt.py`
+（单进程驱动：模型/kNN pool 只加载一次，逐段 SVC）。
+
+**动机**（docs/lowregister-rescore.md）：全曲共用一条 prompt（med~331Hz）对低音
+主歌是「8 个半音之外的说话素材」；探针 downext/singlow 实测段级换参考 ΔA
++0.135 / +0.151。**段 med F0 单独算**（不能由全曲 med 代替）。
+
+**切分算法**：候选切分点 = 每个 ≥ min_run 的静音 run；run ≥ 2*pad 出双刀
+（前段 rs+pad 结束、后段 re-pad 开始，中间纯静音缓冲留零不进 SVC），否则单刀
+中点。收益 = run 时长，在段长硬约束下 DP 最大化总收益。首/尾大段静音（前奏/
+尾奏）隔离。降级链：min_run 0.3→0.2→0.1，seg_min 15→12→10→8（seg_max 永不
+放松——防 SoulX 内部再切是硬约束）。
+
+**段间冗余（2026-08）**：段首/段尾紧贴短静音时冷启动，开头一两个字音质差。
+每段前后各 +2s 一起送 SVC（邻接音频 = 上一段尾巴/下一段头 + 共享静音当上下文），
+拼接时只取中间 [t0,t1] 裁掉冗余；相邻段扩展窗口允许重叠（这正是意图）。
+**推理上限 --svc-max-sec 29.0**：SoulX 整段直推判定是 `gt_wav < max_seg_sec*sr`
+（严格小于，等长会被内部 build_vocal_segments 二次切碎），whisper 30s 硬顶
+（WHISPER_MEL_FRAMES=3000），故取 29。**内容段上限 seg_max = 25 = 29 - 2*2**。
+meta json 每段记 `ext_t0/ext_t1`（扩展窗口）；`svc_segN/window.json` 记扩展窗口
+供 `--reuse-svc` 判定 stale（旧算法产物无此标记会被自动重推）。实测 14 首歌
+25s 上限全部可切分，扩展后最长 28.9s。
+
+**参考预算（2026-08）：`--prompt-budget 45`（默认），与整曲 `prompt_ext.wav`
+44.8s 对齐。** 早期默认 30 是过时限制——SVC 的 `infer_segment` 已支持 >30s
+prompt（commit `7b7f02d`：`pt_content_feat` >30s 走 `encode_long` 28s chunked
+编码绕过 whisper 30s 硬顶；`pt_mel` 是纯 Conv 提取本就无截断；实测 45s 更好）。
+**注意 target 侧 30s 上限依然存在**：`infer_segment:522` 的 `gt_content_feat`
+直接走 `whisper_encoder.encode`（30s 硬截断 + F.pad 补零），超过部分输出是坏
+的——所以 target 段长仍受 29s（`--svc-max-sec`）约束，`encode_long` 只解除了
+prompt 侧。亲亲 45s 预算实测：每段 prompt 45-48s、15-19 候选段，infer 每段
+~10-12s（vs 30s 预算的 6-9s）。

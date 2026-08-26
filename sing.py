@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """零样本歌声合成 CLI：参考语音 -> 用参考音色唱给定歌曲。
 
-默认流水线（2026-08 起，成片 = vocal_psvs.wav）:
+默认流水线（2026-08 起，成片 = vocal.wav，段落级合成 segprompt）:
     song.flac
       ├─ BS-RoFormer          -> 人声(含和声) + 伴奏      (GPT-SoVITS venv)
       │    └─ karaoke 模型    -> 主唱 + 和声
@@ -10,27 +10,21 @@
       ├─ 参考音频(通常带BGM/BGM含人声) 同样两步分离 -> 纯人声 lead
       ├─ 纯人声切片 -> F0 分析 -> 贪心选段 -> prompt.wav (SoulX venv)
       ├─ PC-NSF-HiFiGAN 分层移调补齐高音区 -> prompt_ext.wav (tools/pcnsf venv)
-      ├─ SVS (score-control): MIDI+歌词+prompt_ext -> svs_vocal.wav（音域覆盖全曲，
-      │    但音准差：>50cents 帧 ~38%）
-      ├─ select-svs: 从 svs_vocal 选段 -> prompt_svs.wav（音域到 624Hz，PC-NSF 到不了）
-      ├─ SoulX-Singer SVC: prompt_svs + 主唱 -> vocal_psvs.wav（音准修回 ~5%）
-      └─ 双锚点评测：主指标 = SIM vs svs_vocal，参考 = SIM vs 真实语音
-
-为什么分两段：SVS 负责"用参考音色覆盖全音域"，SVC 负责"用原唱主唱修回音准"。
-实测（爱笑的眼睛 75 窗配对）主指标 0.7432 -> 0.7881（+0.0449, p<1e-4），
-音准 5.4% -> 4.8%，CER 0.2793 -> 0.2500。详见 AGENTS.md「SVS prompt extraction」。
+      ├─ 段落级 SVC（segprompt，默认）: 整曲按静音切段，每段配音域匹配的唱歌参考
+      │    （pick_prompt 预算 45s）+ 前后 2s 冗余 -> 逐段 SVC -> 静音处拼接
+      │    -> vocal.wav。亲亲实测 vs 整曲单 prompt：CER 0.150->0.129、SingMOS
+      │    3.949->4.055、drift 0.0732->0.0662，SIM 持平。见 AGENTS.md「段落级 SVC」。
+      └─ 评测：SIM（音色相似度）+ SingMOS（自然度）+ 漏音检测
 
 其他 prompt 变体（--svc-prompt）:
-    ext       旧默认，直接用 prompt_ext        -> vocal.wav（SIM vs 真实参考最高）
-    psvs_mix  干净素材优先 + SVS 补高音格      -> vocal_psvs_mix.wav（任何权重下都不最优）
+    ext       整曲单 prompt（旧默认），直接用 prompt_ext -> vocal_ext.wav
+    svs       SVS 输出选段 -> vocal_psvs.wav（窄素材/歌曲音域远超素材时用）
+    psvs_mix  干净素材优先 + SVS 补高音格      -> vocal_psvs_mix.wav
 
-Cascade（另一条支线，opt-in）：把 SVS 输出当 SVC 的 *source* 而不是 prompt 来源
-    SVS 输出 -> 提取 F0 -> SVC 二次转换（复用 prompt_ext）-> vocal_cascade.wav
-
-最简用法（走默认流程）:
+最简用法（走默认 segprompt 流程）:
     python3 sing.py --ref data/voices/ref.wav --song data/songs/song.flac --name exp1
 
-旧的纯 SVC 流程（不跑 SVS，快 ~1.5min）:
+旧整曲单 prompt 流程（--svc-prompt ext）:
     python3 sing.py --ref ... --song ... --name exp1 --svc-prompt ext \
         --stages sep,ref-sep,f0-target,select,ext,svc,eval
 
@@ -81,8 +75,8 @@ log = logging.getLogger("sing")
 ALL_STAGES = ["sep", "stems4", "ref-sep", "f0-target", "select", "ext",
               "svs", "select-svs", "svc", "cascade", "post-nsf", "eval",
               "leak-detect", "leak-repair", "mix"]
-# svs / select-svs 只在 --svc-prompt svs|psvs_mix（或 cascade）时才跑：默认 ext 路线
-# 用不到它们，白跑要多花一次 SVS 合成 + 一次选段。
+# svs / select-svs 只在 --svc-prompt svs|psvs_mix（或 cascade）时才跑：默认 segprompt
+# 路线用不到它们，白跑要多花一次 SVS 合成 + 一次选段。
 # cascade 与 prompt_svs 路线是两条独立支线，同时跑只是浪费一次推理。
 # leak-detect 默认开（双模型 3s 共识漏音扫描，写 leak_report.json）；leak-repair 默认关
 # （定点重转修复：vocal.wav 换成修复版、原版备份为 vocal_raw.wav）。
@@ -339,7 +333,22 @@ class Cfg:
     # SIM 不可区分（+0.0024, wins 37/69, p=0.63），但 CER 明显更差（0.4016 vs 0.3639，
     # 咬字变形 S=76 vs 62）—— SVS 多一层重合成的代价落在吐字而非音色上，且白跑
     # svs+select-svs 两个阶段。素材窄的场景仍可 --svc-prompt svs 切回。
-    svc_prompt: str = "ext"
+    # segprompt（默认，2026-08）= 段落级合成：整曲切段（静音优先 DP，段长
+    # [15,25]s），每段配音域匹配的唱歌参考（pick_prompt，预算 45s），前后各
+    # +2s 冗余一起送 SVC（段首/段尾冷启动音质差，邻接音频当上下文），拼接只取
+    # 中间裁掉冗余。实测（亲亲）：CER 0.150->0.129（-2.1 点）、SingMOS 3.949->
+    # 4.055（+0.106）、drift 0.0732->0.0662，SIM 持平。见 AGENTS.md「段落级 SVC」。
+    svc_prompt: str = "segprompt"
+    # segprompt 分段合成的参数（仅 --svc-prompt segprompt 用）
+    segprompt_budget: float = 45.0    # 每段参考素材时长预算（s），与整曲 prompt_ext 对齐
+    segprompt_pad_ext: float = 2.0    # 每段前后冗余秒数（一起送 SVC，拼接裁掉）
+    segprompt_seg_min: float = 15.0   # 内容段长下限（s）
+    segprompt_seg_max: float = 25.0   # 内容段长上限（s）= svc_max - 2*pad_ext
+    segprompt_svc_max: float = 29.0   # 送 SVC 的整段上限（s）：SoulX 判定 gt < max_seg_sec
+    segprompt_min_run: float = 0.3    # 候选切分静音 run 最短秒数
+    segprompt_pad: float = 1.0        # 切分点距静音 run 边缘的冗余
+    segprompt_tmp: str = "segprompt_tmp2"  # 中间产物目录（svc_segN/、prompt_segN.wav 等）
+    segprompt_pool_wav: str = ""      # kNN 检索池；空 = 用 ref_clean（默认整参考）
     # select-svs 是否走分层混合（产出 prompt_svs_mix.wav 而不是 prompt_svs.wav）
     select_svs_mix: bool = False
     mix: bool = False
@@ -464,7 +473,11 @@ class Cfg:
 
     @property
     def svc_prompt_wav(self) -> str:
-        """SVC 实际使用的 prompt（由 --svc-prompt 选）。"""
+        """SVC 实际使用的 prompt（由 --svc-prompt 选）。
+
+        segprompt 模式不用固定 prompt：run_segprompt.py 内部按段从候选池选段渲染，
+        prompt_ext.wav 仅作兜底（候选池无匹配时退回）。
+        """
         return {"svs": self.prompt_svs_wav,
                 "psvs_mix": self.prompt_svs_mix_wav}.get(self.svc_prompt, self.prompt_ext_wav)
 
@@ -475,8 +488,11 @@ class Cfg:
 
     @property
     def vocal_wav(self) -> str:
-        # 各臂产物分开，避免互相覆盖（A/B 需要同时留存）
-        return {"svs": self.p("vocal_psvs.wav"),
+        # 各臂产物分开，避免互相覆盖（A/B 需要同时留存）。
+        # segprompt（默认）输出标准 vocal.wav，下游 mix/评测直接吃。
+        # ext 退为 vocal_ext.wav；svs/psvs_mix 各占一名。
+        return {"ext": self.p("vocal_ext.wav"),
+                "svs": self.p("vocal_psvs.wav"),
                 "psvs_mix": self.p("vocal_psvs_mix.wav")}.get(self.svc_prompt, self.p("vocal.wav"))
 
     @property
@@ -790,6 +806,12 @@ def _svc_multi_seed(cfg: Cfg) -> None:
 
 def stage_svc(cfg: Cfg) -> None:
     banner(f"Stage: 歌声转换 (SoulX-Singer SVC, prompt={cfg.svc_prompt})")
+    if cfg.svc_prompt == "segprompt":
+        if cfg.n_seeds > 1:
+            log.warning("  segprompt 模式暂不支持 --n-seeds >1（run_segprompt 单 seed），"
+                        "按单 seed 跑")
+        _stage_svc_segprompt(cfg)
+        return
     for p in (cfg.svc_prompt_wav, cfg.svc_prompt_f0, cfg.lead_wav, cfg.target_f0):
         if not os.path.exists(p):
             raise Fail(f"缺少前置产物: {p}"
@@ -822,6 +844,54 @@ def stage_svc(cfg: Cfg) -> None:
     if not os.path.exists(gen):
         raise Fail(f"SVC 未产生输出: {gen}")
     shutil.copy(gen, cfg.vocal_wav)
+    log.info(f"  -> {cfg.vocal_wav}")
+
+
+def _stage_svc_segprompt(cfg: Cfg) -> None:
+    """段落级 SVC（默认）：整曲切段，每段配音域匹配的参考 + 前后冗余，拼接。
+
+    走 singing/run_segprompt.py（单进程：模型 + kNN pool 只加载一次）。
+    输出 cfg.vocal_wav（默认 vocal.wav），下游 mix/评测直接吃。
+    """
+    log.info("  段落级合成：静音优先切段（[seg_min, seg_max]）→ 每段音域匹配参考"
+             f"（预算 {cfg.segprompt_budget:g}s）→ 前后 +{cfg.segprompt_pad_ext:g}s 冗余"
+             f"（拼接裁掉）→ SVC 上限 {cfg.segprompt_svc_max:g}s")
+    for p in (cfg.target_f0, cfg.lead_wav, cfg.p("cands_meta.json"),
+              cfg.prompt_ext_wav, cfg.prompt_ext_f0):
+        if not os.path.exists(p):
+            raise Fail(f"缺少 segprompt 前置产物: {p}"
+                       + "（需先跑 f0-target / sep / select / ext 阶段）")
+    # kNN 检索池：显式指定 > ref_clean（默认整参考）> 无
+    pool = cfg.segprompt_pool_wav
+    if pool and not os.path.isabs(pool):
+        cand = os.path.join(cfg.out_dir, pool)
+        pool = cand if os.path.exists(cand) else pool
+    if not pool and cfg.knn_full_pool and os.path.exists(cfg.ref_clean):
+        pool = cfg.ref_clean
+    cmd = [VENVS["soulx"], os.path.join(WORKERS, "run_segprompt.py"),
+           cfg.name,
+           "--tmp-dir", cfg.segprompt_tmp,
+           "--out", os.path.basename(cfg.vocal_wav),
+           "--prompt-budget", str(cfg.segprompt_budget),
+           "--silence-min", str(cfg.segprompt_min_run),
+           "--pad", str(cfg.segprompt_pad),
+           "--seg-min", str(cfg.segprompt_seg_min),
+           "--seg-max", str(cfg.segprompt_seg_max),
+           "--pad-ext", str(cfg.segprompt_pad_ext),
+           "--svc-max-sec", str(cfg.segprompt_svc_max),
+           "--seed", str(cfg.seed) if cfg.seed is not None else "1234",
+           "--n-steps", str(cfg.n_steps),
+           "--cfg", str(cfg.cfg),
+           "--rescale-cfg", str(cfg.rescale_cfg),
+           "--num-overlaps", str(cfg.num_overlaps),
+           "--knn-alpha", str(cfg.knn_alpha),
+           "--knn-k", str(cfg.knn_k),
+           "--device", cfg.device]
+    if pool:
+        cmd += ["--pool-wav", os.path.abspath(pool)]
+    run(cmd, stage="svc", cwd=SOULX_DIR, env={"PYTHONPATH": SOULX_DIR})
+    if not os.path.exists(cfg.vocal_wav):
+        raise Fail(f"segprompt 未产生输出: {cfg.vocal_wav}")
     log.info(f"  -> {cfg.vocal_wav}")
 
 
@@ -1230,14 +1300,34 @@ def main() -> None:
     ap.add_argument("--svs-prompt-max-sec", type=float, default=20.0,
                     help="SVS prompt 时长上限（默认 20）。SVS 只用 metadata 第一段，"
                          "过长会被 --max-merge-ms 切成多段而只用首段")
-    ap.add_argument("--svc-prompt", default="ext", choices=["svs", "ext", "psvs_mix"],
-                    help="SVC 用哪个 prompt。ext（默认）= prompt_ext.wav，直接用参考素材选段，"
-                         "不跑 svs/select-svs：素材音域够宽时 SVS 那层在 SIM 上不可区分"
-                         "(+0.0024, p=0.63) 而 CER 更差 (0.4016 vs 0.3639)；"
-                         "svs = prompt_svs.wav（从 SVS 输出选段，自动带出 svs + select-svs 阶段），"
-                         "窄素材/歌曲音域远超素材时用；psvs_mix = 分层混合（干净素材优先，"
-                         "SVS 只补它到不了的高音格）。三臂产物分别写 vocal.wav / vocal_psvs.wav / "
-                         "vocal_psvs_mix.wav，互不覆盖")
+    ap.add_argument("--svc-prompt", default="segprompt",
+                    choices=["svs", "ext", "psvs_mix", "segprompt"],
+                    help="SVC 用哪个 prompt。segprompt（默认）= 段落级合成：整曲切段"
+                         "（静音优先 DP），每段配音域匹配的唱歌参考 + 前后 2s 冗余"
+                         "（亲亲实测 CER -2.1 点 / SingMOS +0.106 / SIM 持平）；"
+                         "ext = prompt_ext.wav，整曲单 prompt（旧默认，退为 vocal_ext.wav）；"
+                         "svs = prompt_svs.wav（自动带出 svs+select-svs 阶段），窄素材时用；"
+                         "psvs_mix = 分层混合。产物：segprompt/ext 都写 vocal.wav（segprompt 默认），"
+                         "svs/psvs_mix 写 vocal_psvs.wav / vocal_psvs_mix.wav，互不覆盖")
+    ap.add_argument("--segprompt-budget", type=float, default=45.0,
+                    help="segprompt 每段参考素材时长预算（s，默认 45，与整曲 prompt_ext 对齐）")
+    ap.add_argument("--segprompt-pad-ext", type=float, default=2.0,
+                    help="segprompt 每段前后冗余秒数（一起送 SVC，拼接时裁掉，默认 2）")
+    ap.add_argument("--segprompt-seg-min", type=float, default=15.0,
+                    help="segprompt 内容段长下限（s，默认 15）")
+    ap.add_argument("--segprompt-seg-max", type=float, default=25.0,
+                    help="segprompt 内容段长上限（s，默认 25 = svc-max 29 - 2*pad_ext 4）")
+    ap.add_argument("--segprompt-svc-max", type=float, default=29.0,
+                    help="segprompt 送 SVC 的整段上限（s，默认 29：SoulX 判定 gt < max_seg_sec，"
+                         "whisper 30s 硬顶）")
+    ap.add_argument("--segprompt-min-run", type=float, default=0.3,
+                    help="segprompt 候选切分静音 run 最短秒数（默认 0.3）")
+    ap.add_argument("--segprompt-pad", type=float, default=1.0,
+                    help="segprompt 切分点距静音 run 边缘的冗余秒数（默认 1.0）")
+    ap.add_argument("--segprompt-tmp", default="segprompt_tmp2",
+                    help="segprompt 中间产物目录（默认 segprompt_tmp2）")
+    ap.add_argument("--segprompt-pool-wav", default="",
+                    help="segprompt 的 kNN 检索池 wav；空 = 用参考人声（ref_clean，默认）")
     ap.add_argument("--select-svs-mix", action="store_true",
                     help="select-svs 走分层混合，产出 prompt_svs_mix.wav（配 --svc-prompt "
                          "psvs_mix 用）。干净素材取 prompt_ext.wav")
@@ -1292,7 +1382,7 @@ def main() -> None:
 
     if args.stages == "all":
         # svs / select-svs 只在 prompt 真的来自 SVS 时才跑。
-        # cascade 不再被 --mix 带出：它依赖 svs/svs_vocal.wav，而默认 ext 路线不跑 svs，
+        # cascade 不再被 --mix 带出：它依赖 svs/svs_vocal.wav，而默认 segprompt 路线不跑 svs，
         # 绑在一起会让 --mix 必然 Fail。要跑级联就显式 --stages ...,svs,cascade。
         need_svs = args.svc_prompt in ("svs", "psvs_mix")
         stages = [s for s in ALL_STAGES
@@ -1347,6 +1437,15 @@ def main() -> None:
               svs_control=args.svs_control,
               svs_ref=args.svs_ref, svs_prompt_max_sec=args.svs_prompt_max_sec,
               svc_prompt=args.svc_prompt, select_svs_mix=args.select_svs_mix,
+              segprompt_budget=args.segprompt_budget,
+              segprompt_pad_ext=args.segprompt_pad_ext,
+              segprompt_seg_min=args.segprompt_seg_min,
+              segprompt_seg_max=args.segprompt_seg_max,
+              segprompt_svc_max=args.segprompt_svc_max,
+              segprompt_min_run=args.segprompt_min_run,
+              segprompt_pad=args.segprompt_pad,
+              segprompt_tmp=args.segprompt_tmp,
+              segprompt_pool_wav=args.segprompt_pool_wav,
               mix=args.mix,
               no_sep_cache=args.no_sep_cache,
               leak_detect=args.leak_detect, leak_repair=args.leak_repair,

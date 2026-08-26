@@ -4,11 +4,11 @@
 
 ```
 ① sing.py                                       ② MV 渲染（入口 mv.py 分阶段流水线）
-歌曲.flac + 参考语音                        vocal_psvs.wav / mix.wav → data/songs/<歌名>/mv/
+歌曲.flac + 参考语音                        vocal.wav / mix.wav → data/songs/<歌名>/mv/
   └─ sep → ref-sep → f0-target → select            ├─ slice    align.wav(16k) + audio.wav(44.1k)
-     → ext → svs → select-svs → svc                ├─ lyrics  get_lyrics.py（.lrc）
+     → ext → svc（segprompt 段落级，默认）          ├─ lyrics  get_lyrics.py（.lrc）
      → eval → mix                                  ├─ cues    make_cues.py（口型时间轴）
-        ├─ vocal_psvs.wav 干声（口型用这个）        ├─ beats   beat_grid.py（节拍网格）
+        ├─ vocal.wav 干声（口型用这个）             ├─ beats   beat_grid.py（节拍网格）
         └─ mix.wav    人声+伴奏（成片用这个）        ├─ visemes split_visemes.py（口型 sprite）
                                                    ├─ intro   intro_speech.py（可选前奏口白）
                                                    ├─ render  a25rig/render.sh（渲片）
@@ -25,11 +25,11 @@
 ## ⓿ 前置：拿到 vocal.wav 和 mix.wav
 
 ```bash
-# 默认流程（SVS → prompt_svs → SVC），成片干声 = vocal_psvs.wav
+# 默认流程（segprompt 段落级合成，2026-08 起），成片干声 = vocal.wav
 python3 sing.py --ref data/voices/ref.wav --song data/songs/云烟成雨.flac \
     --name 云烟成雨 --seed 1234
 
-# 快速预览：旧的纯 SVC 流程（不跑 SVS，约 2 分钟）
+# 旧整曲单 prompt 流程（--svc-prompt ext，输出 vocal_ext.wav）
 python3 sing.py --ref data/voices/ref.wav --song data/songs/云烟成雨.flac \
     --name 云烟成雨 --svc-prompt ext \
     --stages sep,ref-sep,f0-target,select,ext,svc,eval --seed 1234
@@ -43,33 +43,29 @@ python3 sing.py --ref data/voices/ref.wav --song data/songs/云烟成雨.flac \
 
 | 文件 | 用途 |
 |---|---|
-| `vocal_psvs.wav` | **默认干声（推荐）**。prompt 取自 SVS 输出，**成片优先用它** |
-| `vocal.wav` | 旧流程 SVC 干声（`--svc-prompt ext`）。对真实参考的绝对相似度最高 |
-| `svs/svs_vocal.wav` | SVS 中间产物，**音准未修（>50cents 帧 ~38%），不是成品** |
+| `vocal.wav` | **默认干声（segprompt 段落级合成）**。整曲按静音切段，每段配音域匹配的唱歌参考 + 前后 2s 冗余。亲亲实测 vs 整曲单 prompt：CER −2.1 点、SingMOS +0.106、drift −0.007，SIM 持平 |
+| `vocal_ext.wav` | 旧整曲单 prompt 干声（`--svc-prompt ext`），对真实参考的绝对相似度与 segprompt 持平 |
+| `segprompt_meta.json` | segprompt 每段切分窗口（t0/t1/ext_t0/ext_t1）、med F0、参考候选索引 |
 | `mix.wav` | 人声 + 伴奏。**成片 `--audio` 用它**，否则 MV 没有伴奏 |
-| `eval.txt` | 音色相似度 + 双锚点评测 + 音准，先看这个决定要不要重跑 |
+| `eval.txt` | 音色相似度 + SingMOS 自然度 + 漏音检测，先看这个决定要不要重跑 |
 
-**为什么默认走 SVS→prompt_svs→SVC**：SVS 负责"用参考音色覆盖全音域"（PC-NSF 移调受素材上限
-约束，到不了 547Hz+），SVC 负责"用原唱主唱把音准修回来"（>50cents 帧 38% → 4.8%）。爱笑的眼睛
-75 窗配对实测：主指标 SIM vs `svs_vocal` 0.7432 → **0.7881**（+0.0449, 75/75 窗, p<1e-4），
-CER 0.2793 → 0.2500，稳定性同向改善。代价是对真实参考的 SIM 0.5899 → 0.5735，但那正好收敛到
-SVS 自身的 0.5734 —— 绝对音色由 SVS 那一环负责。详见 `AGENTS.md`「SVS prompt extraction」章节。
-
-另一条支线 **Cascade**（`--stages ...,svs,cascade`）把 SVS 输出当 SVC 的 *source* 而不是 prompt
-来源，产物 `vocal_cascade.wav`；绿色全曲上 A=0.6525、泄漏最低，详见 AGENTS.md Cascade 章节。
+**为什么默认走 segprompt 段落级合成**：全曲共用一条 prompt 对低音主歌是「8 个半音之外的
+说话素材」（med~331Hz vs 段 med~208Hz），段首/段尾紧贴短静音时冷启动音质差。segprompt 给
+每段配一条音域匹配的唱歌参考（预算 45s，与整曲 prompt_ext 对齐），前后各 +2s 冗余把邻接
+音频喂给模型当上下文。详见 `AGENTS.md`「段落级 SVC」章节。
 
 **两者时长严格一致**（同源，实测都是 240.782s），所以同一时间窗切出来的片段天然对齐 —— 
 口型在干声上算、成片用混音出，是安全的。这一点已量化验证过：SoulX-SVC 保留源时间轴，
 `vocal.wav` 与 `sep2/lead.wav` 逐 10s 窗互相关最大位移只有 10ms（0.3 帧 @30fps）。
 
-**Mix 阶段自动选择产物**：用当前 `--svc-prompt` 对应的干声（默认 `vocal_psvs.wav`），不存在时
+**Mix 阶段自动选择产物**：用当前 `--svc-prompt` 对应的干声（默认 `vocal.wav`），不存在时
 回退到 `vocal_cascade.wav`、再回退 `vocal.wav`。也可以用 `--mix-vocal` 手动指定（支持绝对路径
 或相对于 `data/songs/<name>/` 的文件名）：
 
 ```bash
-# 强制使用旧流程的 SVC 干声混音
+# 强制使用旧流程的 ext 干声混音
 python3 sing.py --ref data/voices/ref.wav --song data/songs/云烟成雨.flac \
-    --name 云烟成雨 --stages mix --mix-vocal vocal.wav
+    --name 云烟成雨 --stages mix --mix-vocal vocal_ext.wav
 
 # 或使用绝对路径
 python3 sing.py --ref data/voices/ref.wav --song data/songs/云烟成雨.flac \
