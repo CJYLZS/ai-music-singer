@@ -16,8 +16,10 @@ kNN pool 预编码一次传入每段（soulxsinger_svc.py:infer 支持 knn_pool 
 
 段间冗余（2026-08）：每段前后各 pad_ext=2s 一起送 SVC（段首/段尾冷启动音质
 差，把邻接音频喂给模型当上下文），拼接时只取中间 [t0,t1]。推理上限
---svc-max-sec 默认 29.0（SoulX 整段直推判定 gt < max_seg_sec；whisper 30s 硬
-顶），所以内容段长 --seg-max 默认 25.0 = 29 - 2*2。
+--svc-max-sec 默认 22.0（2026-08-26 定稿：CFM decoder 单块 >~19s 会能量塌缩，
+但 22s 窗口被模型内部切成 ≤19s 块，实测 0/14 衰减、SIM 三档最高），
+所以内容段长 --seg-max 默认 19.0：扩展后 23s 超上限，shrink 只裁尾部冗余
+到 22s，前缀 2s 完整保留、后缀恰 1.0s（用户定稿：后缀 1s 足够）。
 """
 from __future__ import annotations
 
@@ -164,23 +166,28 @@ def main() -> None:
                          ">30s prompt（encode_long chunked 编码绕过 whisper 30s 硬顶，"
                          "commit 7b7f02d，实测 45s 效果更好），与整曲 prompt_ext.wav "
                          "(44.8s) 对齐")
-    ap.add_argument("--silence-min", type=float, default=0.3,
-                    help="候选切分静音 run 最短秒数（低于此的断句静音不切）")
+    ap.add_argument("--silence-min", type=float, default=0.2,
+                    help="候选切分静音 run 最短秒数（低于此的断句静音不切；"
+                         "±2s 冗余缓冲允许短停顿切，默认 0.2）")
     ap.add_argument("--pad", type=float, default=1.0,
                     help="切分点距静音 run 边缘的冗余秒数：run 时长 >= 2*pad "
                          "则双刀（前段 rs+pad 结束、后段 re-pad 开始，中间纯静音 "
                          "缓冲留零不进 SVC）；否则单刀中点均分")
-    ap.add_argument("--seg-min", type=float, default=15.0,
+    ap.add_argument("--seg-min", type=float, default=12.0,
                     help="段长下限（秒）。低于此会被合并/被 DP 跳过——太短 "
                          "SVC 内容特征不足。勿低于 8")
-    ap.add_argument("--seg-max", type=float, default=25.0,
-                    help="内容段长上限（秒，不含前后冗余）。硬约束：扩展后 "
-                         "(seg+2*pad_ext) 必须 < svc-max-sec，否则 SoulX 把段二次切碎")
+    ap.add_argument("--seg-max", type=float, default=19.0,
+                    help="内容段长上限（秒，不含前后冗余）。2026-08-26 定稿："
+                         "22s 窗口被模型内部切成 ≤19s 块，无能量塌缩；"
+                         "seg-max 19 扩展后 23s 超上限，shrink 只裁尾部到 22s，"
+                         "前缀 2s 完整保留、后缀恰 1.0s（用户定稿：后缀 1s 足够）")
     ap.add_argument("--pad-ext", type=float, default=2.0,
                     help="每段前后各加的冗余秒数（一起送 SVC，拼接时裁掉）")
-    ap.add_argument("--svc-max-sec", type=float, default=29.0,
-                    help="送 SVC 的整段推理上限（秒）。SoulX 整段直推判定是 "
-                         "gt_wav < max_seg_sec*sr；whisper 30s 硬顶，故取 29")
+    ap.add_argument("--svc-max-sec", type=float, default=22.0,
+                    help="送 SVC 的整段推理上限（秒）。CFM decoder 单块 >~19s 会能量"
+                         "塌缩，但 max_seg_sec=22 时 18-22s 窗口被 build_vocal_segments "
+                         "内部切成 ≤19s 块，实测 0/14 衰减（最后一页，ratio 0.71-1.09）、"
+                         "SIM 0.8079 为三档最高。默认 22")
     ap.add_argument("--bands", nargs=2, type=float, default=None,
                     metavar=("LOW", "HIGH"),
                     help="启用音域分桶：先按静音切细段，再把相邻同音域段聚合，"

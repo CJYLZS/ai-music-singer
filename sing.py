@@ -342,10 +342,16 @@ class Cfg:
     # segprompt 分段合成的参数（仅 --svc-prompt segprompt 用）
     segprompt_budget: float = 45.0    # 每段参考素材时长预算（s），与整曲 prompt_ext 对齐
     segprompt_pad_ext: float = 2.0    # 每段前后冗余秒数（一起送 SVC，拼接裁掉）
-    segprompt_seg_min: float = 15.0   # 内容段长下限（s）
-    segprompt_seg_max: float = 25.0   # 内容段长上限（s）= svc_max - 2*pad_ext
-    segprompt_svc_max: float = 29.0   # 送 SVC 的整段上限（s）：SoulX 判定 gt < max_seg_sec
-    segprompt_min_run: float = 0.3    # 候选切分静音 run 最短秒数
+    segprompt_seg_min: float = 12.0   # 内容段长下限（s）
+    segprompt_seg_max: float = 19.0   # 内容段长上限（s）= svc_max - pad_ext - 1（前缀2s+后缀1s）
+    # svc_max 默认 22（2026-08-26 定稿）：CFM decoder 单块 >~19s 会能量塌缩，但
+    # max_seg_sec=22 时 18-22s 窗口被 build_vocal_segments 内部切成 ≤19s 块，实测
+    # 最后一页 0/14 衰减（ratio 0.71-1.09）、SIM 0.8079 为三档最高（vs svc18 0.8064）。
+    # seg_max=19 时扩展后 23s 超上限，shrink 只裁尾部冗余到 22s：前缀 2s 完整保留、
+    # 后缀恰 1.0s（用户定稿：后缀 1s 足够）。seg_max 是硬约束上限，18→19 只放大
+    # 解空间，全部 14 首歌仍可切分（配合 min_run=0.2 放宽 + 前奏/尾奏边界修复）。
+    segprompt_svc_max: float = 22.0   # 送 SVC 的整段上限（s）：SoulX 判定 gt < max_seg_sec
+    segprompt_min_run: float = 0.2    # 候选切分静音 run 最短秒数（±2s 冗余缓冲允许短停顿切）
     segprompt_pad: float = 1.0        # 切分点距静音 run 边缘的冗余
     segprompt_tmp: str = "segprompt_tmp2"  # 中间产物目录（svc_segN/、prompt_segN.wav 等）
     segprompt_pool_wav: str = ""      # kNN 检索池；空 = 用 ref_clean（默认整参考）
@@ -1313,15 +1319,16 @@ def main() -> None:
                     help="segprompt 每段参考素材时长预算（s，默认 45，与整曲 prompt_ext 对齐）")
     ap.add_argument("--segprompt-pad-ext", type=float, default=2.0,
                     help="segprompt 每段前后冗余秒数（一起送 SVC，拼接时裁掉，默认 2）")
-    ap.add_argument("--segprompt-seg-min", type=float, default=15.0,
-                    help="segprompt 内容段长下限（s，默认 15）")
-    ap.add_argument("--segprompt-seg-max", type=float, default=25.0,
-                    help="segprompt 内容段长上限（s，默认 25 = svc-max 29 - 2*pad_ext 4）")
-    ap.add_argument("--segprompt-svc-max", type=float, default=29.0,
-                    help="segprompt 送 SVC 的整段上限（s，默认 29：SoulX 判定 gt < max_seg_sec，"
-                         "whisper 30s 硬顶）")
-    ap.add_argument("--segprompt-min-run", type=float, default=0.3,
-                    help="segprompt 候选切分静音 run 最短秒数（默认 0.3）")
+    ap.add_argument("--segprompt-seg-min", type=float, default=12.0,
+                    help="segprompt 内容段长下限（s，默认 12）")
+    ap.add_argument("--segprompt-seg-max", type=float, default=19.0,
+                    help="segprompt 内容段长上限（s，默认 18 = svc-max 22 - 2*pad_ext 4；"
+                         "2026-08-26 定稿：22s 窗口被模型内部切成 ≤19s 块，无能量塌缩）")
+    ap.add_argument("--segprompt-svc-max", type=float, default=22.0,
+                    help="segprompt 送 SVC 的整段上限（s，默认 22：SoulX 判定 gt < max_seg_sec；"
+                         "22s 窗口内部切块安全，SIM 实测最高）")
+    ap.add_argument("--segprompt-min-run", type=float, default=0.2,
+                    help="segprompt 候选切分静音 run 最短秒数（默认 0.2：±2s 冗余缓冲允许短停顿切）")
     ap.add_argument("--segprompt-pad", type=float, default=1.0,
                     help="segprompt 切分点距静音 run 边缘的冗余秒数（默认 1.0）")
     ap.add_argument("--segprompt-tmp", default="segprompt_tmp2",

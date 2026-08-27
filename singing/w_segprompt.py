@@ -10,9 +10,12 @@
   2. 切分点尽量取**纯人声中最长的静音**，不把一句话切成两半。
 
 切分算法（2026-08 静态重写，不跑 SVC）：
-  目标：段长必须落在 [seg_min, seg_max]（默认 15-28s），防止 SoulX 的
-  build_vocal_segments 在推理时把段二次切碎（<30s 整段直推、>28s 会被内部
-  按 28s+静音重切，逐段配的 prompt 只对前 28s 生效）。
+  目标：段长必须落在 [seg_min, seg_max]（默认 12-19s），防止 SoulX 的
+  build_vocal_segments 在推理时把段二次切碎，并避免 CFM decoder 单块过长：
+  2026-08-26 实测单块推理 >~19s 时输出能量随时间塌缩（末段 RMS 掉到 ~30%），
+  但 svc_max=22 时窗口被模型内部切成 ≤19s 块，实测 0/14 衰减、SIM 三档最高，
+  所以内容段长上限取 19s：扩展 ±2s 后 23s 超上限，shrink 只裁尾部冗余到 22s，
+  前缀 2s 完整保留、后缀恰 1.0s（用户定稿：后缀 1s 足够）。
   手段：候选切分点 = 每个 >= min_run 的静音 run。run 时长 >= 2*pad 出
   **双刀**（前一段在 rs+pad 结束、后一段在 re-pad 开始，中间 L-2*pad 秒的
   纯静音作缓冲留零、不喂 SVC）；run 时长 < 2*pad 出**单刀**（中点一刀，
@@ -24,7 +27,7 @@
 紧贴短静音的段首/段尾是冷启动，开头一两个字音质差；把邻接音频（上一段尾
 巴/下一段头 + 共享静音）一起喂给模型，拼接时只取中间 [t0,t1]，把冗余裁掉。
 相邻段扩展窗口允许重叠。扩展后总长必须 < 推理上限（SoulX 整段直推判定是
-gt < max_seg_sec），所以内容段长上限 = 29 - 2*2 = 25s。
+gt < max_seg_sec），超限时只裁尾部冗余（前缀 2s 永远保留，后缀 ≥1s）。
 """
 from __future__ import annotations
 
@@ -125,7 +128,7 @@ def _dp_segments(pts, A: float, B: float, seg_min: float, seg_max: float):
 
 
 def split_optimal(f0: np.ndarray, min_run=0.3, pad=1.0,
-                  seg_min=15.0, seg_max=28.0, _depth=0) -> List[Tuple[float, float]]:
+                  seg_min=12.0, seg_max=19.0, _depth=0) -> List[Tuple[float, float]]:
     """静音优先 + 时长约束的分段，返回 [(start, end)] 秒。
 
     降级链（无解时逐级放宽，seg_max 永不放松 —— 防内部再切是硬约束）：
@@ -139,8 +142,27 @@ def split_optimal(f0: np.ndarray, min_run=0.3, pad=1.0,
     if not runs:
         raise ValueError(f"min_run={min_run} 无任何静音 run")
 
-    A = runs[0][1] if runs[0][0] <= 0.05 else 0.0
-    B = runs[-1][0] if runs[-1][1] >= total - 0.05 else total
+    # 前奏/尾奏隔离区：从两端向内扫描，遇到**长静音**就跳过，直到遇到真正的人声。
+    # 不能用 runs[0]/runs[-1]——开头可能是 0.4s 气口短静音，真正的长前奏在后面
+    # （情歌实测: runs[0]=[0,0.42] 短气口, runs[1]=[0.5,25.9] 才是 25s 前奏；
+    # 若 A 定在 0.4，0.4→首个切分点(26s) 之间 25.6s 无点，首段约束无解）。
+    # 判据：开头连续 >=1.0s 的静音（或覆盖开头 >=0.5s 的静音）视为前奏，
+    # 其终点即 A；结尾对称取 B。短气口（<1s）不构成隔离区。
+    voiced = f0 > 0
+    # A：从 0 找第一个"实质发声段"的起点 —— 跳过开头所有长静音 run
+    A = 0.0
+    for rs, re in runs:
+        if rs - A < 0.5:          # 与已隔离区相邻的静音（含气口间隙）都并入
+            A = max(A, re)
+        else:
+            break
+    # B：从结尾找最后一个"实质发声段"的终点 —— 跳过结尾所有长静音 run
+    B = total
+    for rs, re in reversed(runs):
+        if B - re < 0.5:          # 与已隔离区相邻的静音都并入
+            B = min(B, rs)
+        else:
+            break
 
     inner = [(rs, re) for rs, re in runs
              if rs >= A - 1e-6 and re <= B + 1e-6]
@@ -191,16 +213,16 @@ def split_optimal(f0: np.ndarray, min_run=0.3, pad=1.0,
 # ---------------------------------------------------------------------------
 
 
-def split_silence(f0: np.ndarray, silence_min=0.3, seg_min=15.0,
-                  seg_max=28.0, pad=1.0) -> List[Tuple[float, float]]:
+def split_silence(f0: np.ndarray, silence_min=0.2, seg_min=12.0,
+                  seg_max=19.0, pad=1.0) -> List[Tuple[float, float]]:
     """按静音 + 时长约束切段（新算法：静音优先 DP）。"""
     return split_optimal(f0, min_run=silence_min, pad=pad,
                          seg_min=seg_min, seg_max=seg_max)
 
 
-def split_bands(f0: np.ndarray, silence_min=0.3, seg_min=15.0,
+def split_bands(f0: np.ndarray, silence_min=0.2, seg_min=12.0,
                 band_edges=(260.0, 370.0), pad=1.0,
-                seg_max=28.0) -> List[Tuple[float, float, int]]:
+                seg_max=19.0) -> List[Tuple[float, float, int]]:
     """先按静音切细段，再把相邻的同音域段聚合成组。
 
     返回 [(start, end, band)]，band=0 低 / 1 中 / 2 高（按 band_edges 分档）。

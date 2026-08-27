@@ -3466,18 +3466,23 @@ SIM 持平（0.7468→0.7493，噪声内）。
 **切分算法**：候选切分点 = 每个 ≥ min_run 的静音 run；run ≥ 2*pad 出双刀
 （前段 rs+pad 结束、后段 re-pad 开始，中间纯静音缓冲留零不进 SVC），否则单刀
 中点。收益 = run 时长，在段长硬约束下 DP 最大化总收益。首/尾大段静音（前奏/
-尾奏）隔离。降级链：min_run 0.3→0.2→0.1，seg_min 15→12→10→8（seg_max 永不
+尾奏）隔离。降级链：min_run 0.3→0.2→0.1，seg_min 12→10→8（seg_max 永不
 放松——防 SoulX 内部再切是硬约束）。
 
 **段间冗余（2026-08）**：段首/段尾紧贴短静音时冷启动，开头一两个字音质差。
 每段前后各 +2s 一起送 SVC（邻接音频 = 上一段尾巴/下一段头 + 共享静音当上下文），
 拼接时只取中间 [t0,t1] 裁掉冗余；相邻段扩展窗口允许重叠（这正是意图）。
-**推理上限 --svc-max-sec 29.0**：SoulX 整段直推判定是 `gt_wav < max_seg_sec*sr`
-（严格小于，等长会被内部 build_vocal_segments 二次切碎），whisper 30s 硬顶
-（WHISPER_MEL_FRAMES=3000），故取 29。**内容段上限 seg_max = 25 = 29 - 2*2**。
-meta json 每段记 `ext_t0/ext_t1`（扩展窗口）；`svc_segN/window.json` 记扩展窗口
-供 `--reuse-svc` 判定 stale（旧算法产物无此标记会被自动重推）。实测 14 首歌
-25s 上限全部可切分，扩展后最长 28.9s。
+**推理上限 --svc-max-sec 22.0（2026-08-26 定稿，原 29→18→22）**：SoulX 整段直推
+判定是 `gt_wav < max_seg_sec*sr`（严格小于，等长会被内部 build_vocal_segments
+二次切碎）。CFM decoder 单块推理超过 ~19s 时输出能量随时间塌缩（末段 RMS 掉到
+~30%），**但 22s 窗口会被 build_vocal_segments 内部切成 ≤19s 块**，实测最后一页
+0/14 衰减（ratio 0.71-1.09）、SIM 0.8079 为三档（18/20/22）最高。**内容段上限
+seg_max = 19（扩展后最长 23s 超上限）**；段长 ≥18s 时扩展窗口被 shrink 到
+<22，**只截尾部冗余**（前缀 2.0s 永远完整，后缩到 1.0s 够用——段尾是往静音/
+下一段过渡）。meta json
+每段记 `ext_t0/ext_t1`（扩展窗口）；`svc_segN/window.json` 记扩展窗口供
+`--reuse-svc` 判定 stale（旧算法产物无此标记会被自动重推）。实测 14 首歌
+seg_max=19 + min_run=0.2 全部可切分（配合前奏/尾奏边界修复，见下）。
 
 **参考预算（2026-08）：`--prompt-budget 45`（默认），与整曲 `prompt_ext.wav`
 44.8s 对齐。** 早期默认 30 是过时限制——SVC 的 `infer_segment` 已支持 >30s
