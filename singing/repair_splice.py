@@ -33,6 +33,7 @@ import soundfile as sf
 from eval_triad import load16k, windows, cos
 from eval_leak_campplus import CP
 from eval_triad import SV
+from emb_cache import cached_emb
 
 REPO = "/home/rookie/voice"
 SOULX_PY = os.path.join(REPO, "SoulX-Singer", ".venv", "bin", "python")
@@ -146,11 +147,22 @@ def run_svc(prompt_wav, prompt_f0, pool, lead_f, f0_f, out_dir, cfg, alpha, seed
 class Scorer:
     def __init__(self, ref, target, impostors):
         self.sv, self.cp = SV(), CP()
-        ref16, tgt16 = load16k(ref), load16k(target)
-        self.anch_sv = {"ref": self.sv.emb(ref16), "tgt": self.sv.emb(tgt16)}
-        self.anch_cp = {"ref": self.cp.emb(ref16), "tgt": self.cp.emb(tgt16)}
-        self.anch_sv.update({f"imp{i}": self.sv.emb(load16k(p)) for i, p in enumerate(impostors)})
-        self.anch_cp.update({f"imp{i}": self.cp.emb(load16k(p)) for i, p in enumerate(impostors)})
+
+        def em(p, model, tag, device):
+            """整文件锚点嵌入 + 磁盘缓存。537s 参考的整文件前向在 16GB 卡上瞬时需
+            ~15.5GB 显存，是 OOM 高发点（见 singing/emb_cache.py）；这里同样要嵌
+            参考 + 目标 + 最多 5 个 impostor，两个模型各一遍。"""
+            e = cached_emb(p, tag, lambda: model.emb(load16k(p)), log=print)
+            return e.to(device)
+
+        self.anch_sv = {"ref": em(ref, self.sv, "eres2netv2", self.sv.device),
+                        "tgt": em(target, self.sv, "eres2netv2", self.sv.device)}
+        self.anch_cp = {"ref": em(ref, self.cp, "campplus", "cpu"),
+                        "tgt": em(target, self.cp, "campplus", "cpu")}
+        self.anch_sv.update({f"imp{i}": em(p, self.sv, "eres2netv2", self.sv.device)
+                             for i, p in enumerate(impostors)})
+        self.anch_cp.update({f"imp{i}": em(p, self.cp, "campplus", "cpu")
+                             for i, p in enumerate(impostors)})
         import torch
         torch.cuda.empty_cache()
 

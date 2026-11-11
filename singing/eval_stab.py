@@ -21,8 +21,10 @@ import torch
 import torchaudio
 
 sys.path.insert(0, "/home/rookie/voice/GPT-SoVITS/GPT_SoVITS/eres2net")
+sys.path.insert(0, "/home/rookie/voice/singing")
 import torchaudio.compliance.kaldi as Kaldi  # noqa: E402
 from ERes2NetV2 import ERes2NetV2  # noqa: E402
+from emb_cache import cached_emb  # noqa: E402
 
 CKPT = "/home/rookie/voice/GPT-SoVITS/GPT_SoVITS/pretrained_models/sv/pretrained_eres2netv2w24s4ep4.ckpt"
 
@@ -43,6 +45,8 @@ def main() -> None:
     ap.add_argument("--labels", nargs="*", default=None)
     ap.add_argument("--win", type=float, default=1.5)
     ap.add_argument("--dropout", type=float, default=0.35)
+    ap.add_argument("--no-ref-emb-cache", action="store_true",
+                    help="禁用参考嵌入磁盘缓存，每次重算（见 singing/emb_cache.py）")
     args = ap.parse_args()
 
     labels = args.labels or [f"gen{i}" for i in range(len(args.gen))]
@@ -57,7 +61,10 @@ def main() -> None:
                                          sample_frequency=16000, dither=0) for x in t])
             return m.forward3(f).squeeze(0)
 
-    gt = emb(load16k(args.ref))
+    # 参考嵌入走磁盘缓存：537s 参考整文件前向瞬时需 ~15.5GB 显存，与宿主桌面占用
+    # 叠加就会 OOM（见 singing/emb_cache.py）。缓存内容与直接前向一致，不改协议。
+    gt = cached_emb(args.ref, "eres2netv2", lambda: emb(load16k(args.ref)),
+                    use_cache=not args.no_ref_emb_cache).cuda()
     # 长参考的整文件前向会把 PyTorch 缓存池撑到 ~19GB（537s 素材实测 reserved
     # 19.48GB vs allocated 0.21GB），而后续每个窗只要 0.34GB。不清掉会在 16GB 卡上
     # 随机 OOM（见 eval_sim.py 同处注释）。embedding 已算完，清理不改数值。

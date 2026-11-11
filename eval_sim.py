@@ -19,7 +19,9 @@ import torchaudio.compliance.kaldi as Kaldi
 
 REPO = "/home/rookie/voice"
 sys.path.insert(0, os.path.join(REPO, "GPT-SoVITS", "GPT_SoVITS", "eres2net"))
+sys.path.insert(0, os.path.join(REPO, "singing"))
 from ERes2NetV2 import ERes2NetV2  # noqa: E402
+from emb_cache import cached_emb  # noqa: E402
 
 SV_CKPT = os.path.join(REPO, "GPT-SoVITS", "GPT_SoVITS", "pretrained_models",
                        "sv", "pretrained_eres2netv2w24s4ep4.ckpt")
@@ -67,10 +69,32 @@ def main() -> None:
     ap.add_argument("--f0", required=True, help="生成音频对应的源 F0 .npy（50Hz 网格）")
     ap.add_argument("--ref-f0", required=True, help="参考音频的 F0 .npy")
     ap.add_argument("--win", type=float, default=3.0, help="分析窗长(秒)")
+    ap.add_argument("--ref-emb", default="",
+                    help="参考嵌入缓存 .npy 的显式路径（默认自动命名，见 singing/emb_cache.py）。"
+                         "可先用 --ref-device cpu 预生成，之后所有歌曲复用")
+    ap.add_argument("--no-ref-emb-cache", action="store_true",
+                    help="禁用参考嵌入缓存，每次重算（旧行为）")
+    ap.add_argument("--ref-device", default="cuda", choices=["cuda", "cpu"],
+                    help="缓存未命中时参考嵌入在哪个设备上算。cpu 用于避开 16GB 卡上 "
+                         "537s 参考前向的显存尖峰（数值一致，cos(CPU,GPU)=1.0000005）")
     args = ap.parse_args()
 
     sv = SV()
-    ref_emb = sv.emb(load16k(args.ref))
+    # 参考嵌入走磁盘缓存：537s 参考整文件前向瞬时需 ~15.5GB 显存，与宿主占用叠加会 OOM
+    # （见 singing/emb_cache.py 的长注释）。缓存内容 = 完整参考算出的同一个向量，不改协议。
+    if args.ref_device == "cpu":
+        def _build():
+            sv_cpu = SV(device="cpu")
+            e = sv_cpu.emb(load16k(args.ref))
+            del sv_cpu
+            return e
+    else:
+        def _build():
+            return sv.emb(load16k(args.ref))
+    ref_emb = cached_emb(args.ref, "eres2netv2", _build,
+                         use_cache=not args.no_ref_emb_cache,
+                         cache_file=args.ref_emb or None, log=print)
+    ref_emb = ref_emb.to(sv.device)
     # 长参考的整文件前向会把 PyTorch 缓存池撑到 ~19GB（537s 素材实测 allocated 只有
     # 0.21GB，reserved 19.48GB），而后面每个 3s 窗只要 0.34GB。不清掉这段缓存，
     # 16GB 卡上 eval 会在随机的某一首歌 OOM —— 表现是 SVC 全部成功、只有 eval 挂掉，

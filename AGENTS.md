@@ -1639,6 +1639,41 @@ allocator 在长序列上预取整块显存），而后面每个 3s 窗只要 0.
 `paired_eval.py` 的参考嵌入之后统一加 `torch.cuda.empty_cache()`（embedding 已算完，
 清理不改数值）。新增 eval 类脚本时同样处理。
 
+**但 `empty_cache()` 只治 forward *之后*：537s 参考的整文件前向本身就贴住 16GB 卡的天花板
+—— 改成磁盘缓存（2026-09）。** aliez 实测连续两次 OOM，且失败点在 forward **内部**
+（`ERes2NetV2.forward3 → layer1 → bn3`，`Tried to allocate 4.10 GiB`，`free: 0`，
+`11.41 GiB is allocated by PyTorch, and 3.36 GiB is reserved but unallocated`）。
+allocator 的提示会把人引向 `expandable_segments`，但这不是碎片问题：live 张量本身 11.41GB，
+再要一块 4.1GB，合计已超过 15.99GiB 卡容量 + CUDA context，换分配策略也救不回来。
+即**峰值需求 ≈ 整卡容量**，能否通过取决于宿主桌面当时占用多少 —— 这解释了为什么
+12 首里 6 首的 `sing.log` 都留有 `memory allocation failed` 重试痕迹而多数侥幸过关
+（`empty_cache()` 修的是 forward 之后的缓存池，管不到 forward 内部峰值）。
+
+修法：`singing/emb_cache.py` —— 嵌入按 (wav 路径, size, mtime, 模型 tag) 缓存到
+`data/emb_cache/*.npy`，命中即加载。**首次可在 CPU 上生成**（ERes2NetV2 537s CPU 前向
+实测 ~2.2 分钟、峰值 host RAM ~7GB）：
+
+```bash
+# 一次性：CPU 算 537s 参考嵌入（之后所有歌复用）
+GPT-SoVITS/.venv/bin/python eval_sim.py --ref data/voices/ref_talk_sing.wav \
+    --gen <vocal.wav> --f0 <target_f0.npy> --ref-f0 <prompt_f0.npy> --ref-device cpu
+```
+
+`eval_sim.py` / `singing/eval_stab.py` / `singing/w_leak_detect.py` 已接入
+（`--no-ref-emb-cache` 可关）。**数值不改协议**：CPU 与 GPU 嵌入实测
+cos = 1.0000005（max|diff| 2e-3 / 范数 88）。附带收益：leak-detect 从 5-8 分钟降到
+**10.5s**（它原本要把 537s 参考 + 268s 目标 + 5 个 impostor 各嵌入两遍，合计 ~2.1 小时音频）。
+注意两个嵌入模型的输出设备不同 —— `SV.emb` 在 `self.device`，`CP.emb` 固定返回 **CPU**
+（CAMPPlus 内部 fbank 在 CPU 上做），锚点必须 `.to()` 到与窗口嵌入相同的设备，否则
+`cos` 报 "found at least two devices"。
+
+**不要用「截断参考」绕这个 OOM —— 实测代价 0.10 SIM，是噪声底的 25 倍。** 把参考砍成
+前一半（269s）确实能把锚点前向的显存需求减半，但**换掉了锚点**：同一份 `vocal.wav`、
+同一批 66 个窗、只改 `--ref`，SIM **0.7655 → 0.6648（−0.1007）**，也不再与历史 12 首的
+0.75-0.82 可比。机制：完整 537s 与前半 269s 的锚点向量 cos = 0.9604（"同一个人同一段录音"
+只差 0.04），而窗口 SIM 把这个差异放大 2.5×（0.0396 → 0.1007）。
+锚点长度是**协议的一部分**，不能当显存旋钮用。
+
 **Always score against the real, unmodified speech** as ground truth. Scoring a pitch-shifted variant against
 its own shifted prompt hides the very degradation you are trying to measure — that mistake made a real
 regression look like a tie.

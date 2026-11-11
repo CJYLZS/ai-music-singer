@@ -30,11 +30,13 @@ import os
 import sys
 
 import numpy as np
+import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from eval_triad import SV, load16k, cos, windows  # noqa: E402
 from eval_leak_campplus import CP  # noqa: E402
 from repair_splice import SR  # noqa: E402
+from emb_cache import cached_emb  # noqa: E402
 
 FLOOR_ER = 0.05
 FLOOR_CP = 0.07
@@ -119,12 +121,23 @@ def main() -> None:
             raise SystemExit(f"文件不存在: {p}")
 
     sv, cp = SV(), CP()
-    ref16, tgt16, out16 = load16k(ref), load16k(target), load16k(vocal)
-    a_ref, a_tgt = sv.emb(ref16), sv.emb(tgt16)
-    a_ref_c, a_tgt_c = cp.emb(ref16), cp.emb(tgt16)
-    imps_sv = [sv.emb(load16k(p)) for p in impostors]
-    imps_cp = [cp.emb(load16k(p)) for p in impostors]
-    import torch
+    out16 = load16k(vocal)
+
+    def emb_file(model, tag: str, path: str, device: str) -> torch.Tensor:
+        """整文件嵌入 + 磁盘缓存。这里一次要嵌入 537s 参考 + 268s 目标 + 最多 5 个
+        268s impostor（两个模型各一遍，合计 ~2.1 小时音频），537s 那一发整文件前向
+        瞬时就要 ~15.5GB 显存 —— 16GB 卡上的 OOM 高发点，见 singing/emb_cache.py。
+        注意两个模型的输出设备不同：SV.emb 在 self.device，CP.emb 固定返回 CPU
+        （CAMPPlus 内部 fbank 在 CPU 上做），窗口嵌入也必须落在同一设备才能算 cos。"""
+        e = cached_emb(path, tag, lambda: model.emb(load16k(path)), log=print)
+        return e.to(device)
+
+    a_ref = emb_file(sv, "eres2netv2", ref, sv.device)
+    a_tgt = emb_file(sv, "eres2netv2", target, sv.device)
+    a_ref_c = emb_file(cp, "campplus", ref, "cpu")
+    a_tgt_c = emb_file(cp, "campplus", target, "cpu")
+    imps_sv = [emb_file(sv, "eres2netv2", p, sv.device) for p in impostors]
+    imps_cp = [emb_file(cp, "campplus", p, "cpu") for p in impostors]
     torch.cuda.empty_cache()
 
     report = {"win": 3.0, "ref": ref, "vocal": vocal, "target": target,
