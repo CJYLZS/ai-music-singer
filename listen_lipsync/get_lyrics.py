@@ -215,6 +215,82 @@ def from_netease(title, artist, dur):
 
 # --------------------------------------------------------------- 增强 LRC 读写
 
+def parse_yrc(text):
+    """网易云 yrc（逐字）→ [{start, dur, chars:[(相对起点, 时长, 字)]}]。
+
+    yrc 一行是 `[行起点ms,行时长ms](字起点ms,字时长ms,0)字...`，**字时间是绝对
+    毫秒**（不是 KRC 的相对偏移），这里换算成相对起点，才能对上 write_enhanced。
+    开头的 `{"t":0,"c":[...]}` JSON 行（作词/作曲）不以 `[` 开头，自然被跳过。
+    """
+    out = []
+    for line in text.splitlines():
+        m = re.match(r"^\[(\d+),(\d+)\](.*)$", line)
+        if not m:
+            continue
+        base = int(m.group(1))
+        toks = re.findall(r"\((\d+),(\d+),\d+\)([^(]*)", m.group(3))
+        if not toks:
+            continue
+        if not is_lyric("".join(c for _a, _b, c in toks)):
+            continue
+        out.append({
+            "start": base / 1000.0,
+            "dur": int(m.group(2)) / 1000.0,
+            "chars": [((int(a) - base) / 1000.0, int(b) / 1000.0, c) for a, b, c in toks],
+        })
+    return out
+
+
+def _t2s_same_len(text):
+    """繁→简，**长度不变才采用**（逐字时间戳按位置对齐，长度一变就不能换）。
+
+    网易云的数据偶带繁体/异体字（会呼吸的痛「我终於到达」的「於」）。有 opencc
+    就顺手转，没装就原样返回 —— 不引入硬依赖。
+    """
+    try:
+        import opencc
+    except Exception:
+        return text
+    conv = opencc.OpenCC("t2s").convert(text)
+    return conv if len(conv) == len(text) else text
+
+
+def from_netease_yrc(title, artist, dur):
+    """网易云逐字歌词（yrc）→ 逐字行，或 None。
+
+    比 `from_netease` 的 lv=1 行级 LRC 强在两处：**字级时间戳**（字幕扇光用）与
+    **简体的官方文本**；行锚点也是校对过的（会呼吸的痛 首行 18.10s vs 实测起唱
+    18.20s，而同曲 lrclib 是 14.43s，早 3.7s）。优先于 lrclib/行级网易云。
+    """
+    ref = {"Referer": "https://music.163.com/"}
+    try:
+        s = urllib.parse.quote(f"{title} {artist}".strip())
+        r = json.loads(http(f"https://music.163.com/api/search/get?s={s}&type=1&limit=10", ref))
+        for song in (r.get("result", {}).get("songs") or []):
+            if abs(song.get("duration", 0) / 1000.0 - dur) > 3:
+                continue
+            time.sleep(PACE * 0.5)
+            L = json.loads(http("https://music.163.com/api/song/lyric/v1"
+                                f"?id={song['id']}&cp=false&lv=0&kv=0&tv=0&rv=0"
+                                f"&yv=1&ytv=1&yrv=1&lrctype=1", ref))
+            lines = parse_yrc(((L.get("yrc") or {}).get("lyric") or ""))
+            if len(lines) >= 8:
+                fixed = 0
+                for ln in lines:
+                    joined = "".join(c for _o, _d, c in ln["chars"])
+                    conv = _t2s_same_len(joined)
+                    if conv != joined:
+                        ln["chars"] = [(o, d, c2)
+                                       for (o, d, _c), c2 in zip(ln["chars"], conv)]
+                        fixed += 1
+                if fixed:
+                    log(f"  繁体字转简: {fixed} 行")
+                return lines
+    except Exception:
+        pass
+    return None
+
+
 def fmt_ts(t):
     t = max(0.0, t)
     return f"{int(t // 60):02d}:{int(t % 60):02d}.{int(round(t % 1 * 100)):02d}"
@@ -388,6 +464,17 @@ def process(path, args):
     lines = from_kugou(title, artist, dur)
     if lines:
         meta["source"] = "kugou-krc (逐字)"
+        write_enhanced(out, lines, meta)
+        log(f"  写入 {out} —— {stats(read_enhanced(out)[0])}")
+        return out
+
+    # 酷狗挂了（实测 2026-09 出口在台湾时报 HTTP 200 + 空候选，连热门歌也是）时，
+    # 网易云 yrc 是同样带字级时间戳的来源，优先于下面两个行级源。
+    lines = from_netease_yrc(title, artist, dur)
+    if lines:
+        log(f"  网易云 yrc 逐字命中: {len(lines)} 行 / "
+            f"{sum(len(l['chars']) for l in lines)} 字")
+        meta["source"] = "netease-yrc (逐字)"
         write_enhanced(out, lines, meta)
         log(f"  写入 {out} —— {stats(read_enhanced(out)[0])}")
         return out
