@@ -1674,6 +1674,48 @@ cos = 1.0000005（max|diff| 2e-3 / 范数 88）。附带收益：leak-detect 从
 只差 0.04），而窗口 SIM 把这个差异放大 2.5×（0.0396 → 0.1007）。
 锚点长度是**协议的一部分**，不能当显存旋钮用。
 
+**aliez 首跑记录（2026-09，素材加强后的默认参数）**：268.5s 日系女声歌曲（aLIEz，
+日语词 + 德语音译段），`ref_talk_sing.wav` 直接当锚点（`--ref-is-clean`）。默认 segprompt
+切 14 段、`select` 建议移调 **+1 半音**、`ext` 无移调段（`prompt_ext` 与 `prompt` md5 一致）
+—— 即「素材加强后移调层不触发」在这个音域偏高的歌上同样成立（歌曲 med 371.7Hz
+vs 素材 med 328.5Hz，素材 p90 447/p99 631 覆盖得住）。**最终**：SIM **0.7693/0.7704**、
+SingMOS 合成 **4.042** vs 原唱 4.080、`eval_stab` drift **0.0656** / dropouts **0** / worst 0.3856、
+漏音共识窗 7→5（`--leak-repair` 采纳 2/3 跨度：51.3-53.8s 与 228.3-241.6s；
+204.1-222.3s 那一发重转后 excess 反而 +0.0249，增益门正确拦截）。唯一明显短板是
+445-500Hz（离参考 med 4-6 半音）桶掉到 0.7167，`corr(pitch distance, SIM) = −0.60` ——
+在这首歌上音高距离仍然是活的杠杆（与加强素材上另外几首测到的 +0.046 不同），
+高音格是素材 p90 以上的薄区。
+
+**⚠️ 但这首歌首跑踩到了一个新坑：karaoke 分离把同一个人的声音劈成两半，
+`lead.wav` 在 27-44s 只剩残渣，默认流程会拿这份残渣去转换。**
+判据是「逐秒 `lead` 相对 `lead+backing` 的电平」：正常段恒为 −0.0…−0.1 dB（backing 空或
+−20dB 以下），这一段掉到 **−1.3…−20.5 dB**（32-37s 最惨：lead −41…−45dBFS，backing −22dBFS，
+即**人声主要落在 backing 里**）。同一段两个 stem 的 F0 逐秒相同（差 ≤0.2 半音）——
+是「一个声音被劈开」，不是和声，这是与真和声（F0 相差若干半音）的区分判据。
+可听/可测后果：受损源转出来的 33s 窗 SIM **0.6677**，ASR 在该段编造内容
+（`棚に隠した青森村が、はじんこぎの歌かんだのか`），而真词是
+`棚に隠した青裸、端に濡れた鏡の中`。
+
+修法与验证（`sep2/lead.wav` 已就地修复，原件留 `sep2/lead_karaoke_raw.wav`）：
+把那一段的 `lead` 换成 `sep1/vocal.wav`（= lead+backing，BS-RoFormer 人声总和），两端 0.3s
+交叉淡化，然后**从 `f0-target` 起重跑**（`--stages f0-target,select,ext,svc,eval,leak-detect`
+—— 千万别带 `sep`，它会把缓存里的原始分离拷回来覆盖修复）。实测：
+
+| 区域 | v1（受损源） | 最终 | Δ |
+|---|---|---|---|
+| **27-44s（修复区）** | 0.8042 | **0.8400** | **+0.0358**（33s 窗 +0.1601）|
+| 44-57s（同段连带） | 0.7655 | 0.7629 | −0.0026（51s 窗先 −0.023，被 leak-repair 追回 +0.044）|
+| 其余 | 0.8241 / 0.7580 | 0.8277 / 0.7597 | +0.002（噪声内）|
+| 全曲 | 0.7647 | 0.7693 | +0.0046 |
+
+三个必须记住的点：**(1)** 连带损失是段级转换的固有代价——修复区所在的 seg 是整段送 SVC 的，
+源在段内一变，整段输出都变，所以收益和代价都落在同一个 seg 里（27-44 与 44-53.6 同属
+34.8-53.6 那个 seg）；净账仍是正的。**(2)** 换源会轻微改动 `target_f0` → `select` 重跑
+（18 段/44.6s → 16 段/44.1s）→ 逐段参考选择变化，这是「其余」区 ±0.002 的来源，不是缺陷。
+**(3)** 这类失败**不能靠听 lead.wav 发现**（残渣仍有正确的 F0 与 61% 浊音率，波形听上去
+"有东西"），必须跑逐秒电平比。建议加进 pre-flight：`lead` 比 `lead+backing` 低 >2dB
+且两者 F0 相同 → 报警。
+
 **Always score against the real, unmodified speech** as ground truth. Scoring a pitch-shifted variant against
 its own shifted prompt hides the very degradation you are trying to measure — that mistake made a real
 regression look like a tie.
