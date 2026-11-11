@@ -163,6 +163,16 @@ def load_lrc_ts(path, wav_path):
     天然免疫这类坏数据。行内均匀分布后，拖腔长音由下游 is_voiced/
     first_long_silence 逻辑负责 hold/闭嘴。
 
+    **行尾要拿 LRC 自带的 end 兜一道（2026-09，aliez 实测）**：只用
+    `first_long_silence` 会把「行内乐句之间的气口（≥0.35s 低电平）」当成行尾，
+    于是整行的字被压进前半段、后半段嘴巴冻结。aliez 40 行里 5 行中招，
+    最惨的是第一句（24 字压进 1.7s，之后僵 7.3s），而那段音频 73-83% 是有声的。
+    判据用「截断点之后还有没有在唱」区分两种情形，两种都是实测过的：
+      - 截断点之后有声 → 那只是气口，行尾回到 LRC 的 end（本修复）
+      - 截断点之后确实空掉 → LRC 行尾伸进了间奏，保留能量截断（aliez 第 9/19 行）
+    另注：门限是**相对整个 align.wav 峰值**的 −40dB，所以同一个窗口切多长会
+    轻微影响判定 —— 别用「某个窗口跑出来没问题」推断全曲没问题。
+
     返回 (lyr 字符串, ts 列表[(start_ms, end_ms)])，两者索引一一对应。
     """
     import soundfile as sf
@@ -209,6 +219,13 @@ def load_lrc_ts(path, wav_path):
         if not units:
             continue
         line_end = first_long_silence(ln["start"], nxt)
+        # 行尾兜底：截断点之后还在唱，说明那 0.35s 静音只是行内气口（见 docstring）
+        lrc_end = ln.get("end")
+        if lrc_end and line_end < lrc_end - 0.3:
+            e = min(lrc_end, nxt)
+            a, b = int(round(line_end * 200)), min(int(round(e * 200)), len(rms))
+            if b > a and (rms[a:b] > gate).mean() > 0.5:
+                line_end = e
         span = max(0.1, line_end - ln["start"])
         m = len(units)
         for i, ch in enumerate(units):
