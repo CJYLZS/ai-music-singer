@@ -238,15 +238,141 @@ kNN 的吐字代价（CER）、SIM 的天花板错觉、漏音的归一化误报
 - **仓库卫生**：`a167a26` 一次性清理未跟踪脚本（入库带 docstring 或删除）、补 `.gitignore`；
   `3c3aebd` 明确"上游克隆不按 gitlink 跟踪"。
 
-## 9. 当前状态与未结线头
+## 9. 当前流水线：逐阶段职责与模型/算法
+
+`sing.py --stages all` 的默认链是：
+
+```
+sep → stems4 → ref-sep → f0-target → select → ext → svc → eval → leak-detect
+```
+
+`mix` 是可选后置阶段（先验收纯人声再混伴奏）；`svs / select-svs / cascade / post-nsf / leak-repair`
+是可选支线。下面按数据流逐个说明**这一阶段负责什么、用什么模型/算法、默认值是多少**。
+
+### 9.1 `sep` — 把歌声拆成主唱与伴奏
+
+- **职责**：歌曲 → `vocal.wav`（人声总和）+ `acc.wav`（伴奏）；再对 vocal 跑 karaoke 模型拆出
+  `lead.wav`（主唱）与 `backing.wav`（和声/伴唱）。
+- **模型**：BS-RoFormer `model_bs_roformer_ep_317_sdr_12.9755`（SDR 12.98）
+  → mel-band-RoFormer `mel_band_roformer_karaoke_becruily`。均由 `bsroformer.Roformer_Loader` 加载。
+- **默认/坑**：产物按「输入文件 md5 + 权重 md5」缓存，同歌重跑 140s→4s。
+  karaoke 模型有概率把**同一个人的声音**劈进 lead/backing 两边（aLIEz 27-44s），
+  判据是逐秒 `lead` 相对 `lead+backing` 的电平 + 两 stem 的 F0 是否相同。
+  紧随其后的 `stems4` 再用 4-stem 权重（`bs_roformer_4stems_ft`）把伴奏拆成 drums/bass/other，
+  产物里的「鼓点 + bass 骨架」可作为 `--mix` 的替代伴奏。
+
+### 9.2 `ref-sep` — 清理参考素材
+
+- **职责**：把参考音频（可能是带 BGM 的录音/翻唱）跑同样的两级分离，产出 `refsep2/lead.wav`
+  作为音色锚点；`--ref-is-clean` 时跳过。
+- **模型**：同 9.1（BS-RoFormer + karaoke）。
+- **为什么必须**：SVC 的 prompt 会直接进模型当 in-context mel，带 BGM 的参考会把伴奏当音色学进去。
+
+### 9.3 `f0-target` — 提取原唱旋律
+
+- **职责**：从 `lead.wav` 逐帧提取 F0，写 `target_f0.npy`（50Hz 网格）。下游的选段、移调量计算、
+  SVC 的 F0 条件全依赖它；也是 SVC 分段切分的依据。
+- **模型**：RMVPE（SoulX-Singer 预处理权重 `rmvpe.pt`），取 50Hz 帧率。
+- **坑**：先跑这一步再跑 `select`，否则分段键不上；静音段/清音段的 F0=0 是正常的，不要当坏帧过滤。
+
+### 9.4 `select` — 从参考里挑出音色锚点 + 补频段缺口
+
+- **职责**：在参考人声里选出总长 ≤45s 的片段，构成 `prompt.wav`；再按"歌曲频段分布 − 锚点频段分布"
+  的缺口，决定要移调哪些源段，交给 `ext`。产物是 `prompt.wav` / `prompt_ext.wav` 与候选清单。
+- **算法**：候选切分采用**混合两级切法**（细切 1s、长切 4s），在 2 半音一格的音高网格上做贪心覆盖；
+  默认用 **DBS（Diverse Beam Search）第 2 轮**——第 g 轮排序键减去 `λ×该段已被前几轮选中的次数`
+  （λ=0.1），防止反复挑同一批高音段。增益按时长归一化（`gain/dur**1.0`）。
+- **默认**：`--select-min-sec 1.0`、`--max-prompt 45`、`--dbs-group 2`；`--anchor-min-ratio 1.0` 表示
+  "素材够宽就把 45s 全留给干净锚点，移调预算为 0"（此时 `prompt_ext` 与 `prompt` 字节一致）。
+- **被否掉的分支**：MILP 求解器（`cov_anchor`）全曲 10 首均值仅 +0.0012、一半歌变差且慢 19.7×，
+  降级为单歌可选；"覆盖率"作为目标函数被否证 9 次——它和 SIM 不是同向的。
+
+### 9.5 `ext` — 用神经声码器给参考补高音/低音
+
+- **职责**：把选中的源段按缺口所需的半音数移调，追加进 `prompt_ext`（**锚点在前、移调段在后**，
+  绝不替换锚点），让参考的音域覆盖歌曲的旋律范围。
+- **模型**：PC-NSF-HiFiGAN 44.1k（`pc_nsf_hifigan_44.1k_hop512_128bin_2025.02`，method=`nsfhifigan`，
+  音高检测 RMVPE）。做法是 `adjust_f0_semitones` 改 F0 曲线后由 NSF 声码器重合成，而不是 DSP 变调。
+  回退引擎是 seed-vc（DiT flow matching，`--f0-condition`）。
+- **默认**：`--ext-method nsf`、单段最大 +8 半音、源段复用惩罚 3.0（等价半音）、按 5 组批量移调
+  （5 次 fork 合 1 次，2.22× 提速，10 首 bit-identical）。
+- **为什么不用全量重合成**：过一遍声码器即使 0 半音也会掉 ~15% 音色相似度，所以"锚点原样保留"是硬约束。
+
+### 9.6 `svc` — 零样本歌声转换（核心）
+
+- **职责**：把 `lead.wav` 的音色换成参考人物的音色，输出 `vocal.wav`；`segprompt` 模式下按段分别选参考。
+- **模型**：SoulX-Singer（权重 2.7GB 的 flow-matching SVC）。三个部件：
+  - `WhisperEncoder`（whisper-base）提**内容特征**，`f0_to_coarse` 把 F0 编码成 361 个 bin 的 embedding；
+  - `CFMDecoder`：条件流匹配（conditional flow matching）+ DiT，Euler 积分 32 步；
+  - `MelSpectrogramEncoder`：把 prompt 作为 in-context mel 送进解码器（音色从这里来）。
+- **关键默认**：`--cfg 0.5`（上游 3.0 被否，CFG 放大会把输出推回原唱）、`--n-steps 32`（已饱和）、
+  `--rescale-cfg 0.75`、`--knn-alpha 0.2` / `--knn-k 4`（kNN-VC 式内容特征替换，检索池是**完整参考**，
+  分块编码绕开 whisper 30s 硬顶）、`--seed` 固定可复现、`--pitch-shift auto` 按段做八度对齐。
+- **segprompt（默认）**：先按静音做 DP 切分（段长约束 [15,25]s），每段算中位 F0 后从候选池选音域
+  匹配的参考（预算 45s），每段前后各带 2s 上下文一起送 SVC（只保留中间）——因为冷启动段首音质差。
+- **长度约束（两处，容易混淆）**：
+  - **目标段**（要转换的音频）走 `whisper_encoder.encode()`，不重采样分块，所以仍受 30s 硬顶；
+    `--max-seg-sec 28`、`--num-overlaps 1` 就是为把"段 + 上下文"压进这个上限并控制显存峰值。
+  - **prompt 侧**：>30s 时内容特征走 `encode_long()` 按 28s 分块拼接，音色通道 `pt_mel` 直接从波形算，
+    真正的上限是 RoPE 4096（约 50s），所以 `--max-prompt 45` 才敢设 45s。
+
+### 9.7 `eval` — 把"像不像 / 稳不稳 / 清不清"量化
+
+- **职责**：对 `vocal.wav` 打分并写 JSON；默认包含 SIM、稳定性与 SingMOS（漏音由下一节的双模型扫描负责）。
+- **模型/算法**：
+  - **SIM**：ERes2NetV2（`pretrained_eres2netv2w24s4ep4`）说话人嵌入，3s 窗逐窗余弦，
+    按"离 prompt 的半音距离"分桶；±0.004 是 seed 噪声底。
+  - **稳定性**：1.5s 窗的相邻 drift / 掉音色窗 / 最差窗。
+  - **吐字**：FunASR `paraformer-large` + `fsmn-vad`，以原唱 ASR 为参考算 CER（必须固定 VAD 种子）。
+  - **自然度**：SingMOS（`tools/singmos` 独立 venv）；NISQA 可选（语音域，仅诊断）。
+  - **三角**：`eval_triad` 用 ERes2NetV2 + CAMPPlus 双模型 + impostor 归一化，给"获得/难度/残留"。
+  - **天花板**：`eval_sim_ceiling` 先标定"同一个人同一段录音"能拿多少分，否则 SIM 下降无法解读。
+
+### 9.8 `leak-detect` / `leak-repair` — 检测并定点修复"像原唱"
+
+- **职责**：扫全曲 3s 窗，找"输出比参考更接近原唱"的区间（漏音），写 `leak_report.json`；
+  `leak-repair` 对命中的跨度重新合成，只在增益门通过时采纳（默认关）。
+- **算法**：ERes2NetV2 与 CAMPPlus 双模型各自算 `excess = C − A`（原唱相似度 − 参考相似度），
+  用 impostor 池归一化后取**共识窗**；低于地板（0.05 / 0.07）不报。
+- **坑**：impostor 池为空时 `excess` 会退化成裸 C，产生误报（已修）；相似度锚点必须一致，
+  截断参考会换掉锚点使历史数字不可比。
+
+### 9.9 `mix` — 混回伴奏
+
+- **职责**：`vocal.wav` + `acc.wav` → `mix.wav`。纯信号处理，无模型。
+- **算法**：`--match-lead`（默认开）用原唱 `lead.wav` 的逐帧 RMS 包络校正人声（200ms 平滑，
+  修正 SVC 在乐句内的 3-5dB 下陷）；`--match-acc`（默认开）让人声增益跟随伴奏包络；软限幅防削波；
+  伴奏保留立体声。
+
+### 9.10 MV 侧：`mv.py` 的八个阶段
+
+| 阶段 | 职责 | 用的模型/算法 |
+|---|---|---|
+| `slice` | 切出 16k `align.wav` + 44.1k `audio.wav`，写 `slice_meta.json` | ffmpeg，无模型 |
+| `lyrics` | 抓歌词并转成带逐字时间的增强 LRC | 酷狗 KRC / 网易云 yrc（逐字）/ lrclib，多源回退 |
+| `cues` | 歌词 → 口型时间轴 `cues.json` | 中文 pypinyin（strict 取真实韵母）；日文 pyopenjtalk + jaconv；映射到 Rhubarb 的 A/B/C/E 口型；能量门限（−40dB）判行尾，长音做"枣核型"两段式 |
+| `beats` | 全曲节拍网格，供渲染的 `--sway` 摇摆 | Beat This! 检测 downbeat + 鲁棒最小二乘拟合 `t = t0 + k·barLen`（抗漏检） |
+| `visemes` | 九宫格口型图 → 9 张 sprite | 图像切分，无模型 |
+| `intro` | 前奏口白 TTS | GPT-SoVITS（SoVITS e12 唱歌混合数据权重 + GPT 权重表），`--tts-speed` 调速 |
+| `render` | PSD 立绘 → 逐帧 PNG → mp4 | Anime2.5DRig（a25rig）2.5D 绑定 + Puppeteer 无头 Chrome/WebGL（d3d12），必须在交互式会话跑 |
+| `subs` | 烧双行滚动 KTV 字幕 | `make_ass.py` 生成 ASS + `ffmpeg -vf ass` |
+
+### 9.11 当前默认与产物
 
 截至 2026-11-11：
 
-- 默认链：`sep → ref-sep → f0-target → select → ext → svc(segprompt) → eval → leak-detect → mix`，
-  cfg 0.5、kNN α 0.2、leak-detect 开、SingMOS 计入默认 eval。
-- 未结线头：aLIEz 的 karaoke 劈裂已就地修复但**尚未变成 pre-flight 检查**；
-  日文口型通路只在一首歌上验证过；`tts_batch.py` 是 8 月的工具、11 月才入库；
-  `docs/patches/` 里的 echomimic3 补丁依赖上游版本。
+- 默认链即上面的 9.1–9.8（其中 `leak-repair` 与 `mix` 手动触发）；核心默认值：`cfg 0.5`、`knn α 0.2 / k 4`、
+  `n_steps 32`、`max_seg_sec 28`、`num_overlaps 1`、`prompt ≤45s`、`anchor_min_ratio 1.0`、
+  `dbs_group 2`、`ext_max_shift 8`。
+- 产物：`data/songs/<歌名>/` 下的 `vocal.wav`（干声，口型用）、`mix.wav`（成片用）、
+  `prompt*.wav`、`target_f0.npy`、`leak_report.json`、`natmos_report.json`；
+  MV 产物在 `mv/` 子目录（`aliez.mp4`、`aliez_lyrics.mp4` 等）。
+
+### 9.12 未结线头
+
+- aLIEz 的 karaoke 劈裂已就地修复，但**尚未变成 pre-flight 检查**（判据已写成文档）。
+- 日文口型通路只在一首歌上验证过；中文歌保持逐字节不变（`song_is_ja=False` 直接返回 None）。
+- `tts_batch.py` 是 8 月的工具、11 月才入库；`docs/patches/` 里的 echomimic3 补丁依赖上游版本。
 - 已知工作区状态：`test_tts/` 等生成物不入库；`GPT-SoVITS` 内的 `polyphonic.md5` 是运行时缓存，改动无意义。
 
 ## 10. 可复用的经验
