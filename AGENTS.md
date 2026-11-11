@@ -2417,19 +2417,30 @@ PSD 立绘 + `make_cues.py` 口型时间轴 → MV。上游是交互式浏览器
   Chrome 需要 libnss3/libnspr4，本机无 root，这些 `.so` 是 `apt-get download` +
   `dpkg-deb -x` 解到 `driver/nsslib/` 的。直接跑 node 会报
   `libnss3.so: cannot open shared object file`。
-- **`render` 阶段在受限沙箱里跑不了**（不是脚本 bug）：headless Chrome + Mesa D3D12 拿 GPU
-  （ANGLE/GL）需要系统级设备访问，沙箱内 `page.goto(base+'/index.html')` 能返回，但随后
-  `page.waitForFunction('window.__rig && window.agPsd && window.Rigger', {timeout:60000})`
-  **60s 超时、node 以 exit 1 退出**（实测日志里还会先冒一条 `Failed to load resource: 404`）。
-  根因是命令在沙箱里执行，Chrome 拿不到 GPU/设备访问。两种解法，等价：
-  (1) 在能访问 GPU 的正常机器上跑，或给该命令提权执行（2026-08 实测提权后 2s 冒烟片 6.9s 出片）；
-  (2) **在本 harness 里用 `bash` 工具的 `sandbox_permissions: danger-full-access` 让这条
-  `mv.py --stages render` 在沙箱外跑** —— 2026-08 实测：沙箱内 60s 超时失败、同命令加该 override
-  后 277s 正常出片（`情歌_intro.mp4`，260.09s）。`mv.py --stages render` 负责拼
-  `MESA_LOADER_DRIVER_OVERRIDE=d3d12 ...` 那套 env + `setsid`，文档不重复贴。
-  **注意 `subs`（烧字幕）只是 `ffmpeg -vf ass`，不依赖 Chrome/GPU，沙箱内也能跑**；只有
-  `render` 必须在沙箱外。所以"改口白后重出片"的惯用法是：`--stages intro --force`（口白 TTS，
-  沙箱内可跑）→ 再单独用 override 跑 `--stages render,subs --with-intro --force`。
+- **`render` 阶段在「远程工作区 / SSH 会话」里跑不了 —— 根因是会话类型，不是沙箱权限
+  （2026-09 更正）。** 症状：`node a25rig/render.sh` 报 `exec: node: not found`（PATH 里没有
+  nvm 的 node），补上 PATH 后 `page.goto(base+'/index.html')` **30s Navigation timeout**，
+  或侥幸过了 goto 之后 `page.waitForFunction('window.__rig && window.agPsd && window.Rigger',
+  {timeout:60000})` **60s 超时、node exit 1**（日志里会先冒一条
+  `Failed to load resource: 404`，那是 favicon 之类，**是噪声不是病因**）。
+  **真正原因：命令由 harness 经 SSH 执行，SSH 会话拉不起 UI 进程**（headless Chrome 仍要经
+  Mesa d3d12 拿 GPU/设备），所以 `bash` 工具的 `sandbox_permissions: danger-full-access`
+  **并不能**解决 —— 2026-09 实测三种配置（普通 / `--use-gl=swiftshader` / `--use-gl=egl`）
+  在沙箱内外都复现同一条 goto 超时，提权那次也一样失败。
+  **解法：在交互式 WSL 会话里直接跑**（用户手动执行，实测 3000 帧 @ ~35 fps、100s 试片
+  渲染 86s + 烧字 13s，合计 1.7 分钟出片）。成功运行的日志开头能自证会话类型：
+  `env WAYLAND_DISPLAY=wayland-0`、`env WSL2_GUI_APPS_ENABLED=1`。
+  给用户执行的命令（node 必须来自 nvm）：
+  ```bash
+  cd /home/rookie/voice
+  export PATH="$HOME/.nvm/versions/node/v24.15.0/bin:$PATH"
+  python3 mv.py --song aliez --start 0 --end 100 --stages render,subs \
+      --bg data/songs/aliez/aliez.png --font "Yu Gothic"
+  ```
+  `mv.py --stages render` 负责拼 `MESA_LOADER_DRIVER_OVERRIDE=d3d12 ...` 那套 env + `setsid`，
+  文档不重复贴。**注意 `subs`（烧字幕）只是 `ffmpeg -vf ass`，不依赖 Chrome/GPU，SSH 里也能跑**；
+  只有 `render` 必须在交互式会话。诊断脚本 `a25rig/driver/probe_rig.mjs` 会依次试
+  4 种 GL 配置并打印 WebGL 实际渲染器，用于区分「会话问题」与「GL 真挂了」。
 - **puppeteer 脚本必须放在 `driver/`**（`node_modules` 所在处），否则
   `ERR_MODULE_NOT_FOUND: Cannot find package 'puppeteer'`。
 - **GPU 可用，但必须显式点名适配器**，否则选到 AMD 核显（比软渲染更慢）。
