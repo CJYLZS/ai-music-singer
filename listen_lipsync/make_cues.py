@@ -99,6 +99,146 @@ def load_pinyin():
     return pinyin, Style
 
 
+# ---------------- 日文通路（假名 / 汉字 / 拉丁词） ----------------
+#
+# 本脚本原本只有中文通路：pypinyin 取韵母 → 口型。喂日文歌词时它两头都错 ——
+# 假名 pypinyin 返回空、汉字返回**中文读音**（自→zi、惚→hu）。aliez 实测：
+# 865 个字里 **92.6% 落到同一个 C**（188 个假名全是 C），嘴会整首张着不动。
+#
+# 这里改用 GPT-SoVITS venv 里**已有的** pyopenjtalk（它自己的日文 TTS 前端）
+# + jaconv 取日文读音，再走同一张 A/B/C/E 表（Rhubarb 语义，见上方注释）：
+#   a→C（开口）i→B（展唇）u→E（圆唇）e→C o→E；っ/ん→A（闭唇成阻）
+# 五十音与元音的对应是**一一对应**的，所以假名逐字直取即可；汉字词用
+# pyopenjtalk 的词级读音按词内字数摊到每个字（自惚れ=ウヌボレ → 自u 惚u れe）。
+# 拉丁词必须绕开 pyopenjtalk：它把 Leben 按字母拼读成「エルイービーイーエヌ」，
+# 元音全错；直接取字母元音才对（Leben→ee、Augen→aue、hokori→ooi）。
+JA_VOWEL_SHAPE = {"a": "C", "i": "B", "u": "E", "e": "C", "o": "E", "N": "A"}
+
+_KANA_VOWEL = {}
+for _row, _v in (("あかさたなはまやらわがざだばぱぁゃ", "a"),
+                 ("いきしちにひみりぎじびぴぃ", "i"),
+                 ("うくすつぬふむゆるぐずづぶぷぅゅゔ", "u"),
+                 ("えけせてねへめれげぜでべぺぇ", "e"),
+                 ("おこそとのほもよろをごぞどぼぽぉょ", "o")):
+    for _k in _row:
+        _KANA_VOWEL[_k] = _v
+
+# 闭唇/成阻：m/b/p 行假名与 っ/ん 都要先闭嘴（对应中文通路的 INITIAL_SHAPE b/p/m）
+_JA_CLOSURE = set("まみむめもばびぶべぼぱぴぷぺぽっッんン")
+_JA_LATIN_MAP = {"ä": "a", "ö": "o", "ü": "u", "é": "e", "è": "e", "ê": "e",
+                 "á": "a", "à": "a", "â": "a", "ó": "o", "ò": "o",
+                 "í": "i", "ì": "i", "ú": "u", "ù": "u"}
+
+
+def mora_vowel(mora: str):
+    """一个 mora → 元音字母；っ/ん 返回 'N'（闭唇），ー/记号返回 None。
+
+    取**最后一个**元音：拗音モーラ「きゃ」里小写假名才决定元音（→a），
+    取第一个会把它判成 i。"""
+    if any(c in "っッんン" for c in mora):
+        return "N"
+    v = None
+    for c in mora:
+        if c in _KANA_VOWEL:
+            v = _KANA_VOWEL[c]
+    return v
+
+
+def _is_latin_unit(u: str) -> bool:
+    core = [c for c in u if not c.isspace()]
+    if not core:
+        return False
+    return all((c.isascii() and c.isalpha()) or ("\uff21" <= c <= "\uff5a")
+               or c in "',.!?-&" for c in core)
+
+
+def _latin_vowels(u: str) -> str:
+    try:
+        import jaconv
+        s = jaconv.z2h(u, kana=False, ascii=True, digit=True).lower()
+    except Exception:
+        s = u.lower()
+    out = []
+    for c in s:
+        if c in "aeiou":
+            out.append(c)
+        elif c in _JA_LATIN_MAP:
+            out.append(_JA_LATIN_MAP[c])
+    return "".join(out)
+
+
+def ja_unit_vowels(units, text, song_is_ja=False):
+    """日文行 → 与 units 等长的 [(元音串, 是否闭唇起音)]。
+
+    **判定必须按「整首歌有没有假名」来做，不能看汉字区** —— `\\u4e00-\\u9fff`
+    是中日共用的，用它判语言会让中文歌被 pyopenjtalk 用**日文读音**读一遍
+    （自→じ、惚→こつ），是静默回归。所以中文歌（song_is_ja=False）直接返回
+    None，通路与改动前逐字节一致；本工作区其余中文歌的 cues 不受影响。
+
+    返回 None 表示这一行走原中文通路。标点返回 ("", False)，由调用方沿用上一个口型。
+    """
+    if not song_is_ja:
+        return None
+    try:
+        import pyopenjtalk
+        import jaconv
+    except Exception as e:                      # 缺依赖不能让整条流水线挂掉
+        print(f"[ja] pyopenjtalk/jaconv 不可用（{e}）→ 日文口型退回中文通路",
+              file=sys.stderr)
+        return None
+    flat = re.sub(r"\s+", "", text)
+    # units 里可能带**尾随空格**（网易云 yrc 会把空格挂在上一字上：'り '、'で '），
+    # 所以两侧都去空白再比，消费 per 时也按去空白后的长度走。第一版没做这一步，
+    # 40 行**全部**对不上而静默退回中文通路（表现：口型分布几乎没变）。
+    if re.sub(r"\s+", "", "".join(units)) != flat:
+        return None
+    # pyopenjtalk 会把半角空格/字母规范化成全角，先自己转一遍保证下标对齐
+    norm = jaconv.h2z(flat, kana=False, ascii=True, digit=True)
+    per = []
+    try:
+        words = pyopenjtalk.run_frontend(norm)
+    except Exception as e:
+        print(f"[ja] pyopenjtalk 解析失败（{e}）→ 退回中文通路", file=sys.stderr)
+        return None
+    for w in words:
+        s = w.get("string") or ""
+        r = w.get("read") or ""
+        morae = re.findall(r"[ぁ-ゖァ-ヺー]", jaconv.kata2hira(r))
+        n = len(s)
+        if n == 0:
+            continue
+        for i in range(n):
+            if morae:
+                a = i * len(morae) // n
+                b = max(a + 1, (i + 1) * len(morae) // n)
+                vs = [mora_vowel(m) for m in morae[a:b]]
+                v = next((x for x in reversed(vs) if x), None)
+                # 长音符「ー」单独成一个 mora：沿用它前面的元音
+                if v is None and any(m == "ー" for m in morae[a:b]):
+                    v = next((x for x in reversed(per) if x), None)
+            else:
+                v = None
+            per.append(v)
+    if len(per) != len(norm):
+        return None
+    out, p, last = [], 0, None
+    for u in units:
+        n_u = len(re.sub(r"\s+", "", u))
+        seg = per[p:p + n_u]
+        p += n_u
+        if _is_latin_unit(u):
+            vs = _latin_vowels(u)
+            out.append((vs, False) if vs else ("", False))
+            continue
+        vs = "".join(x for x in seg if x)
+        if not vs and last:                      # ー / 标点：沿用上一个元音
+            vs = last
+        if vs:
+            last = vs
+        out.append((vs, any(c in _JA_CLOSURE for c in u)))
+    return out
+
+
 def shape_of(ch, pinyin, Style):
     # strict=True 才能拿到《汉语拼音方案》的真实韵母：strict=False 会把 yu/ju/qu/xu 的
     # ü 按书写形式给成 "u"，于是「与/居/去/需」全部错判成强圆唇的 u 口型（F）而不是 ü（H）。
@@ -152,7 +292,7 @@ def norm_text(s):
 
 
 def load_lrc_ts(path, wav_path):
-    """从增强 LRC 读时间戳 → (lyr, ts)。
+    """从增强 LRC 读时间戳 → (lyr, ts, ja)。
 
     行起点 = LRC 时间戳（KRC 人工校对，实测 43/43 落在有声处，<0.2s 偏差）。
     字级时间 = 行内均摊到「行内最后有声时刻」——口型只需要「这行大约何时
@@ -173,7 +313,7 @@ def load_lrc_ts(path, wav_path):
     另注：门限是**相对整个 align.wav 峰值**的 −40dB，所以同一个窗口切多长会
     轻微影响判定 —— 别用「某个窗口跑出来没问题」推断全曲没问题。
 
-    返回 (lyr 字符串, ts 列表[(start_ms, end_ms)])，两者索引一一对应。
+    返回 (lyr 字符串, ts 列表[(start_ms, end_ms)], ja 列表)，三者索引一一对应。
     """
     import soundfile as sf
     import numpy as np
@@ -207,7 +347,15 @@ def load_lrc_ts(path, wav_path):
                 run = 0
         return t_end
 
-    lyr, ts = [], []
+    lyr, ts, ja = [], [], []
+    # 语言判定在**整首**层面做一次：任何一行出现假名 → 这首歌走日文通路。
+    # 逐行判会漏掉「纯汉字行」（日文歌词里存在，如单独一行的汉字短语）与
+    # 纯拉丁行（德文段）；而按汉字区判会把中文歌误判成日文（见 ja_unit_vowels）。
+    song_is_ja = any(
+        any("\u3040" <= c <= "\u30ff" for c in (ln.get("text") or ""))
+        for ln in lines)
+    if song_is_ja:
+        print("[ja] 检测到假名 → 走日文口型通路（pyopenjtalk 读音）", file=sys.stderr)
     for li, ln in enumerate(lines):
         nxt = lines[li + 1]["start"] if li + 1 < len(lines) else \
               (ln.get("end") or len(y) / sr)
@@ -218,6 +366,8 @@ def load_lrc_ts(path, wav_path):
             units = list(norm_text(ln["text"] or ""))
         if not units:
             continue
+        # 日文通路：整行一次算（汉字读音要靠词级上下文），逐 unit 落到 ja[]
+        jv = ja_unit_vowels(units, ln.get("text") or "".join(units), song_is_ja)
         line_end = first_long_silence(ln["start"], nxt)
         # 行尾兜底：截断点之后还在唱，说明那 0.35s 静音只是行内气口（见 docstring）
         lrc_end = ln.get("end")
@@ -233,7 +383,8 @@ def load_lrc_ts(path, wav_path):
             en = ln["start"] + span * (i + 1) / m
             lyr.append(ch)
             ts.append((int(round(st * 1000)), int(round(en * 1000))))
-    return "".join(lyr), ts
+            ja.append(jv[i] if jv else None)
+    return "".join(lyr), ts, ja
 
 
 def main():
@@ -310,11 +461,16 @@ def main():
         # 行级时间（KRC 人工校对，实测与音频能量跃变差 <0.2s）是权威锚点；
         # 字级时间：逐字行直接用逐字时间戳，行级行按行内字数均摊——
         # 口型只需要「这行大约何时唱」与大致节奏，发音不需字级精准。
-        lyr, ts = load_lrc_ts(args.lrc, args.wav)
+        lyr, ts, ja_units = load_lrc_ts(args.lrc, args.wav)
         src = args.lrc
         n = len(ts)
-        print(f"LRC 时间轴: {n} 字", file=sys.stderr)
+        if ja_units and any(x for x in ja_units):
+            k = sum(1 for x in ja_units if x and x[0])
+            print(f"LRC 时间轴: {n} 字（日文通路命中 {k} 字）", file=sys.stderr)
+        else:
+            print(f"LRC 时间轴: {n} 字", file=sys.stderr)
     else:
+        ja_units = None          # ASR / --text 通路仍走中文 pypinyin
         if args.text:
             lyr = norm_text(open(args.text, encoding="utf-8").read())
             src = args.text
@@ -591,6 +747,7 @@ def main():
             cues.append({"start": round(a, 3), "end": round(b, 3), "value": v})
 
     chars = []
+    latin_spans = []      # 多音节拉丁词，循环后按元音均分展开
     prev_end = 0.0
 
     # 能量门限：按实际音频判静音，而不是按字间隔时长猜。
@@ -690,7 +847,18 @@ def main():
                     if cut < hold_end:
                         hold_end = cut
 
-        shape, ini = shape_of(ch, pinyin, Style)
+        jv = ja_units[i] if ja_units else None
+        if jv is not None:
+            # 日文/拉丁 unit：元音直接来自读音（见 ja_unit_vowels）
+            vs, clo = jv
+            if vs:
+                shape = JA_VOWEL_SHAPE.get(vs[0], "C")
+            else:
+                # 标点/延音记号：沿用上一个口型，不要凭空张一下
+                shape = chars[-1]["shape"] if chars else "C"
+            ini = "A" if clo else ""
+        else:
+            shape, ini = shape_of(ch, pinyin, Style)
 
         # Melodic accent（VOCAL 的 Ma）：短元音不给满开口。
         # 论文指出语音模型用于唱歌时的典型失败是短元音 over-articulate ——
@@ -724,6 +892,11 @@ def main():
         else:
             body_start = st
             body_end = hold_end
+
+        # 多音节拉丁词（Leben→ee / Augen→aue / hokori→ooi）：一个 unit 只给一个
+        # 口型太粗（德语段整词只有一下），记下来在循环后按元音个数均分。
+        if jv is not None and len(jv[0]) > 1:
+            latin_spans.append((body_start, body_end, jv[0]))
 
         # 拖腔处理：「枣核型」两段式，而不是按音量密集切分。
         #
@@ -763,6 +936,22 @@ def main():
                 push(prev_end, tail, cues[-1]["value"] if cues else "X")
             if info.duration > tail:
                 push(tail, info.duration, "X")
+
+    # 多音节拉丁词展开：把该词那一整段 cue 按元音个数等分（Leben→e,e；Augen→a,u,e）。
+    # 只替换「起点终点都与词的 body 段完全吻合」的那一条，不动 hold/拖腔逻辑。
+    for bs, be, vs in latin_spans:
+        k = len(vs)
+        if k < 2 or be - bs < 1e-3:
+            continue
+        idx = next((j for j, c in enumerate(cues)
+                    if abs(c["start"] - bs) < 1e-6 and abs(c["end"] - be) < 1e-6), None)
+        if idx is None:
+            continue
+        step = (be - bs) / k
+        cues[idx:idx + 1] = [
+            {"start": round(bs + i * step, 3), "end": round(bs + (i + 1) * step, 3),
+             "value": FOLD.get(JA_VOWEL_SHAPE.get(vs[i], "C"), JA_VOWEL_SHAPE.get(vs[i], "C"))}
+            for i in range(k)]
 
     out = {"metadata": {"soundFile": os.path.abspath(args.wav),
                         "duration": round(info.duration, 3),
