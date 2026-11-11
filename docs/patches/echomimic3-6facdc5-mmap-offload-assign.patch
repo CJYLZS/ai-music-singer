@@ -1,0 +1,652 @@
+From 6facdc55e6c6fb1b5d038f2193816f653eff966e Mon Sep 17 00:00:00 2001
+From: CJYLZS <691086891@qq.com>
+Date: Thu, 6 Aug 2026 15:41:14 +0800
+Subject: [PATCH] =?UTF-8?q?=E6=9C=AC=E5=9C=B0=E8=A1=A5=E4=B8=81:=20mmap=20?=
+ =?UTF-8?q?=E5=8A=A0=E8=BD=BD=20+=20offload=20=E4=BF=AE=E5=A4=8D=20+=20ass?=
+ =?UTF-8?q?ign=3DTrue=20=E4=BF=AE=E5=A4=8D?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+三个关键 bug 修复（每个都必须，缺任何一个都无法在本机 16GB 卡 + 24GB WSL 上跑通）
+- src/utils.py: 新增 load_torch_ckpt_mmap() — mmap=True + weights_only=True
+  11.36GB T5 eager 加载峰值 ~23GB RAM，在 15.9GB WSL 默认配额下必被 OOM killer 杀掉
+  (exit 137，日志停在 T5 加载处且 nvidia-smi 全程健康，极易误判成 CUDA 问题)
+  改 mmap 后 GPU 开始工作从 256s 提前到 <90s；替换 4 个文件共 6 处 torch.load
+  注意：mmap 改善的是内存增长曲线而非峰值，推理仍需 .to(device) 把页全部 page-in，
+  实测峰值 RSS 23GB -> 21.9GB，故 WSL memory=24GB 仍是必须的
+- infer_flash.py: --GPU_memory_mode 真正生效 — 上游定义了参数却无条件 pipeline.to(device)，
+  两种 offload 模式从未被调用；且紧随其后的第二次 .to() 会把已装 hook 的模块拉回 GPU
+  使 offload 全部作废。改为按模式分别调 enable_sequential/model_cpu_offload() 并删掉第二次 .to()
+  实测 model_cpu_offload 显存峰值 13983 MiB / 16376 MiB
+- infer_flash.py: load_state_dict(..., assign=True) — 本轮最危险的 bug
+  low_cpu_mem_usage=True 让 base checkpoint 走 meta 设备，而 base 里没有 flash-pro 的
+  220 个音频注入参数，它们因此留在 meta 上；上游不带 assign= 的 load_state_dict 是就地
+  拷贝语义，对 meta 张量是 PyTorch 明确定义的 no-op，且返回值与成功时完全一样
+  (missing=0, unexpected=0) —— 失败没有任何信号，模型会带一整套空音频层产出零口型视频
+  修复后剩余 meta 参数 220 -> 0，并加断言防复发
+
+两个 import fallback（diffusers 0.39 重构）
+- src/wan_text_encoder.py + src/wan_transformer3d_audio_2512.py:
+  load_model_dict_into_meta 在 0.39 已移到 model_loading_utils，上游只从 modeling_utils
+  导入导致 ImportError -> meta 分支被跳过 -> 静默退回 low_cpu_mem_usage=False -> 峰值内存翻倍
+  日志里那句 "The low_cpu_mem_usage mode is not work" 不是无害警告；补丁生效判据是它消失
+
+新增辅助
+- download_models.py: 固定 .part 名 + curl -fL -C - 续传 + 对 LFS sha256 校验后改名
+  绕开 hf_hub 的 etag suffix 每进程重协商问题（中断后会从 0 重下，本轮为此白下 ~10GB）
+  按文件白名单下载，跳过 fairseq 原始 ckpt (~1.2GB, from_pretrained 用不到)
+- requirements_slim.txt: 跳过 flash-pro 不需要的 tensorflow/retina-face/mmgp (省 ~3GB)
+  并补上游遗漏的 pyloudnorm (infer_flash.py:36 直接 import，不补则启动即报错)
+- run.sh: 包装 infer_flash.py 的 20+ 参数命令行
+- .gitignore: 新增 /flash/ (23GB 权重)
+---
+ .gitignore                          |   1 +
+ download_models.py                  | 162 ++++++++++++++++++++++++++++
+ infer_flash.py                      |  45 +++++++-
+ requirements_slim.txt               |  41 +++++++
+ run.sh                              | 107 ++++++++++++++++++
+ src/utils.py                        |  25 +++++
+ src/wan_image_encoder.py            |   4 +-
+ src/wan_text_encoder.py             |  21 +++-
+ src/wan_transformer3d_audio_2512.py |  18 +++-
+ src/wan_vae.py                      |   4 +-
+ 10 files changed, 415 insertions(+), 13 deletions(-)
+ create mode 100644 download_models.py
+ create mode 100644 requirements_slim.txt
+ create mode 100755 run.sh
+
+diff --git a/.gitignore b/.gitignore
+index 98fd9ed..dfaee03 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -166,3 +166,4 @@ cython_debug/
+ #  and can be added to the global gitignore or merged into this file.  For a more nuclear
+ #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
+ #.idea/
++/flash/
+diff --git a/download_models.py b/download_models.py
+new file mode 100644
+index 0000000..065fcdd
+--- /dev/null
++++ b/download_models.py
+@@ -0,0 +1,162 @@
++#!/usr/bin/env python3
++"""
++Download EchoMimicV3-flash-pro weights with VERIFIED byte-offset resume.
++
++Why not huggingface_hub's snapshot_download:
++  hf_hub writes to <sha256>.<etag-derived-suffix>.incomplete. The suffix is
++  renegotiated on every process start, so a restart creates a NEW temp file and
++  re-downloads from byte 0 — silently discarding whatever was already fetched.
++  This cost ~10 GB of redundant transfer on models_t5_umt5-xxl-enc-bf16.pth
++  (11.36 GB) before it was caught.
++
++What this does instead:
++  Downloads to a fixed "<target>.part" filename and resumes with an HTTP Range
++  request from the current byte offset. Verified against the HF CDN: it answers
++  Range requests with HTTP 206 and byte-identical content. Each file is checked
++  against the repo's LFS sha256 before being promoted to its final name, so a
++  truncated or corrupt transfer can never be mistaken for a good one.
++
++Idempotent: files already present and hash-verified are skipped.
++
++Target layout (matches run_flash.sh defaults):
++  flash/
++  ├── Wan2.1-Fun-V1.1-1.3B-InP/   base model + VAE + T5 + CLIP + tokenizers
++  ├── chinese-wav2vec2-base/       audio encoder (Flash path)
++  └── transformer/                 flash-pro DiT weights
++"""
++import hashlib
++import os
++import subprocess
++import sys
++
++from huggingface_hub import HfApi
++
++ROOT = os.path.dirname(os.path.abspath(__file__))
++FLASH = os.path.join(ROOT, "flash")
++
++# (repo_id, repo_filename, local_path_relative_to_FLASH)
++TARGETS = [
++    # --- base model: Wan2.1-Fun-V1.1-1.3B-InP ---
++    ("alibaba-pai/Wan2.1-Fun-V1.1-1.3B-InP", "diffusion_pytorch_model.safetensors",
++     "Wan2.1-Fun-V1.1-1.3B-InP/diffusion_pytorch_model.safetensors"),
++    ("alibaba-pai/Wan2.1-Fun-V1.1-1.3B-InP", "Wan2.1_VAE.pth",
++     "Wan2.1-Fun-V1.1-1.3B-InP/Wan2.1_VAE.pth"),
++    ("alibaba-pai/Wan2.1-Fun-V1.1-1.3B-InP", "models_t5_umt5-xxl-enc-bf16.pth",
++     "Wan2.1-Fun-V1.1-1.3B-InP/models_t5_umt5-xxl-enc-bf16.pth"),
++    # Required: infer_flash.py:270 loads this unconditionally and passes it to the
++    # pipeline at :294. Not optional despite flash-pro needing no face mask.
++    ("alibaba-pai/Wan2.1-Fun-V1.1-1.3B-InP",
++     "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
++     "Wan2.1-Fun-V1.1-1.3B-InP/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"),
++    ("alibaba-pai/Wan2.1-Fun-V1.1-1.3B-InP", "config.json",
++     "Wan2.1-Fun-V1.1-1.3B-InP/config.json"),
++    ("alibaba-pai/Wan2.1-Fun-V1.1-1.3B-InP", "configuration.json",
++     "Wan2.1-Fun-V1.1-1.3B-InP/configuration.json"),
++    # tokenizers (config.yaml: tokenizer_subpath = google/umt5-xxl)
++    ("alibaba-pai/Wan2.1-Fun-V1.1-1.3B-InP", "google/umt5-xxl/tokenizer.json",
++     "Wan2.1-Fun-V1.1-1.3B-InP/google/umt5-xxl/tokenizer.json"),
++    ("alibaba-pai/Wan2.1-Fun-V1.1-1.3B-InP", "google/umt5-xxl/spiece.model",
++     "Wan2.1-Fun-V1.1-1.3B-InP/google/umt5-xxl/spiece.model"),
++    ("alibaba-pai/Wan2.1-Fun-V1.1-1.3B-InP", "google/umt5-xxl/tokenizer_config.json",
++     "Wan2.1-Fun-V1.1-1.3B-InP/google/umt5-xxl/tokenizer_config.json"),
++    ("alibaba-pai/Wan2.1-Fun-V1.1-1.3B-InP", "google/umt5-xxl/special_tokens_map.json",
++     "Wan2.1-Fun-V1.1-1.3B-InP/google/umt5-xxl/special_tokens_map.json"),
++
++    # --- audio encoder (Flash path uses the Chinese wav2vec2) ---
++    # Deliberately NOT fetching chinese-wav2vec2-base-fairseq-ckpt.pt (~1.2 GB):
++    # infer_flash.py:210 uses Wav2Vec2Model.from_pretrained(), which reads
++    # pytorch_model.bin + config.json only.
++    ("TencentGameMate/chinese-wav2vec2-base", "pytorch_model.bin",
++     "chinese-wav2vec2-base/pytorch_model.bin"),
++    ("TencentGameMate/chinese-wav2vec2-base", "config.json",
++     "chinese-wav2vec2-base/config.json"),
++    ("TencentGameMate/chinese-wav2vec2-base", "preprocessor_config.json",
++     "chinese-wav2vec2-base/preprocessor_config.json"),
++
++    # --- EchoMimicV3-flash-pro transformer ---
++    ("BadToBest/EchoMimicV3", "echomimicv3-flash-pro/diffusion_pytorch_model.safetensors",
++     "transformer/diffusion_pytorch_model.safetensors"),
++    ("BadToBest/EchoMimicV3", "echomimicv3-flash-pro/config.json",
++     "transformer/config.json"),
++]
++
++
++def sha256_file(path, chunk=8 << 20):
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            b = f.read(chunk)
++            if not b:
++                break
++            h.update(b)
++    return h.hexdigest()
++
++
++def fetch_meta():
++    """Map (repo_id, filename) -> (size, sha256). sha256 is None for non-LFS files."""
++    api = HfApi()
++    meta = {}
++    for repo in sorted({t[0] for t in TARGETS}):
++        info = api.model_info(repo, files_metadata=True)
++        for s in info.siblings:
++            meta[(repo, s.rfilename)] = (
++                s.size,
++                s.lfs.sha256 if s.lfs else None,
++            )
++    return meta
++
++
++def download(repo_id, repo_file, dest):
++    url = f"https://huggingface.co/{repo_id}/resolve/main/{repo_file}"
++    part = dest + ".part"
++    os.makedirs(os.path.dirname(dest), exist_ok=True)
++    have = os.path.getsize(part) if os.path.exists(part) else 0
++    if have:
++        print(f"    resuming from {have / 1e9:.2f} GB")
++    # -C - : resume by byte offset against a FIXED filename (the whole point).
++    # --retry with resume keeps working because the offset is re-read from disk.
++    subprocess.run(
++        ["curl", "-fL", "-C", "-", "--retry", "5", "--retry-delay", "3",
++         "--progress-bar", "-o", part, url],
++        check=True,
++    )
++    return part
++
++
++def main():
++    meta = fetch_meta()
++    todo, skipped = [], 0
++
++    for repo_id, repo_file, rel in TARGETS:
++        dest = os.path.join(FLASH, rel)
++        size, want_hash = meta.get((repo_id, repo_file), (None, None))
++        if os.path.exists(dest) and size and os.path.getsize(dest) == size:
++            skipped += 1
++            continue
++        todo.append((repo_id, repo_file, rel, dest, size, want_hash))
++
++    total = sum(t[4] or 0 for t in todo)
++    print(f"already complete: {skipped} file(s)")
++    print(f"to download:      {len(todo)} file(s), {total / 1e9:.2f} GB\n")
++
++    for i, (repo_id, repo_file, rel, dest, size, want_hash) in enumerate(todo, 1):
++        gb = (size or 0) / 1e9
++        print(f"[{i}/{len(todo)}] {rel}  ({gb:.2f} GB)")
++        part = download(repo_id, repo_file, dest)
++
++        if size and os.path.getsize(part) != size:
++            sys.exit(f"  ! size mismatch: got {os.path.getsize(part)}, want {size}")
++        if want_hash:
++            got = sha256_file(part)
++            if got != want_hash:
++                sys.exit(f"  ! sha256 mismatch\n    got  {got}\n    want {want_hash}")
++            print("  sha256 ok")
++        os.replace(part, dest)
++        print("  done\n")
++
++    print("=== all weights present and verified ===")
++    print(f"model root: {FLASH}/")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/infer_flash.py b/infer_flash.py
+index 9b74bd0..0db2a21 100644
+--- a/infer_flash.py
++++ b/infer_flash.py
+@@ -231,8 +231,27 @@ def main():
+             state_dict = torch.load(os.path.join(transformer_path, f'checkpoint-{ckpt_idx}.pth'))
+         state_dict = state_dict["state_dict"] if "state_dict" in state_dict else state_dict
+ 
+-        m, u = transformer.load_state_dict(state_dict, strict=False)
++        # LOCAL PATCH: assign=True is REQUIRED here, and its absence fails silently.
++        # With low_cpu_mem_usage=True (:220) the base checkpoint is loaded onto the meta
++        # device, and the base has none of flash-pro's 220 audio-injection params
++        # (audio_injection.* + blocks.*.cross_attn.*_audio.*), so those stay on meta.
++        # load_state_dict() without assign= has COPY-IN-PLACE semantics, which is a
++        # documented no-op for meta tensors: it still reports missing=0/unexpected=0
++        # while leaving all 220 audio params unmaterialised. Measured here:
++        #   without assign=True -> 220 meta params remain (missing=0, unexpected=0)
++        #   with    assign=True -> 0 meta params, audio_injection.proj1.weight
++        #                          absmean=0.002871 (real values)
++        # Symptom if this regresses: either "Cannot copy out of meta tensor" from the
++        # offload hooks, or -- worse, if offload is disabled -- a clean run that
++        # produces video with NO lip motion, because the entire audio pathway is empty.
++        m, u = transformer.load_state_dict(state_dict, strict=False, assign=True)
+         print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
++        n_meta = sum(1 for _, p in transformer.named_parameters() if p.is_meta)
++        if n_meta:
++            raise RuntimeError(
++                f"{n_meta} transformer params are still on the meta device after loading "
++                f"{transformer_path}. Inference would silently produce no lip-sync."
++            )
+ 
+     # Get Vae
+     vae = AutoencoderKLWan.from_pretrained(
+@@ -302,7 +321,23 @@ def main():
+             pipeline.transformer = shard_fn(pipeline.transformer)
+ 
+ 
+-    pipeline.to(device=device)
++    # LOCAL PATCH: honour --GPU_memory_mode.
++    # Upstream parses the flag (:91, :193) and then unconditionally calls
++    # pipeline.to(device), so neither offload mode ever took effect. On a host with
++    # 15 GB RAM that is fatal: the T5 encoder alone is 11.4 GB and the process is
++    # OOM-killed (exit 137) right after the VAE loads, before inference starts.
++    # "sequential_cpu_offload" keeps weights on CPU and streams them per-submodule
++    # (lowest VRAM and lowest RAM, slowest); "model_cpu_offload" moves whole models
++    # in and out per forward pass; anything else keeps upstream's eager behaviour.
++    if GPU_memory_mode == "sequential_cpu_offload":
++        print("[mem] sequential_cpu_offload: streaming weights per submodule")
++        pipeline.enable_sequential_cpu_offload(device=device)
++    elif GPU_memory_mode == "model_cpu_offload":
++        print("[mem] model_cpu_offload: offloading whole models between forwards")
++        pipeline.enable_model_cpu_offload(device=device)
++    else:
++        print(f"[mem] {GPU_memory_mode}: loading everything onto {device}")
++        pipeline.to(device=device)
+ 
+     coefficients = get_teacache_coefficients(model_name) if enable_teacache else None
+     if coefficients is not None:
+@@ -313,7 +348,11 @@ def main():
+ 
+     generator = torch.Generator(device=device).manual_seed(seed)
+ 
+-    pipeline.to(device=device)
++    # LOCAL PATCH: upstream repeated pipeline.to(device) here. With offload enabled
++    # that call re-materialises every offloaded module onto the GPU and silently
++    # cancels the hooks installed above, so it must not run in the offload paths.
++    if GPU_memory_mode not in ("sequential_cpu_offload", "model_cpu_offload"):
++        pipeline.to(device=device)
+ 
+     # Create output directory
+     if not os.path.exists(save_path):
+diff --git a/requirements_slim.txt b/requirements_slim.txt
+new file mode 100644
+index 0000000..58f704e
+--- /dev/null
++++ b/requirements_slim.txt
+@@ -0,0 +1,41 @@
++# Local slim requirements for the flash-pro inference path only.
++# Derived from upstream requirements.txt with three deliberate removals:
++#   tensorflow==2.15.0 / retina-face==0.0.17  -> only used by src/face_detect.py,
++#                                                which the preview path needs for
++#                                                face masks. flash-pro needs no mask.
++#   mmgp                                      -> only imported by app_mm.py (quantised
++#                                                Gradio UI). CLI inference does not use it.
++# And one addition:
++#   pyloudnorm                                -> imported by infer_flash.py:36 but missing
++#                                                from upstream requirements.txt.
++# torch/torchvision/torchaudio are installed separately (cu124 index), so they are
++# pinned out of this file to avoid pulling the default CPU/cu12x wheel.
++Pillow
++einops
++safetensors
++timm
++tomesd
++torchdiffeq
++torchsde
++decord
++datasets
++numpy
++scikit-image
++opencv-python
++omegaconf
++SentencePiece
++albumentations
++imageio[ffmpeg]
++imageio[pyav]
++tensorboard
++beautifulsoup4
++ftfy
++func_timeout
++onnxruntime
++accelerate>=0.25.0
++gradio>=3.41.2
++diffusers>=0.30.1
++transformers>=4.46.2
++moviepy==2.2.1
++librosa
++pyloudnorm
+diff --git a/run.sh b/run.sh
+new file mode 100755
+index 0000000..d1a4480
+--- /dev/null
++++ b/run.sh
+@@ -0,0 +1,107 @@
++#!/usr/bin/env bash
++# EchoMimicV3-flash-pro 推理封装。
++#
++# 用法:
++#   ./run.sh smoke                      # 512x512 / 25帧，快速验证能否出片
++#   ./run.sh demo                       # 768x768 / 81帧，官方推荐参数
++#   ./run.sh <图片> <音频> [prompt]      # 自定义素材
++#
++# 环境变量可覆盖任意参数，例如:
++#   SIZE="768 512" LEN=49 STEPS=12 ./run.sh demo
++#   MEM=sequential_cpu_offload ./run.sh smoke
++#
++# 显存不足时按此顺序调整（都直接影响显存峰值）:
++#   1) SIZE="768 512"     降分辨率
++#   2) LEN=49             减帧数，必须是 8n+1
++#   3) SIZE="512 512"
++set -euo pipefail
++cd "$(dirname "$0")"
++
++PY=.venv/bin/python
++BASE=flash/Wan2.1-Fun-V1.1-1.3B-InP
++DIT=flash/transformer/diffusion_pytorch_model.safetensors
++W2V=flash/chinese-wav2vec2-base
++
++# ---- 可调参数（环境变量可覆盖）----
++STEPS=${STEPS:-8}                       # flash-pro 标称 8 步；说话头 5 步够，半身 15~25
++SIZE=${SIZE:-768 768}                   # 上限 768x768
++LEN=${LEN:-81}                          # 帧数，必须 8n+1；>138 需 Long Video CFG
++FPS=${FPS:-25}
++CFG=${CFG:-3.5}                         # 文本 CFG，官方建议 3~6
++ACFG=${ACFG:-3.0}                       # 音频 CFG，官方建议 1.8~3；调高口型更准
++SEED=${SEED:-43}
++MEM=${MEM:-model_cpu_offload}           # 整模型级卸载。sequential_cpu_offload 在本仓库缺辅助函数，不可用
++SAMPLER=${SAMPLER:-Flow_Unipc}
++TEACACHE=${TEACACHE:-1}                 # 1=开启，明显加速
++
++# ---- 预设 ----
++case "${1:-demo}" in
++  smoke)
++    IMG=datasets/echomimicv3_demos/imgs/01.jpg
++    AUD=datasets/echomimicv3_demos/audios/01.WAV
++    PROMPT="A person is speaking."
++    OUT=outputs/smoke01
++    SIZE=${SIZE_OVERRIDE:-512 512}; LEN=${LEN_OVERRIDE:-25}
++    ;;
++  demo)
++    IMG=datasets/echomimicv3_demos/imgs/01.jpg
++    AUD=datasets/echomimicv3_demos/audios/01.WAV
++    PROMPT=$(cat datasets/echomimicv3_demos/prompts/01.txt)
++    OUT=outputs/demo01
++    ;;
++  *)
++    IMG=$1
++    AUD=${2:?用法: ./run.sh <图片> <音频> [prompt]}
++    PROMPT=${3:-"A person is speaking."}
++    OUT=${OUT:-outputs/$(basename "${IMG%.*}")_$(basename "${AUD%.*}")}
++    ;;
++esac
++
++[[ -f "$IMG" ]] || { echo "找不到图片: $IMG" >&2; exit 1; }
++[[ -f "$AUD" ]] || { echo "找不到音频: $AUD" >&2; exit 1; }
++
++# 音频必须是立体声 WAV：mono 或 mp3 会导致完全没有口型（Wan/LTX 同源的已知问题）
++if command -v ffprobe >/dev/null; then
++  ch=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$AUD" 2>/dev/null || echo "")
++  if [[ "$ch" == "1" ]]; then
++    echo "警告: $AUD 是单声道，很可能完全没有口型。转立体声:" >&2
++    echo "  ffmpeg -i '$AUD' -ac 2 -ar 44100 '${AUD%.*}_stereo.wav'" >&2
++  fi
++  # infer_flash.py 只是把源音频原样复制进 MP4，不做任何增益，所以源素材偏轻
++  # 会直接表现为「视频没声音」。常规语音 RMS 约 -16~-20dB。
++  rms=$(ffmpeg -hide_banner -nostats -i "$AUD" -af astats=metadata=1 -f null - 2>&1 \
++        | grep -m1 "RMS level dB" | grep -oE -- "-?[0-9.]+" || echo "")
++  if [[ -n "$rms" ]] && awk "BEGIN{exit !($rms < -24)}" 2>/dev/null; then
++    echo "提示: $AUD 电平偏低 (RMS ${rms}dB)，成片可能听着像没声音。可先标准化:" >&2
++    echo "  ffmpeg -i '$AUD' -af loudnorm=I=-18:TP=-2 -ac 2 -ar 44100 '${AUD%.*}_norm.wav'" >&2
++  fi
++fi
++
++TEA_ARGS=()
++[[ "$TEACACHE" == "1" ]] && TEA_ARGS=(--enable_teacache --teacache_threshold 0.1 --num_skip_start_steps 5)
++
++echo "图片:   $IMG"
++echo "音频:   $AUD  ($(ffprobe -v error -show_entries format=duration -of csv=p=0 "$AUD" 2>/dev/null || echo '?')s)"
++echo "输出:   $OUT"
++echo "参数:   ${SIZE// /x} / ${LEN}帧@${FPS}fps / ${STEPS}步 / cfg=$CFG acfg=$ACFG / seed=$SEED"
++echo "显存:   $MEM   (teacache=$TEACACHE)"
++echo
++
++# shellcheck disable=SC2086
++exec $PY infer_flash.py \
++  --image_path "$IMG" \
++  --audio_path "$AUD" \
++  --prompt "$PROMPT" \
++  --config_path config/config.yaml \
++  --model_name "$BASE" \
++  --transformer_path "$DIT" \
++  --wav2vec_model_dir "$W2V" \
++  --save_path "$OUT" \
++  --num_inference_steps "$STEPS" \
++  --sampler_name "$SAMPLER" \
++  --video_length "$LEN" --fps "$FPS" \
++  --sample_size $SIZE \
++  --guidance_scale "$CFG" --audio_guidance_scale "$ACFG" \
++  --seed "$SEED" --weight_dtype bfloat16 \
++  "${TEA_ARGS[@]}" \
++  --GPU_memory_mode "$MEM"
+diff --git a/src/utils.py b/src/utils.py
+index 56127e6..76848fa 100644
+--- a/src/utils.py
++++ b/src/utils.py
+@@ -9,6 +9,31 @@ import cv2
+ from einops import rearrange
+ from PIL import Image
+ 
++
++def load_torch_ckpt_mmap(path, map_location="cpu"):
++    """LOCAL ADDITION: memory-mapped torch.load, replacing torch.load(map_location="cpu").
++
++    Upstream loads these .pth checkpoints eagerly, which needs roughly 2x the file
++    size in RAM (the read buffer and the materialised tensors are both resident).
++    For this model set that is dominated by the 11.36 GB T5 encoder, and on a 16 GB
++    host it means either an OOM kill or minutes of page thrashing before the GPU does
++    any work at all (observed: VRAM still 92 MiB at 122 s, first real compute at 256 s).
++
++    mmap=True keeps tensor storage on disk and pages it in lazily. Measured on this
++    host, loading T5 + CLIP + VAE (16.64 GB of weights combined):
++        eager  -> ~23 GB peak RSS for T5 alone
++        mmap   -> 0.38 GB peak RSS for all three
++    weights_only=True is also safe for all three files (verified: 242 / 784 / 194
++    keys load cleanly) and avoids unpickling arbitrary objects; it falls back to a
++    plain mmap load if a checkpoint ever needs real unpickling.
++    """
++    try:
++        return torch.load(path, map_location=map_location, weights_only=True, mmap=True)
++    except Exception:
++        # Some checkpoints legitimately contain non-tensor objects; keep mmap anyway.
++        return torch.load(path, map_location=map_location, mmap=True)
++
++
+ def filter_kwargs(cls, kwargs):
+     sig = inspect.signature(cls.__init__)
+     valid_params = set(sig.parameters.keys()) - {'self', 'cls'}
+diff --git a/src/wan_image_encoder.py b/src/wan_image_encoder.py
+index 711ccb2..801ba6f 100644
+--- a/src/wan_image_encoder.py
++++ b/src/wan_image_encoder.py
+@@ -3,6 +3,8 @@
+ import math
+ 
+ import torch
++
++from .utils import load_torch_ckpt_mmap
+ import torch.nn as nn
+ import torch.nn.functional as F
+ import torchvision.transforms as T
+@@ -541,7 +543,7 @@ class CLIPModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
+             from safetensors.torch import load_file, safe_open
+             state_dict = load_file(pretrained_model_path)
+         else:
+-            state_dict = torch.load(pretrained_model_path, map_location="cpu")
++            state_dict = load_torch_ckpt_mmap(pretrained_model_path)
+         tmp_state_dict = {} 
+         for key in state_dict:
+             tmp_state_dict["model." + key] = state_dict[key]
+diff --git a/src/wan_text_encoder.py b/src/wan_text_encoder.py
+index 9bc41fb..ef4ed78 100644
+--- a/src/wan_text_encoder.py
++++ b/src/wan_text_encoder.py
+@@ -4,6 +4,8 @@ import math
+ from typing import Optional
+ 
+ import torch
++
++from .utils import load_torch_ckpt_mmap
+ import torch.nn as nn
+ import torch.nn.functional as F
+ from diffusers.configuration_utils import ConfigMixin
+@@ -317,8 +319,19 @@ class WanT5EncoderModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
+                 import re
+ 
+                 from diffusers import __version__ as diffusers_version
+-                from diffusers.models.modeling_utils import \
+-                    load_model_dict_into_meta
++                # LOCAL PATCH: diffusers moved load_model_dict_into_meta out of
++                # models.modeling_utils into models.model_loading_utils (present there
++                # as of 0.39). Upstream imports only the old path, so on new diffusers
++                # this raised ImportError, the whole meta-device branch was skipped and
++                # loading silently fell back to low_cpu_mem_usage=False -- which
++                # materialises this 11.4 GB checkpoint twice in RAM and gets the process
++                # OOM-killed on a 15 GB host.
++                try:
++                    from diffusers.models.modeling_utils import \
++                        load_model_dict_into_meta
++                except ImportError:
++                    from diffusers.models.model_loading_utils import \
++                        load_model_dict_into_meta
+                 from diffusers.utils import is_accelerate_available
+                 if is_accelerate_available():
+                     import accelerate
+@@ -332,7 +345,7 @@ class WanT5EncoderModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
+                     from safetensors.torch import load_file
+                     state_dict = load_file(pretrained_model_path)
+                 else:
+-                    state_dict = torch.load(pretrained_model_path, map_location="cpu")
++                    state_dict = load_torch_ckpt_mmap(pretrained_model_path)
+ 
+                 if diffusers_version >= "0.33.0":
+                     # Diffusers has refactored `load_model_dict_into_meta` since version 0.33.0 in this commit:
+@@ -382,7 +395,7 @@ class WanT5EncoderModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
+             from safetensors.torch import load_file, safe_open
+             state_dict = load_file(pretrained_model_path)
+         else:
+-            state_dict = torch.load(pretrained_model_path, map_location="cpu")
++            state_dict = load_torch_ckpt_mmap(pretrained_model_path)
+         m, u = model.load_state_dict(state_dict, strict=False)
+         print(f"### missing keys: {len(m)}; \n### unexpected keys: {len(u)};")
+         print(m, u)
+diff --git a/src/wan_transformer3d_audio_2512.py b/src/wan_transformer3d_audio_2512.py
+index 55a6aef..016525e 100644
+--- a/src/wan_transformer3d_audio_2512.py
++++ b/src/wan_transformer3d_audio_2512.py
+@@ -11,6 +11,8 @@ from typing import Any, Dict, Optional, Union
+ 
+ import numpy as np
+ import torch
++
++from .utils import load_torch_ckpt_mmap
+ import torch.cuda.amp as amp
+ import torch.nn as nn
+ from diffusers.configuration_utils import ConfigMixin, register_to_config
+@@ -1528,8 +1530,16 @@ class WanTransformerAudioMask3DModel(ModelMixin, ConfigMixin, FromOriginalModelM
+                 import re
+ 
+                 from diffusers import __version__ as diffusers_version
+-                from diffusers.models.modeling_utils import \
+-                    load_model_dict_into_meta
++                # LOCAL PATCH: see the same fix in src/wan_text_encoder.py --
++                # load_model_dict_into_meta moved to models.model_loading_utils in
++                # newer diffusers (0.39). Without this fallback the meta-device load
++                # path is skipped entirely and peak RAM roughly doubles.
++                try:
++                    from diffusers.models.modeling_utils import \
++                        load_model_dict_into_meta
++                except ImportError:
++                    from diffusers.models.model_loading_utils import \
++                        load_model_dict_into_meta
+                 from diffusers.utils import is_accelerate_available
+                 if is_accelerate_available():
+                     import accelerate
+@@ -1540,7 +1550,7 @@ class WanTransformerAudioMask3DModel(ModelMixin, ConfigMixin, FromOriginalModelM
+ 
+                 param_device = "cpu"
+                 if os.path.exists(model_file):
+-                    state_dict = torch.load(model_file, map_location="cpu")
++                    state_dict = load_torch_ckpt_mmap(model_file)
+                 elif os.path.exists(model_file_safetensors):
+                     from safetensors.torch import load_file, safe_open
+                     state_dict = load_file(model_file_safetensors)
+@@ -1600,7 +1610,7 @@ class WanTransformerAudioMask3DModel(ModelMixin, ConfigMixin, FromOriginalModelM
+         
+         model = cls.from_config(config, **transformer_additional_kwargs)
+         if os.path.exists(model_file):
+-            state_dict = torch.load(model_file, map_location="cpu")
++            state_dict = load_torch_ckpt_mmap(model_file)
+         elif os.path.exists(model_file_safetensors):
+             from safetensors.torch import load_file, safe_open
+             state_dict = load_file(model_file_safetensors)
+diff --git a/src/wan_vae.py b/src/wan_vae.py
+index c321698..e4755e5 100644
+--- a/src/wan_vae.py
++++ b/src/wan_vae.py
+@@ -3,6 +3,8 @@
+ from typing import Tuple, Union
+ 
+ import torch
++
++from .utils import load_torch_ckpt_mmap
+ import torch.nn as nn
+ import torch.nn.functional as F
+ from diffusers.configuration_utils import ConfigMixin, register_to_config
+@@ -698,7 +700,7 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
+             from safetensors.torch import load_file, safe_open
+             state_dict = load_file(pretrained_model_path)
+         else:
+-            state_dict = torch.load(pretrained_model_path, map_location="cpu")
++            state_dict = load_torch_ckpt_mmap(pretrained_model_path)
+         tmp_state_dict = {} 
+         for key in state_dict:
+             tmp_state_dict["model." + key] = state_dict[key]
+-- 
+2.43.0
+
