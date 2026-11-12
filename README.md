@@ -355,6 +355,7 @@ setsid a25rig/render.sh --psd data/pics/figure.psd \
 | `--size` | `16:9` 或 `WxH`；**必须同时给背景**，否则 0 帧 |
 | `--bg` | 纯色/图片背景；`--bg-dim` 压暗、`--bg-blur` 景深 |
 | `--rain-glass <img>` | 玻璃水珠（角色**后**）；自带背景，**与 `--bg` 冲突，别同传** |
+| `--snow` | 雪花飘落（角色前/后分层）；`--snow-density` 默认 45/MP、`--snow-size` 5.5px@1080p |
 | `--glass-blur` | 玻璃模糊，默认 **0**（水痕才看得出变清晰；旧默认 3 时水痕只有周围 0.5×） |
 | `--streaks` | 落雨丝（角色**前**）；`--streak-density` 默认 2.8/MP，参考片实测 10/MP |
 | `--char-scale/-x/-y` | 缩放 / 位置（**x/y 是 0..1 比例**） |

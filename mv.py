@@ -76,13 +76,47 @@ RAIN_GLASS = os.path.join(PICS, "love_song.jpg")
 A25_RENDER = os.path.join(ROOT, "a25rig", "render.sh")
 FONTS_CONF = os.path.join(ROOT, ".tmp", "fontconf", "fonts.conf")
 
-# 渲染必须显式点名 NVIDIA 适配器 + ANGLE/GL，否则选到 AMD 核显或回落 SwiftShader
-RENDER_ENV = {
-    "MESA_LOADER_DRIVER_OVERRIDE": "d3d12",
-    "GALLIUM_DRIVER": "d3d12",
-    "MESA_D3D12_DEFAULT_ADAPTER_NAME": "NVIDIA",
-    "A25_GL_ARGS": "--use-gl=angle --use-angle=gl --ignore-gpu-blocklist",
-}
+# 渲染必须显式点名 NVIDIA 适配器 + ANGLE/GL，否则选到 AMD 核显或回落 SwiftShader。
+#
+# 但这组 GPU 变量有一个硬前提：ANGLE/GL 需要一个 X display。通过 SSH 进入 WSL 时
+# 默认没有 DISPLAY，此时强行给 --use-gl=angle 会让 Chrome 的 renderer 直接死掉
+# （WebGL 拿不到 context，随后 Target closed），进程一直挂着不返回 —— 2026-11 实测，
+# `timeout 60` 才结束。WSLg 提供了 :0（/tmp/.X11-unix/X0），所以：
+#   - 有 X0  → 设 DISPLAY=:0 + XDG_RUNTIME_DIR，启用 GPU（D3D12 走 NVIDIA）；
+#   - 无 X0  → 摘掉 A25_GL_ARGS 与 MESA 变量，让 Chrome 回落 SwiftShader（纯 CPU，
+#              慢但不会挂）。千万不要在无 DISPLAY 时保留 --use-gl=angle。
+def _render_env() -> dict:
+    env = {
+        "MESA_LOADER_DRIVER_OVERRIDE": "d3d12",
+        "GALLIUM_DRIVER": "d3d12",
+        "MESA_D3D12_DEFAULT_ADAPTER_NAME": "NVIDIA",
+        "A25_GL_ARGS": "--use-gl=angle --use-angle=gl --ignore-gpu-blocklist",
+    }
+    if os.path.exists("/tmp/.X11-unix/X0"):
+        env.setdefault("DISPLAY", ":0")
+        if os.path.isdir("/mnt/wslg/runtime-dir"):
+            env.setdefault("XDG_RUNTIME_DIR", "/mnt/wslg/runtime-dir")
+    else:
+        log.warning("  没有 WSLg X socket（/tmp/.X11-unix/X0）：回落 SwiftShader 软渲染")
+        for k in ("A25_GL_ARGS", "MESA_LOADER_DRIVER_OVERRIDE", "GALLIUM_DRIVER",
+                  "MESA_D3D12_DEFAULT_ADAPTER_NAME"):
+            env.pop(k, None)
+    # render.sh 用 `node` 启动驱动；SSH 会话的 PATH 里通常没有 nvm 的 node。
+    node = shutil.which("node")
+    if not node:
+        root = os.path.expanduser("~/.nvm/versions/node")
+        if os.path.isdir(root):
+            cands = sorted(os.listdir(root), reverse=True)
+            for v in cands:
+                p = os.path.join(root, v, "bin", "node")
+                if os.path.exists(p):
+                    env["PATH"] = os.path.join(root, v, "bin") + os.pathsep + \
+                        os.environ.get("PATH", "")
+                    break
+    return env
+
+
+RENDER_ENV = _render_env()
 
 
 def setup_logging(logfile: str, verbose: bool) -> None:
@@ -191,6 +225,13 @@ class Cfg:
     fps: int = 30
     size: str = "16:9"
     render_seed: int = 1
+    # 雪花飘落（a25rig setSnow）：像雨丝一样是显式粒子；这里只暴露观感旋钮。
+    snow: bool = False
+    snow_density: float = 45.0
+    snow_size: float = 5.5
+    snow_speed: float = 0.12
+    snow_wind: float = 0.35
+    snow_alpha: float = 0.85
     # --- subs ---
     subs: bool = True
     ass: str = ""             # 空 = mv/lyrics.ass
@@ -496,6 +537,12 @@ def stage_render(cfg: Cfg) -> None:
         cmd += ["--rain-glass", cfg.rain_glass]
         if cfg.streaks:
             cmd += ["--streaks"]
+    if cfg.snow:
+        cmd += ["--snow", "--snow-density", f"{cfg.snow_density:g}",
+                "--snow-size", f"{cfg.snow_size:g}",
+                "--snow-speed", f"{cfg.snow_speed:g}",
+                "--snow-wind", f"{cfg.snow_wind:g}",
+                "--snow-alpha", f"{cfg.snow_alpha:g}"]
     log.info(f"  素材: cues={os.path.basename(cfg.video_cues)}  audio="
              f"{os.path.basename(cfg.video_audio)}  beats={os.path.basename(cfg.beats_json)}")
     run(cmd, stage="render", env=RENDER_ENV, timeout=7200)
@@ -654,6 +701,18 @@ def main() -> None:
     ap.add_argument("--rain-glass", default=RAIN_GLASS, help="雨水玻璃背景图（默认 data/pics/love_song.jpg）")
     ap.add_argument("--no-streaks", dest="streaks", action="store_false", default=True,
                     help="雨天风格但不加落雨丝")
+    ap.add_argument("--snow", action="store_true",
+                    help="雪花飘落（a25rig setSnow；远/中/近三层，角色前方与后方都有）")
+    ap.add_argument("--snow-density", type=float, default=45.0,
+                    help="雪花密度（每百万像素片数，默认 45 ≈ 1080p 93 片）")
+    ap.add_argument("--snow-size", type=float, default=5.5,
+                    help="近层雪花半径 px@1080p（默认 5.5）")
+    ap.add_argument("--snow-speed", type=float, default=0.12,
+                    help="近层下落速度，画面高度/秒（默认 0.12）")
+    ap.add_argument("--snow-wind", type=float, default=0.35,
+                    help="共享风强度（默认 0.35）")
+    ap.add_argument("--snow-alpha", type=float, default=0.85,
+                    help="雪花不透明度（默认 0.85）")
     ap.add_argument("--char-scale", type=float, default=1.15)
     ap.add_argument("--char-x", type=float, default=0.62)
     ap.add_argument("--char-y", type=float, default=0.56)
@@ -704,6 +763,9 @@ def main() -> None:
               bg=args.bg, rain_glass=args.rain_glass, streaks=args.streaks,
               char_scale=args.char_scale, char_x=args.char_x, char_y=args.char_y,
               fps=args.fps, size=args.size, render_seed=args.render_seed,
+              snow=args.snow, snow_density=args.snow_density, snow_size=args.snow_size,
+              snow_speed=args.snow_speed, snow_wind=args.snow_wind,
+              snow_alpha=args.snow_alpha,
               subs=args.subs, ass=args.ass, fc=args.fc, font=args.font)
 
     setup_logging(cfg.log_file, args.verbose)
