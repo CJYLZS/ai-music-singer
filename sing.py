@@ -287,6 +287,11 @@ class Cfg:
     knn_pool_wav: str = ""   # 显式指定 kNN 检索池（覆盖 knn_full_pool）；可用相对 out_dir 的路径
     source_wav: str = ""   # SVC 源音频覆盖（音色归一化预处理实验）：替代 sep2/lead.wav 进
     # whisper 内容特征提取；F0 仍用 target_f0.npy（光谱编辑不改音高）。空 = 用 lead_wav
+    lead_wav_override: str = ""   # 主唱源覆盖（默认空 = sep2/lead.wav）。与 source_wav 的区别：
+    # 这个换的是「演唱本身」——f0-target、SVC 源、mix 的 --match-lead 参照、eval 锚点全部跟着换；
+    # source_wav 只换喂给 whisper 的音频，F0 与混音对齐仍以原主唱为准。
+    # 用途：sep2 的 karaoke 二分把主唱拆进 backing 时，用 sep1/vocal.wav（BS-RoFormer 全人声）
+    # 当演唱源补回来。见 AGENTS.md「二次分离丢人声」
     n_steps: int = 32
     cfg: float = 0.5   # 上游默认 3.0，实测偏高（见 AGENTS.md「cfg 扫点」）
     rescale_cfg: float = 0.75   # CFG 外推的 std 归一化混合比（上游默认，0=关闭归一化）
@@ -408,7 +413,21 @@ class Cfg:
 
     @property
     def lead_wav(self) -> str:
-        return self.p("sep2", "lead.wav")
+        """主唱源：--lead-wav 覆盖 > sep2/lead.wav。
+
+        覆盖时相对路径按 data/songs/<name>/ 解析（与 --knn-pool-wav 一致），
+        指向不存在的文件直接报错 —— 静默回退会让 A/B 看起来"改了没效果"。
+        """
+        if not self.lead_wav_override:
+            return self.p("sep2", "lead.wav")
+        p = self.lead_wav_override
+        if not os.path.isabs(p):
+            cand = os.path.join(self.out_dir, p)
+            if os.path.exists(cand):
+                return cand
+        if not os.path.exists(p):
+            raise Fail(f"--lead-wav 不存在: {self.lead_wav_override}")
+        return os.path.abspath(p)
 
     @property
     def ref_lead(self) -> str:
@@ -637,6 +656,8 @@ def stage_ref_sep(cfg: Cfg) -> None:
 
 def stage_f0_target(cfg: Cfg) -> None:
     banner("Stage: 主唱 F0 提取 (RMVPE)")
+    if cfg.lead_wav_override:
+        log.info(f"  主唱源: {cfg.lead_wav}（--lead-wav 覆盖，非 sep2/lead.wav）")
     run([VENVS["soulx"], os.path.join(WORKERS, "w_f0.py"),
          "--wav", cfg.lead_wav, "--out", cfg.target_f0,
          "--device", cfg.device, "--max-duration", "600"], stage="f0-target")
@@ -862,6 +883,8 @@ def _stage_svc_segprompt(cfg: Cfg) -> None:
     log.info("  段落级合成：静音优先切段（[seg_min, seg_max]）→ 每段音域匹配参考"
              f"（预算 {cfg.segprompt_budget:g}s）→ 前后 +{cfg.segprompt_pad_ext:g}s 冗余"
              f"（拼接裁掉）→ SVC 上限 {cfg.segprompt_svc_max:g}s")
+    if cfg.lead_wav_override:
+        log.info(f"  演唱源: {cfg.lead_wav}（--lead-wav 覆盖）")
     for p in (cfg.target_f0, cfg.lead_wav, cfg.p("cands_meta.json"),
               cfg.prompt_ext_wav, cfg.prompt_ext_f0):
         if not os.path.exists(p):
@@ -892,6 +915,7 @@ def _stage_svc_segprompt(cfg: Cfg) -> None:
            "--num-overlaps", str(cfg.num_overlaps),
            "--knn-alpha", str(cfg.knn_alpha),
            "--knn-k", str(cfg.knn_k),
+           "--lead-wav", os.path.abspath(cfg.lead_wav),
            "--device", cfg.device]
     if pool:
         cmd += ["--pool-wav", os.path.abspath(pool)]
@@ -1262,6 +1286,11 @@ def main() -> None:
     ap.add_argument("--source-wav", default="",
                     help="SVC 源音频覆盖（音色归一化预处理实验）：替代 sep2/lead.wav 进 whisper "
                          "内容特征提取，F0 仍用 target_f0.npy。见 docs/source-timbre-normalization-survey.md")
+    ap.add_argument("--lead-wav", default="",
+                    help="主唱源覆盖（默认 sep2/lead.wav）。相对路径按 data/songs/<name>/ 解析。"
+                         "与 --source-wav 不同：这里换的是演唱本身，f0-target / SVC 源 / "
+                         "mix 的 --match-lead / eval 锚点全部跟着换。用于 karaoke 二分把主唱"
+                         "拆进 backing 的歌，如 --lead-wav sep1/vocal.wav")
     ap.add_argument("--knn-k", type=int, default=4,
                     help="kNN 近邻数（默认 4，同 kNN-VC）")
     ap.add_argument("--knn-pool-wav", default="",
@@ -1432,6 +1461,7 @@ def main() -> None:
               knn_full_pool=args.knn_full_pool,
               knn_pool_wav=args.knn_pool_wav,
               source_wav=args.source_wav,
+              lead_wav_override=args.lead_wav,
               n_steps=args.n_steps, cfg=args.cfg, rescale_cfg=args.rescale_cfg,
               pitch_shift=args.pitch_shift,
               seed=args.seed, n_seeds=args.n_seeds, dp_lam=args.dp_lam,

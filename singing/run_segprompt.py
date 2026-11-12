@@ -202,6 +202,9 @@ def main() -> None:
                          "prompt_ext.wav。用来把「音域匹配」和「切段+30s 短 "
                          "prompt」两个因素分开")
     ap.add_argument("--tmp-dir", default="segprompt_tmp")
+    ap.add_argument("--lead-wav", default=None,
+                    help="主唱源覆盖（默认 <song-dir>/sep2/lead.wav）。sing.py --lead-wav "
+                         "据此换掉切段/推理用的演唱音频，f0 由 target_f0.npy 给出")
     ap.add_argument("--n-steps", type=int, default=32)
     ap.add_argument("--cfg", type=float, default=0.5)
     ap.add_argument("--rescale-cfg", type=float, default=0.75)
@@ -218,7 +221,8 @@ def main() -> None:
 
     d = ROOT / "data" / "songs" / args.song
     f0 = np.load(d / "target_f0.npy")
-    lead, sr = sf.read(str(d / "sep2" / "lead.wav"), dtype="float32")
+    lead_path = Path(args.lead_wav) if args.lead_wav else d / "sep2" / "lead.wav"
+    lead, sr = sf.read(str(lead_path), dtype="float32")
     cands = json.load(open(d / "cands_meta.json", encoding="utf-8"))
     tmp = d / args.tmp_dir
     tmp.mkdir(exist_ok=True)
