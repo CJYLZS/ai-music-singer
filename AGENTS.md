@@ -2417,30 +2417,11 @@ PSD 立绘 + `make_cues.py` 口型时间轴 → MV。上游是交互式浏览器
   Chrome 需要 libnss3/libnspr4，本机无 root，这些 `.so` 是 `apt-get download` +
   `dpkg-deb -x` 解到 `driver/nsslib/` 的。直接跑 node 会报
   `libnss3.so: cannot open shared object file`。
-- **`render` 阶段在「远程工作区 / SSH 会话」里跑不了 —— 根因是会话类型，不是沙箱权限
-  （2026-09 更正）。** 症状：`node a25rig/render.sh` 报 `exec: node: not found`（PATH 里没有
-  nvm 的 node），补上 PATH 后 `page.goto(base+'/index.html')` **30s Navigation timeout**，
-  或侥幸过了 goto 之后 `page.waitForFunction('window.__rig && window.agPsd && window.Rigger',
-  {timeout:60000})` **60s 超时、node exit 1**（日志里会先冒一条
-  `Failed to load resource: 404`，那是 favicon 之类，**是噪声不是病因**）。
-  **真正原因：命令由 harness 经 SSH 执行，SSH 会话拉不起 UI 进程**（headless Chrome 仍要经
-  Mesa d3d12 拿 GPU/设备），所以 `bash` 工具的 `sandbox_permissions: danger-full-access`
-  **并不能**解决 —— 2026-09 实测三种配置（普通 / `--use-gl=swiftshader` / `--use-gl=egl`）
-  在沙箱内外都复现同一条 goto 超时，提权那次也一样失败。
-  **解法：在交互式 WSL 会话里直接跑**（用户手动执行，实测 3000 帧 @ ~35 fps、100s 试片
-  渲染 86s + 烧字 13s，合计 1.7 分钟出片）。成功运行的日志开头能自证会话类型：
-  `env WAYLAND_DISPLAY=wayland-0`、`env WSL2_GUI_APPS_ENABLED=1`。
-  给用户执行的命令（node 必须来自 nvm）：
-  ```bash
-  cd /home/rookie/voice
-  export PATH="$HOME/.nvm/versions/node/v24.15.0/bin:$PATH"
-  python3 mv.py --song aliez --start 0 --end 100 --stages render,subs \
-      --bg data/songs/aliez/aliez.png --font "Yu Gothic"
-  ```
-  `mv.py --stages render` 负责拼 `MESA_LOADER_DRIVER_OVERRIDE=d3d12 ...` 那套 env + `setsid`，
-  文档不重复贴。**注意 `subs`（烧字幕）只是 `ffmpeg -vf ass`，不依赖 Chrome/GPU，SSH 里也能跑**；
-  只有 `render` 必须在交互式会话。诊断脚本 `a25rig/driver/probe_rig.mjs` 会依次试
-  4 种 GL 配置并打印 WebGL 实际渲染器，用于区分「会话问题」与「GL 真挂了」。
+- **`render` 阶段在 SSH 会话里的历史坑（2026-09 误诊，2026-11 已定位）。** 当年症状：
+  `exec: node: not found`（PATH 无 nvm node）→ 补 PATH 后 `page.goto` 30s 超时 /
+  `waitForFunction` 60s 超时（日志里的 `404` 是 favicon 噪声）。当时误判为「SSH 拉不起 UI
+  进程」，实际是缺 `DISPLAY` 时仍强开 ANGLE/GL。2026-11 已用 WSLg X0 在纯 SSH 下跑通全片；
+  正确设置、`_render_env()` 与最小调试阶梯见本节末尾「SSH 渲染」。
 - **puppeteer 脚本必须放在 `driver/`**（`node_modules` 所在处），否则
   `ERR_MODULE_NOT_FOUND: Cannot find package 'puppeteer'`。
 - **GPU 可用，但必须显式点名适配器**，否则选到 AMD 核显（比软渲染更慢）。
@@ -2614,6 +2595,112 @@ PSD 立绘 + `make_cues.py` 口型时间轴 → MV。上游是交互式浏览器
 - **fork 已推到 `CJYLZS/Anime2.5DRig` 分支 `offline-render`**（remote 名 `fork`，
   上游 `852wa/Anime2.5DRig` 为 `origin`）。`driver/node_modules/`、`driver/nsslib/`、
   `out/`、`frames/` 在 `.gitignore` 里。
+
+### SSH 渲染（2026-11）：缺的是 `DISPLAY`，不是「会话类型」
+
+2026-09 那条「SSH 里 render 必失败、要去交互式会话」的结论**是误诊**。2026-11 在雪之华上
+复现并定位：headless Chrome 本身不需要桌面，但 `A25_GL_ARGS` 强制的 ANGLE/GL **需要 X
+display**；SSH 默认没有 `DISPLAY`，于是 renderer 创建 WebGL context 失败 → `Target closed`
+→ 进程挂死（没有报错行，`timeout` 才结束）。三种配置实测：
+
+| 配置 | 结果 |
+|---|---|
+| 无 DISPLAY、不强制 GL | ✅ SwiftShader 软渲染，launch 0.8s，WebGL2 可用 |
+| 无 DISPLAY + ANGLE/GL + MESA d3d12 | ❌ WebGL 拿不到 context → `Target closed` → **挂死**（timeout 60 才退） |
+| `DISPLAY=:0` + `XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir` + MESA d3d12 + ANGLE/GL | ✅ `ANGLE (Microsoft, D3D12 (RTX 4070 Ti SUPER), OpenGL 4.6)`，34–35 fps |
+
+WSLg 的 `/tmp/.X11-unix/X0` 就是所需 display，**不用装 Xvfb/完整桌面**。`mv.py` 已加
+`_render_env()` 自动判断：有 X0 → 设 DISPLAY/XDG 并启用 GPU；无 X0 → 摘掉 `A25_GL_ARGS` 与
+MESA 变量、回落 SwiftShader；同时把 nvm 的 node 补进 PATH。所以纯 SSH 直接
+`python3 mv.py ...` 即可出片。
+
+**最小调试阶梯**（防止一上来跑全片卡死）：`probe_env.mjs` 打印 WebGL renderer → 1 帧 →
+6 帧 640×360 → 0.5s/1080p → 130s 预览 → 全片；每级都套 `timeout`。
+`a25rig/driver/probe_env.mjs` 是这轮的诊断脚本（4 种 GL 组合 + 启动/编码耗时）。
+
+- 全片 10,258 帧：无争用 **~34–35 fps（≈5 min）**；中途跑 CPU 对齐检查时掉到 26.9 fps/386s。
+- `subs` 只是 `ffmpeg -vf ass`，全曲 64s，SSH 可跑；只有 `render` 是 Chrome 那一步。
+- `--snow-*` 参数没进 `stale` 检查，改完必须 `--force`，否则会复用旧片。
+
+### 雪花（`--snow`，2026-11）
+
+复用 `setStreaks` 的粒子框架（seeded RNG、深度层、确定性 wrap、与角色同一张 canvas2d
+合成），新增 `setSnow`/`_drawSnow`：远/中/近三层，**远层画在角色后、近层画在角色前**；
+最近层用更宽更软的径向 sprite 做景深虚化；共享缓变风 + 每片正弦摇摆 + 慢闪烁。没有引第三方
+库；模型参考 canvas-snowfall(MIT) 的 count/radius/speed/wind/opacity + HyperFrames snow 的
+三层速度拆分。旗标：`--snow-density`(45/MP)、`--snow-size`(5.5px@1080p)、`--snow-speed`
+(0.12fh/s)、`--snow-wind`(0.35)、`--snow-alpha`(0.85)、`--snow-layers`(3)。雪之华最终用
+60/MP、7px、0.8。验收：同参两次渲染 6/6 帧 md5 一致；0.5s 内天空区 0.6% 像素变化 >10
+（真的在落，不是静态贴图）。
+
+### 二次分离丢人声：karaoke 二分把主唱拆进 backing（2026-11，雪之华 3:29）
+
+症状：成品人声在若干短片段突然变弱（3:29 附近最明显）。根因不在 SVC，而在
+`sep1/vocal.wav -> sep2/lead.wav + backing.wav` 这一步：mel-band-roformer-karaoke
+在这几段把主唱判成了和声。判据见 `singing/probe_sep2_holes.py`（逐 50ms 帧 RMS）：
+
+- **能量守恒**：`|lead+backing|` vs `|vocal|` 有声帧 mean **−0.10 dB**（p5 −0.49）→ 二分
+  只是把同一份人声分到两路，并没有丢能量。
+- **正常帧 `backing` 比 `vocal` 低 53 dB**（等于没有）；**下陷帧只低 3.9 dB** → 人声位移。
+- 谱相关 `corr(vocal, backing)` 在下陷帧 0.95-0.96、正常帧 0.46 —— 但正常帧 0.46 是能量
+  守恒的必然结果，所以这条只作辅证，主证据是上面两条。
+
+13 段 / 16.4 s，全在 1:48 之后：1:48.6、3:12.9、3:18.4、3:20.9、**3:25.6-3:28.4
+（均值 −12.3 dB，最深 −35）**、3:59.1-4:03.3、4:03.6、4:05.2、4:29.1、4:29.9、4:30.9、
+4:31.4、4:33.3。
+
+**mix 阶段会把它放大成听得见的坑。** `w_mix.py --match-lead` 拿 `sep2/lead.wav` 当逐帧 RMS
+参照，主唱没了的位置它会把 SVC 人声一并压下去（限幅 −12 dB）。实测成片人声总线
+（`vocal·lead_curve·match_acc_gain`）弱于原唱 ≥6 dB 的段：A 臂 **17 段 / 16.3 s**；
+3:25.6-3:28.4 均值 **−8.40 dB**、最低 **−41.8 dB**。
+
+修法：**`--lead-wav sep1/vocal.wav`**（2026-11 新增）。它换的是「演唱」本身 —— f0-target、
+SVC 源、mix 的 `--match-lead` 参照、eval/SingMOS 锚点四层一起换。`--source-wav` 救不了这个
+坑：它只换喂给 whisper 的音频，f0 与混音对齐仍锚在原主唱。
+
+同一 seed/参数下的 A/B（雪之华，`--seed 1234`）：
+
+| | A: `sep2/lead` | B: `sep1/vocal` |
+|---|---|---|
+| 人声总线弱段 | 17 段 / 326 帧 / 16.3s | **11 段 / 137 帧 / 6.9s** |
+| 13 处下陷（总线 vs 原唱） | −4.5…−14.1 dB | **+0.0…+1.4 dB**（+5.3…+14.1 dB） |
+| 3:25.6-3:28.4 | −8.40 dB | **+0.75 dB** |
+| SIM mean / median | 0.7708 / 0.7856 | 0.7729 / 0.7848 |
+| SingMOS（合成） | 3.954 | 3.965 |
+
+- f0 几乎不动（同为浊音帧 **99.8% 在 0.5 半音内**，浊音率 64.32% → 64.50%）→ 收益全部来自
+  源音频，不是 f0 重算的副作用。
+- 补回来的片段音高是对的：原唱 vs 新 SVC 的中位半音差 **0.0**，>1 半音的帧只占 1-6%。
+- 剩下的 6.9 s 是 SVC 自己在 `f0=0` 帧（气声/送气辅音/耳语段）上的电平抖动，两臂都有；
+  250-258s 那段 B 比 A 低 3-6 dB，但该段 f0 连续 9 s 全 0，属于气声底噪级差别。
+- 产出可复现：主目录用 `--lead-wav` 重跑后 `vocal.wav`/`mix.wav` 与实验目录 md5 完全一致。
+
+**不要无脑全局换 sep1。** 本例能这么换，是因为除这 13 处外 `backing` 只有 −53 dB ——
+sep1 ≈ sep2 lead，换等于"补洞"。真有和声编曲的歌，sep1 里含着真实和声，全局换会把和声也
+一起 SVC 成目标音色；那种歌应先看 `backing − vocal` 是否普遍 > −30 dB，若普遍有料，只用
+sep1 覆盖下陷跨度而不是整轨替换。
+
+### 雪之华（341.9s 日语歌）首跑记录（2026-11）
+
+- **音频**：`ref_talk_sing.wav` + `--ref-is-clean`，segprompt 默认、`--seed 1234`。
+  SIM **0.7708 / 0.7856**，SingMOS **3.954** vs 原唱 4.094，漏音 **0**，eval_stab
+  drift 0.0524 / dropouts 0；整条 **7.7 min**（SVC 297s、分离 60s）。与 aliez 同档。
+- **日语歌词**：酷狗 KRC 命中 47 行/473 字（353 假名），首句 35.27s、末句 312.56s。
+  **KRC 第一条是 0s 的「歌名 - 歌手」头行，必须在 `--lrc` 前删掉** —— 钢琴前奏本身有声，
+  能量门控吃不掉它，不删会让角色在前奏里对着歌名动嘴 12s。删后首条正文必须是 35.27s。
+  `make_cues.py` 的日文通路（pyopenjtalk 读音）在 473 字上正常。
+- **卡拉 OK 分离**：`lead/vocal` < −2dB 的跨度共 34s（192–202 / 237–246 / 269–273 副歌、
+  32–34 起唱前），但 `lead` 仍有 −18…−30dBFS（不是 aliez 的 −41dB 残渣）。其中 13 段 /
+  16.4s 是真丢人声（主唱被判进 backing），见上一节。**已用 `--lead-wav sep1/vocal.wav`
+  修掉并重出成片**；SIM 0.7708→0.7729、SingMOS 3.954→3.965，无回归。
+- **MV**：1080p30、10,258 帧、341.933s；cues 538 条（A/B/C/E/X），首张嘴 35.27s、
+  末 313.37s、最长单 cue 3.66s、“唱着却闭嘴” **0.2%**；无 cue 张嘴 **0%**（有 cue 95%）；
+  字幕带差分 13.6×（40s）/12.8×（95s），前奏/尾奏仅 1.6×。字幕字体 **Yu Gothic 54px**
+  （SimHei 对日文不合适），93 个事件。**换 sep1 源后重跑 `slice,cues,beats,visemes,render,subs`
+  （6.9 min）**：cues 541 条 / 536 张嘴，首末与最长不变；成片音轨与 `mix.wav` corr 0.9996 /
+  相对误差 −29.4dB（AAC 有损，这就是正常水平）。
+- 成片：`data/songs/雪之华/mv/雪之华.mp4` / `雪之华_lyrics.mp4`。
+  旧 sep2 源那一版连同 `vocal/mix/eval` 存在 `data/songs/雪之华/_armA_sep2src/`（A/B 用）。
 
 ---
 
